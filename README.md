@@ -1,6 +1,6 @@
 # turbo-aimdo
 
-turbo-aimdo is a [turboCLI](https://omega.gg/turboCLI) custom offloading backend based on [comfy-aimdo](https://github.com/Comfy-Org/comfy-aimdo).
+turbo-aimdo is a [turboCLI](https://omega.gg/turboCLI) custom offloader based on [comfy-aimdo](https://github.com/Comfy-Org/comfy-aimdo).
 Paired with a CUDA GPU it improves generate times substantially through optimal VRAM / RAM
 allocation when the model does not fit into VRAM, even on a low VRAM GPU.
 
