@@ -583,7 +583,8 @@ class Offloader:
     #----------------------------------------------------------------------------------------------
 
     def _pre(self, m, args):
-        # Per-forward: fault, then provide the weight (synchronous path). See aimdo.md.
+        # Per-forward (synchronous path): fault, then read the weight into its slot (or the reused
+        # temp buffer if offloaded), via the shared _do_read. See aimdo.md.
         state = m._aimdo
         if self.prefetch:
             return self._pre_prefetch(m, state)
@@ -593,29 +594,13 @@ class Offloader:
             m.weight = state.gpu  # resident: reuse, NO read
             return
 
-        # Enqueue the fast-DMA on the COMPUTE stream so the consuming F.linear is ordered after it
-        # (no event needed on the sync path).
-        strm = int(torch.cuda.current_stream(self.device).cuda_stream)
-
-        # destination: the resident VBAR slot if faulted in, else the reused temp buffer
-        # (offloaded).
+        # destination: resident VBAR slot if faulted in, else the reused temp buffer (offloaded)
         if signature is not None:
             weight = (_at.aimdo_to_tensor(state.slot, self.device)[:state.num_bytes]
                       .view(state.dtype).view(state.shape))
         else:
             weight = self.cast_buffer[:state.num_bytes].view(state.dtype).view(state.shape)
-        if state.host is not None:
-            # pinned HostBuffer view -> truly-async H2D
-            weight.copy_(state.host, non_blocking=True)
-        else:
-            # fast-DMA read of the .safetensors slice -> GPU (page cache if hot, disk if cold)
-            _hb.read_file_to_device(state.file, state.file_offset, state.num_bytes,
-                                    strm, weight.data_ptr(), self.device_index)
-        if state.lora is not None:
-            # On-cast LoRA: weight += sum scale*(up@down), in place on the freshly-read base weight
-            # (stacked LoRAs accumulate). See aimdo.md.
-            for up, down, scale in state.lora:
-                weight.addmm_(up, down, alpha=scale)
+        self._do_read(state, weight, None)   # H2D (+ on-cast LoRA) on the compute stream
 
         state.gpu = weight; state.signature = signature
         m.weight = weight
