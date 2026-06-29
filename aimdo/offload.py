@@ -24,6 +24,7 @@
 #  aimdo.md (kept in sync with the pinned upstream commits noted there).
 # =================================================================================================
 import os, json, struct, torch
+from collections import namedtuple
 
 import comfy_aimdo.control as _ctl     # device init / CUDA alloc hooks
 import comfy_aimdo.torch as _at        # raw-pointer <-> torch.Tensor bridge
@@ -67,9 +68,13 @@ def _align(n, a=512):
     return (n + a - 1) & ~(a - 1)
 
 
+# Where a streamed weight lives on disk -- the diffusers analog of ComfyUI's per-tensor file slice.
+# See aimdo.md.
+_Slice = namedtuple("_Slice", "file file_offset num_bytes dtype shape")
+
+
 def _offsets(tdir):
-    # name -> (file_path, abs_offset, num_bytes, dtype, shape); the diffusers analog of ComfyUI's
-    # per-tensor file slice. See aimdo.md.
+    # Build {checkpoint key -> _Slice} from the transformer's .safetensors shard headers.
     idx = os.path.join(tdir, "diffusion_pytorch_model.safetensors.index.json")
     shards = set(json.load(open(idx))["weight_map"].values()) if os.path.exists(idx) \
         else [f for f in os.listdir(tdir) if f.endswith(".safetensors")]
@@ -83,8 +88,8 @@ def _offsets(tdir):
             if k == "__metadata__":
                 continue
             start, end = info["data_offsets"]
-            offsets[k] = (p, data_start + start, end - start,
-                          _DT[info["dtype"]], tuple(info["shape"]))
+            offsets[k] = _Slice(p, data_start + start, end - start,
+                                _DT[info["dtype"]], tuple(info["shape"]))
     return offsets
 
 
@@ -194,7 +199,7 @@ class Offloader:
         offsets = _offsets(tdir)
 
         # one open handle per shard, kept for the per-forward fast-DMA reads (closed in free()).
-        self.files = {p: open(p, "rb") for p, *_ in {(v[0],) for v in offsets.values()}}
+        self.files = {p: open(p, "rb") for p, *_ in {(v.file,) for v in offsets.values()}}
 
         # Collect the nn.Linear weights to stream.
         linears = {}; skipped = 0; tiny = 0
@@ -210,7 +215,7 @@ class Offloader:
 
                 # Tiny weights (<=16 KiB) stay resident -- mixing tiny + giant streamed weights
                 # stalls stream-buffer rotations (ComfyUI force-loads them). See aimdo.md.
-                if offsets[weight_key][2] <= 16 * 1024:
+                if offsets[weight_key].num_bytes <= 16 * 1024:
                     tiny += 1; continue
                 linears[m] = weight_key
 
@@ -222,8 +227,8 @@ class Offloader:
 
         # dtype guard (DIFFERENCE #3): we stream + use weights in their STORED dtype (== compute,
         # bf16 here). Warn loudly if a model mixes dtypes. See aimdo.md.
-        bad = {offsets[weight_key][3] for weight_key in linears.values()
-               if offsets[weight_key][3] != self.compute_dtype}
+        bad = {offsets[weight_key].dtype for weight_key in linears.values()
+               if offsets[weight_key].dtype != self.compute_dtype}
         if bad:
             print("[aimdo] WARNING: streamed weight dtype(s) %s != compute_dtype %s; NOT cast "
                   "(DIFFERENCE #3; ComfyUI casts in [CU model_management.py cast_to L1453])"
@@ -242,7 +247,7 @@ class Offloader:
         root.load_state_dict(state_dict, strict=False, assign=True)
 
         # One VBAR backs every streamed weight; pages committed only on fault().
-        total = sum(_align(offsets[weight_key][2]) for weight_key in linears.values())
+        total = sum(_align(offsets[weight_key].num_bytes) for weight_key in linears.values())
         self.vbar = ModelVBAR(int(total) + (64 << 20), device=self.device_index)
 
         # Mark this VBAR's pages high-priority so aimdo keeps as many of our weights resident as
@@ -264,7 +269,7 @@ class Offloader:
 
         # Cast buffers for the OFFLOADED case (weight didn't fault into its slot): two ping-pong
         # views from the reserved VRAMBuffer. The faulted case reads straight into the VBAR slot.
-        largest = max(_align(offsets[weight_key][2]) for weight_key in linears.values())
+        largest = max(_align(offsets[weight_key].num_bytes) for weight_key in linears.values())
         buffer_size = _align(largest) + 512
 
         # offload_stream is used only when prefetching; the sync path uses cast_buffer (= bufs[0]).
@@ -323,7 +328,7 @@ class Offloader:
         # In-order up to the budget. See aimdo.md.
         used = 0; pinned = []
         for m, weight_key in linears.items():
-            a = _align(offsets[weight_key][2])
+            a = _align(offsets[weight_key].num_bytes)
             if used + a > self.pin_budget:
                 continue  # past budget -> this weight streams from file
             pinned.append(weight_key); used += a
@@ -419,19 +424,19 @@ class Offloader:
             if b.device.type == "cpu":
                 b.data = b.data.to(self.device)
 
-        total = sum(_align(offsets[weight_key][2]) for _, weight_key in pairs)
+        total = sum(_align(offsets[weight_key].num_bytes) for _, weight_key in pairs)
         self.vbar = ModelVBAR(int(total) + (64 << 20), device=self.device_index)
         self.vbar.prioritize()  # high-priority VRAM retention
 
         # Shared reserved cast buffer for OOM'd layers; no pinning (stream from page cache). Runs
         # once per request, so no prefetch.
-        largest = max(_align(offsets[weight_key][2]) for _, weight_key in pairs)
+        largest = max(_align(offsets[weight_key].num_bytes) for _, weight_key in pairs)
         self.offload_stream, self.cast_buffers = get_aimdo_cast_buffer(
             self.device_index, _align(largest) + 512)
         self.cast_buffer = self.cast_buffers[0]; self.offload_stream = None
         self.pins = {}  # no pinned host weights -> stream from file
         self.files = {p: open(p, "rb")
-                      for p, *_ in {(offsets[weight_key][0],) for _, weight_key in pairs}}
+                      for p, *_ in {(offsets[weight_key].file,) for _, weight_key in pairs}}
 
         for m, weight_key in pairs:
             # frees the live CPU weight (del m._parameters["weight"])
