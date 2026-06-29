@@ -126,31 +126,35 @@ class Offloader:
                  lora_files=None, from_module=False, pin_budget=0, manage=False):
         self.device = torch.device(device); self.device_index = self.device.index or 0
         self.compute_dtype = compute_dtype
-        self.from_module = from_module
         self._freed = False
+
         # tdir: the model's checkpoint dir. REQUIRED -- big weights always stream from disk so an
         # inactive model's host RAM is just OS page cache. See aimdo.md.
         self.tdir = tdir
+
         # manage: opt into the coexisting-dynamic-models manager so a managed model (e.g. the TE)
         # stays loaded across requests while its GPU footprint is reclaimed during denoise.
         # aimdo.md.
         self.manage = manage
+
         # Manager state (a LoadedModel-like entry). root = the module whose forward is the load
         # boundary; _staged = streamed modules; _released/_resident_backup track the CPU<->GPU
         # move.
         self.root = root; self._staged = []
         self._released = False; self._resident_backup = None; self._act_handle = None
+
         # Pinning tier (file path): weights pinned into a HostBuffer up to pin_budget bytes get
         # truly-async H2D; the rest stream file->GPU. Budget measured by the caller (placement).
         self.pin_budget = int(pin_budget)
         self.hb = None; self._registered = []; self.pins = {}
+
         # Double-buffered prefetch overlap (file path only): MEASURED -- ON when the whole set is
         # pinned (RAM-bound), OFF when some weights stream from disk (disk-bound). Env override
         # SKY_AIMDO_VBAR_PREFETCH=0/1. See aimdo.md.
         self._prefetch_env = os.environ.get("SKY_AIMDO_VBAR_PREFETCH")
         self.prefetch = False  # set after pinning (file path)
         self.order = []; self.pos = {}
-        self.offload_stream = None; self.cast_buffer2 = None; self.cast_buffers = None
+        self.offload_stream = None; self.cast_buffers = None
         if not _ctl.devctxs:
             _ctl.init_device(self.device_index)
 
@@ -167,6 +171,7 @@ class Offloader:
             return
 
         offsets = _offsets(tdir)
+
         # one open handle per shard, kept for the per-forward fast-DMA reads (closed in free()).
         self.files = {p: open(p, "rb") for p, *_ in {(v[0],) for v in offsets.values()}}
 
@@ -181,11 +186,13 @@ class Offloader:
                 weight_key = base_name + ".weight"
                 if weight_key not in offsets:
                     skipped += 1; continue  # lora adapter / tied / unsaved
+
                 # Tiny weights (<=16 KiB) stay resident -- mixing tiny + giant streamed weights
                 # stalls stream-buffer rotations (ComfyUI force-loads them). See aimdo.md.
                 if offsets[weight_key][2] <= 16 * 1024:
                     tiny += 1; continue
                 linears[m] = weight_key
+
         if skipped:
             print("[aimdo] skipped %d Linear(s) absent from checkpoint" % skipped, flush=True)
         if tiny:
@@ -216,6 +223,7 @@ class Offloader:
         # One VBAR backs every streamed weight; pages committed only on fault().
         total = sum(_align(offsets[weight_key][2]) for weight_key in linears.values())
         self.vbar = ModelVBAR(int(total) + (64 << 20), device=self.device_index)
+
         # Mark this VBAR's pages high-priority so aimdo keeps as many of our weights resident as
         # fit.
         self.vbar.prioritize()
@@ -237,6 +245,7 @@ class Offloader:
         # views from the reserved VRAMBuffer. The faulted case reads straight into the VBAR slot.
         largest = max(_align(offsets[weight_key][2]) for weight_key in linears.values())
         buffer_size = _align(largest) + 512
+
         # offload_stream is used only when prefetching; the sync path uses cast_buffer (= bufs[0]).
         self.offload_stream, self.cast_buffers = get_aimdo_cast_buffer(
             self.device_index, buffer_size)
@@ -263,14 +272,17 @@ class Offloader:
                 prefixes = {k[:-len(ds)] for k in keys for ds, _us in sufs if k.endswith(ds)}
                 for prefix in prefixes:
                     ds, us = next((d, u) for d, u in sufs if prefix + d in keys)
+
                     # [rank, in]
                     down = sf.get_tensor(prefix + ds).to(self.device, self.compute_dtype)
+
                     # [out, rank]
                     up = sf.get_tensor(prefix + us).to(self.device, self.compute_dtype)
                     rank = down.shape[0]
                     scale = ((sf.get_tensor(prefix + ".alpha").item() / rank)
                              if (prefix + ".alpha") in keys else 1.0) * file_weight
                     lora.setdefault(prefix + ".weight", []).append((up, down, float(scale)))
+
         print("[aimdo] loaded LoRA over %d target(s) from %d file(s)"
               % (len(lora),
                  len(specs if isinstance(specs, (list, tuple)) else [specs])), flush=True)
@@ -296,6 +308,7 @@ class Offloader:
             pinned.append(weight_key); used += a
         if not pinned:
             return
+
         # HostBuffer sized to the pinned set (+ headroom).
         self.hb = _hb.HostBuffer(0, 64 * 1024 * 1024, used + (64 << 20))
         layout = {}
@@ -303,9 +316,11 @@ class Offloader:
             p, file_offset, num_bytes, dtype, shape = offsets[weight_key]
             offset = self.hb.size
             self.hb.extend(_align(num_bytes), register=False)
+
             # file -> HostBuffer once (host-only)
             self.hb.read_file_slice(self.files[p], file_offset, num_bytes, offset=offset)
             layout[weight_key] = (offset, num_bytes, dtype, shape)
+
         host = _at.hostbuf_to_tensor(self.hb)  # uint8 view over the staged buffer
         base = host.data_ptr(); cudart = torch.cuda.cudart(); ok = 0
         for weight_key, (offset, num_bytes, dtype, shape) in layout.items():
@@ -315,6 +330,7 @@ class Offloader:
             else:
                 self._discard_cuda_async_error()
             self.pins[weight_key] = host[offset:offset + num_bytes].view(dtype).view(shape)
+
         print("[aimdo] pinned %d/%d streamed weight(s) = %.2f GB (budget %.2f GB)"
               % (len(self.pins), len(linears), ok / 1024 ** 3,
                  self.pin_budget / 1024 ** 3), flush=True)
@@ -324,16 +340,21 @@ class Offloader:
         state = _StreamedWeight()
         state.file = self.files[p]; state.file_offset = file_offset; state.num_bytes = num_bytes
         state.shape = shape; state.dtype = dtype
+
         # pinned view if pinned, else None -> file-stream
         state.host = self.pins.get(weight_key)
+
         # VBAR slot for this weight
         state.slot = self.vbar.alloc(_align(num_bytes))
         state.signature = None; state.gpu = None
+
         # prefetch bookkeeping (unused on the sync path)
         state.ready = False; state.ev = None; state.dst = None
         state.lora = self._lora.get(weight_key)  # (up, down, scale) on-cast patch, or None
+
         # dtype placeholder between forwards
         state.ph = torch.empty(0, dtype=dtype, device=self.device)
+
         del m._parameters["weight"]; setattr(m, "weight", state.ph)
         m._aimdo = state; self._staged.append(m)
         m.register_forward_pre_hook(self._pre)
@@ -380,6 +401,7 @@ class Offloader:
         total = sum(_align(offsets[weight_key][2]) for _, weight_key in pairs)
         self.vbar = ModelVBAR(int(total) + (64 << 20), device=self.device_index)
         self.vbar.prioritize()  # high-priority VRAM retention
+
         # Shared reserved cast buffer for OOM'd layers; no pinning (stream from page cache). Runs
         # once per request, so no prefetch.
         largest = max(_align(offsets[weight_key][2]) for _, weight_key in pairs)
@@ -389,13 +411,16 @@ class Offloader:
         self.pins = {}  # no pinned host weights -> stream from file
         self.files = {p: open(p, "rb")
                       for p, *_ in {(offsets[weight_key][0],) for _, weight_key in pairs}}
+
         for m, weight_key in pairs:
             # frees the live CPU weight (del m._parameters["weight"])
             self._stage(m, weight_key, offsets)
+
         import gc as _gc; _gc.collect()              # reclaim the freed live Linear weights now
         print("[aimdo] from_module: streaming %d Linear(s) from disk = %.2f GB "
               "(host RAM = page cache only)"
               % (len(pairs), total / 1024 ** 3), flush=True)
+
         if self.manage:
             self._register_manager()
 
@@ -407,6 +432,7 @@ class Offloader:
         by_kind = {}
         for k, (_, _, _nb, dtype, shape) in offsets.items():
             by_kind.setdefault((tuple(shape), dtype), []).append(k.split("."))
+
         pairs = []; missing = []; bad_dt = set()
         for name, m in linears:
             shape = tuple(m.weight.shape); dtype = m.weight.dtype
@@ -459,6 +485,7 @@ class Offloader:
             loaded.remove(self)
         loaded.insert(0, self)  # most-recently-active first
         _ACTIVE[self.device_index] = self
+
         self.vbar.prioritize()
         for other in loaded[1:]:  # release the OTHER dynamic models
             other.partially_unload()
@@ -472,6 +499,7 @@ class Offloader:
         try:
             if getattr(self, "offload_stream", None) is not None:
                 self.offload_stream.synchronize()
+
             # no in-flight reads into the slots we are about to free
             torch.cuda.synchronize(self.device)
         except Exception:
@@ -479,10 +507,12 @@ class Offloader:
         free0 = torch.cuda.mem_get_info(self.device)[0]               # free VRAM before reclaim
         vbar_freed = int(self.vbar.free_memory(1 << 62))  # decommit ALL pages; returns bytes freed
         self.vbar.deprioritize()  # release retention priority
+
         # Force a clean re-read on the next fault (a stale gpu/signature would falsely "match").
         for m in self._staged:
             state = m._aimdo; state.gpu = None; state.signature = None
             state.ready = False; state.dst = None; state.ev = None
+
         # Resident params/buffers -> CPU. parameters() dedups (tied embed/lm_head moves once); the
         # streamed weights are placeholders, not Parameters, so they are skipped.
         backups = []; res_bytes = 0
@@ -495,9 +525,11 @@ class Offloader:
                 res_bytes += b.numel() * b.element_size(); backups.append(b)
                 b.data = b.data.to("cpu")
         self._resident_backup = backups
+
         # The bounce buffer is the shared reserved cast buffer (persistent across swaps) -> leave
         # it; only the streamed VBAR pages + resident params were ours to free.
         self._released = True
+
         # Return the freed VRAM to the allocator so the newly-active model's VBAR can commit it
         # resident (else it stays reserved and the active model re-streams every layer). See
         # aimdo.md.
@@ -532,9 +564,11 @@ class Offloader:
                 and vbar_signature_compare(signature, state.signature)):
             m.weight = state.gpu  # resident: reuse, NO read
             return
+
         # Enqueue the fast-DMA on the COMPUTE stream so the consuming F.linear is ordered after it
         # (no event needed on the sync path).
         strm = int(torch.cuda.current_stream(self.device).cuda_stream)
+
         # destination: the resident VBAR slot if faulted in, else the reused temp buffer
         # (offloaded).
         if signature is not None:
@@ -554,6 +588,7 @@ class Offloader:
             # (stacked LoRAs accumulate). See aimdo.md.
             for up, down, scale in state.lora:
                 weight.addmm_(up, down, alpha=scale)
+
         state.gpu = weight; state.signature = signature
         m.weight = weight
 
@@ -597,6 +632,7 @@ class Offloader:
         else:
             self._do_read(state, weight, None)
             state.ev = None
+
         state.gpu = weight; state.signature = signature; state.dst = weight; state.ready = True
 
     def _pre_prefetch(self, m, state):
@@ -633,6 +669,7 @@ class Offloader:
         if self._freed:
             return
         self._freed = True
+
         # Leave the manager first so a teardown can't re-trigger activation or be released by a
         # peer.
         try:
@@ -645,6 +682,7 @@ class Offloader:
             loaded.remove(self)
         if _ACTIVE.get(self.device_index) is self:
             _ACTIVE.pop(self.device_index, None)
+
         # If manager-released, restore first so teardown frees the VBAR in its normal populated
         # state (freeing a free_memory()'d VBAR then loading the next pipe was observed to
         # segfault).
@@ -661,6 +699,7 @@ class Offloader:
             torch.cuda.synchronize(self.device)
         except Exception:
             pass
+
         # cudaHostUnregister every pinned region BEFORE freeing the HostBuffer, else the next
         # HostBuffer (often the same host addresses) fails with "already mapped".
         cudart = torch.cuda.cudart()
@@ -678,10 +717,10 @@ class Offloader:
             self.hb = None
         self.pins = {}
         self.vbar = None        # ModelVBAR.__del__ -> vbar_free
+
         # Drop refs to the cast buffers/stream but do NOT free them: the reserved VRAMBuffer + copy
         # stream are persistent (STREAM_AIMDO_CAST_BUFFERS) and reused across model swaps.
-        self.cast_buffer = None; self.cast_buffer2 = None
-        self.cast_buffers = None; self.offload_stream = None
+        self.cast_buffer = None; self.cast_buffers = None; self.offload_stream = None
         self.order = []; self.pos = {}
         for f in getattr(self, "files", {}).values():
             try:

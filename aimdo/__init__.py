@@ -134,6 +134,7 @@ def _load_streamed(model, dtype, engine, lora_files):
     )
 
     p.vae.to("cuda")
+
     # VAE stays full-frame (slicing is a no-op at batch=1; full-frame fits <=1024x768 with
     # cudaMallocAsync). The caller can enable VAE tiling (slicing="slice") for higher resolutions.
     # See aimdo.md.
@@ -158,6 +159,7 @@ def _load_streamed(model, dtype, engine, lora_files):
     encoder_offloader = offload.Offloader(
         p.text_encoder, tdir=os.path.join(model, "text_encoder"), from_module=True,
         device="cuda:0", manage=True)
+
     # prepare() reloads the TE to GPU BEFORE the pipeline reads _execution_device (else input lands
     # on CPU while the weight is on CUDA). A fresh single-shot pipe runs without it; it matters
     # only when the pipe is reused. See aimdo.md.
