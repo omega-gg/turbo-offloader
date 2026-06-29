@@ -35,11 +35,11 @@
 #                                               (server.sh). No-ops for a pipe that needs none.
 #
 #  Everything GPL-derived lives in this backend/aimdo/ package (comfy_aimdo is the external dep;
-#  the ComfyUI-style VBAR weight streaming in backend/aimdo/hb_offload_vbar.py and the measured
+#  the ComfyUI-style VBAR weight streaming in backend/aimdo/offload.py and the measured
 #  placement in backend/aimdo/placement.py sit next to this file), so the calling shell scripts
 #  stay GPL-free.
 #
-#  This package (__init__.py + hb_offload_vbar.py + placement.py) is GPL; license text maintained
+#  This package (__init__.py + offload.py + placement.py) is GPL; license text maintained
 #  separately.
 # =================================================================================================
 
@@ -97,7 +97,7 @@ def available():
 def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     """Resource-driven placement of `engine` (ComfyUI-style, all budgets MEASURED -- placement.py):
     full_resident when the transformer fits VRAM (== ComfyUI full_load, a big GPU), else streamed
-    through the merged VBAR offloader (hb_offload_vbar) -- pinned HostBuffer up to the measured RAM
+    through the merged VBAR offloader (offload) -- pinned HostBuffer up to the measured RAM
     budget + reserved cast buffers + measured prefetch + file overflow + VBAR residency. No
     hardcoded VRAM/RAM sizes (mem_get_info / psutil). Returns a fully-placed pipeline, ready to
     run.
@@ -129,7 +129,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
 
 def _load_streamed(model, dtype, engine, lora_files):
-    # Unified aimdo loader for all engines via the merged VBAR offloader (hb_offload_vbar):
+    # Unified aimdo loader for all engines via the merged VBAR offloader (offload):
     # meta-load the transformer (no pageable copy of its weights), then stream its Linear weights
     # to the GPU per forward -- pinned into a HostBuffer up to the measured RAM budget
     # (all-or-nothing by fits-RAM, truly-async H2D), VBAR residency for the hot set, reserved cast
@@ -144,7 +144,7 @@ def _load_streamed(model, dtype, engine, lora_files):
     # streamed from disk via from_module (host RAM = page cache only); qwen's Qwen2.5-VL loader
     # rewrites the checkpoint keys and its vision-tower conv3d must stay on CUDA, both handled
     # model-agnostically by the shared from_module path.
-    from . import hb_offload_vbar
+    from . import offload
     from . import placement
 
     from accelerate import init_empty_weights
@@ -192,7 +192,7 @@ def _load_streamed(model, dtype, engine, lora_files):
     # on-demand cross-vbar eviction, which underperforms on this box (the deliberate
     # dynamic-for-dynamic no-unload is [CU model_management.py L824-828]; see PLAN-te-streaming.md
     # "EMPIRICAL").
-    transformer_offloader = hb_offload_vbar.HBOffloaderVBAR(
+    transformer_offloader = offload.HBOffloaderVBAR(
         meta_transformer, tdir, "cuda:0", lora_files=lora_files or None,
         pin_budget=placement.pin_budget(), manage=True)
 
@@ -211,7 +211,7 @@ def _load_streamed(model, dtype, engine, lora_files):
     # boundary and reloads it for the next encode (ComfyUI coexisting dynamic models
     # [CU model_patcher.py L1937-1941]), so host RAM is bounded and the transformer gets denoise
     # VRAM.
-    encoder_offloader = hb_offload_vbar.HBOffloaderVBAR(
+    encoder_offloader = offload.HBOffloaderVBAR(
         p.text_encoder, tdir=os.path.join(model, "text_encoder"), from_module=True,
         device="cuda:0", manage=True)
     # prepare() reloads the TE to GPU BEFORE the pipeline reads self._execution_device (computed at
@@ -247,12 +247,12 @@ def reclaim(pipe):
     the driver + drop the VBAR resident floors, so the NEXT generation's activations don't starve
     the persistent VBAR weights (a SEPARATE CUDA VMM [AI plat.h three_stooges L182]) into
     re-streaming every layer (measured ~16 s/ step vs ~2). See PLAN-aimdo-pool-reclaim.md and
-    hb_offload_vbar.reclaim_between_runs. No-op for a pipe with no offloaders (no VBAR competing
+    offload.reclaim_between_runs. No-op for a pipe with no offloaders (no VBAR competing
     with the torch pool)."""
     if getattr(pipe, "_aimdo_offloaders", None):
-        from . import hb_offload_vbar
+        from . import offload
 
-        hb_offload_vbar.reclaim_between_runs()
+        offload.reclaim_between_runs()
 
 
 def release(pipe):
@@ -260,7 +260,7 @@ def release(pipe):
     weight region and decommits the host buffer. This reclaims the host RAM (a plain del would leak
     it: the offloader<->module reference cycle keeps the buffer's __del__ from running) AND leaves
     the host addresses clean so the NEXT model can build in the same process (without it, a rebuild
-    faults with "already mapped"). See hb_offload_vbar.HBOffloaderVBAR.free. No-op for a pipe with
+    faults with "already mapped"). See offload.HBOffloaderVBAR.free. No-op for a pipe with
     no offloaders."""
     import traceback
 
