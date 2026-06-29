@@ -1,10 +1,10 @@
 #==================================================================================================
 #
-#   Copyright (C) 2026-2026 turbo-comfy authors. <https://omega.gg/turbo-comfy>
+#   Copyright (C) 2026-2026 turbo-aimdo authors. <https://omega.gg/turbo-aimdo>
 #
 #   Author: Benjamin Arnaud. <https://bunjee.me> <bunjee@omega.gg>
 #
-#   This file is part of turbo-comfy.
+#   This file is part of turbo-aimdo.
 #
 #   - GNU General Public License Usage:
 #   This file may be used under the terms of the GNU General Public License version 3 as published
