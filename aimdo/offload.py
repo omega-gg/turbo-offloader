@@ -35,6 +35,10 @@ from comfy_aimdo.model_vbar import (   # VBAR residency allocator
 )
 
 
+#--------------------------------------------------------------------------------------------------
+# Per-generation reclaim
+#--------------------------------------------------------------------------------------------------
+
 def reclaim_between_runs(device="cuda:0"):
     # Per-generation housekeeping: return torch's retained allocator pool to the driver and drop
     # the VBARs' watermark floors. The VBAR has its own CUDA VMM separate from torch's pool; if
@@ -48,6 +52,11 @@ def reclaim_between_runs(device="cuda:0"):
         import traceback
         print("[aimdo] reclaim_between_runs: vbars_reset_watermark_limits failed:\n"
               + traceback.format_exc(), flush=True)
+
+
+#--------------------------------------------------------------------------------------------------
+# Checkpoint offsets
+#--------------------------------------------------------------------------------------------------
 
 _DT = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "F64": torch.float64,
        "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8,
@@ -79,6 +88,10 @@ def _offsets(tdir):
     return offsets
 
 
+#--------------------------------------------------------------------------------------------------
+# Reserved cast buffers
+#--------------------------------------------------------------------------------------------------
+
 # Persistent per-device cast buffers for the OFFLOADED path (a weight that did NOT fault into its
 # VBAR slot): one copy stream + a reserved aimdo VRAMBuffer carved into two ping-pong views,
 # created once per device and reused across builds. Reserved (not torch.empty) so the aimdo
@@ -104,6 +117,10 @@ def get_aimdo_cast_buffer(device_index, buffer_size):
     return entry["stream"], entry["bufs"]
 
 
+#--------------------------------------------------------------------------------------------------
+# Offloader
+#--------------------------------------------------------------------------------------------------
+
 # Per-Linear streaming state: where the weight lives (file / file_offset / num_bytes / shape /
 # dtype), its VBAR slot, residency bookkeeping (signature / gpu), the between-forwards placeholder
 # (ph), the pinned host view (host), the on-cast LoRA delta (lora), prefetch fields (ready/ev/dst).
@@ -122,6 +139,10 @@ _ACTIVE = {}    # device_index -> the Offloader whose pages are currently priori
 
 
 class Offloader:
+    #----------------------------------------------------------------------------------------------
+    # Initialize
+    #----------------------------------------------------------------------------------------------
+
     def __init__(self, root, tdir=None, device="cuda:0", compute_dtype=torch.bfloat16,
                  lora_files=None, from_module=False, pin_budget=0, manage=False):
         self.device = torch.device(device); self.device_index = self.device.index or 0
@@ -455,7 +476,10 @@ class Offloader:
             pairs.append((m, weight_key))
         return pairs, missing, bad_dt
 
-    # ---- manager: activation (load boundary) + release/reload ----
+    #----------------------------------------------------------------------------------------------
+    # Dynamic-model manager (load boundary + release / reload)
+    #----------------------------------------------------------------------------------------------
+
     def _register_manager(self):
         # Join the registry + hook the root forward as the load boundary (the analog of
         # load_models_gpu(model) running before the model executes).
@@ -554,6 +578,10 @@ class Offloader:
         self._released = False
         print("[aimdo] restore_loaded_backups: resident tensors -> GPU", flush=True)
 
+    #----------------------------------------------------------------------------------------------
+    # Per-forward streaming
+    #----------------------------------------------------------------------------------------------
+
     def _pre(self, m, args):
         # Per-forward: fault, then provide the weight (synchronous path). See aimdo.md.
         state = m._aimdo
@@ -592,19 +620,23 @@ class Offloader:
         state.gpu = weight; state.signature = signature
         m.weight = weight
 
-    def _do_read(self, state, weight, offload_stream):
-        # H2D for one layer into `weight` on `offload_stream` (None = compute stream). Shared by
-        # the prefetch and not-yet-prefetched paths. See aimdo.md.
-        strm = int((offload_stream or torch.cuda.current_stream(self.device)).cuda_stream)
-        if state.host is not None:
-            # pinned HostBuffer view -> async H2D
-            weight.copy_(state.host, non_blocking=True)
-        else:
-            _hb.read_file_to_device(state.file, state.file_offset, state.num_bytes,
-                                    strm, weight.data_ptr(), self.device_index)
-        if state.lora is not None:
-            for up, down, scale in state.lora:
-                weight.addmm_(up, down, alpha=scale)
+    def _pre_prefetch(self, m, state):
+        # Provide this layer's weight (faulting inline if not prefetched), then kick the NEXT
+        # layer's read on the copy stream to overlap compute. Order is learned on step 1. See
+        # aimdo.md.
+        i = self.pos.get(id(m))
+        if i is None:
+            i = len(self.order); self.pos[id(m)] = i; self.order.append(m)
+        if not state.ready:
+            self._fetch(state, copy=False, bufidx=i & 1)  # not prefetched -> compute stream
+        if state.ev is not None:
+            # compute waits for the copy
+            torch.cuda.current_stream(self.device).wait_event(state.ev)
+        m.weight = state.dst
+        if i + 1 < len(self.order):  # prefetch next into the OTHER buf
+            nxt = self.order[i + 1]._aimdo
+            if not nxt.ready:
+                self._fetch(nxt, copy=True, bufidx=(i + 1) & 1)
 
     def _fetch(self, state, copy, bufidx):
         # Fault (pins the slot) + read this layer into its VBAR slot (faulted/resident) or a
@@ -635,23 +667,19 @@ class Offloader:
 
         state.gpu = weight; state.signature = signature; state.dst = weight; state.ready = True
 
-    def _pre_prefetch(self, m, state):
-        # Provide this layer's weight (faulting inline if not prefetched), then kick the NEXT
-        # layer's read on the copy stream to overlap compute. Order is learned on step 1. See
-        # aimdo.md.
-        i = self.pos.get(id(m))
-        if i is None:
-            i = len(self.order); self.pos[id(m)] = i; self.order.append(m)
-        if not state.ready:
-            self._fetch(state, copy=False, bufidx=i & 1)  # not prefetched -> compute stream
-        if state.ev is not None:
-            # compute waits for the copy
-            torch.cuda.current_stream(self.device).wait_event(state.ev)
-        m.weight = state.dst
-        if i + 1 < len(self.order):  # prefetch next into the OTHER buf
-            nxt = self.order[i + 1]._aimdo
-            if not nxt.ready:
-                self._fetch(nxt, copy=True, bufidx=(i + 1) & 1)
+    def _do_read(self, state, weight, offload_stream):
+        # H2D for one layer into `weight` on `offload_stream` (None = compute stream). Shared by
+        # the prefetch and not-yet-prefetched paths. See aimdo.md.
+        strm = int((offload_stream or torch.cuda.current_stream(self.device)).cuda_stream)
+        if state.host is not None:
+            # pinned HostBuffer view -> async H2D
+            weight.copy_(state.host, non_blocking=True)
+        else:
+            _hb.read_file_to_device(state.file, state.file_offset, state.num_bytes,
+                                    strm, weight.data_ptr(), self.device_index)
+        if state.lora is not None:
+            for up, down, scale in state.lora:
+                weight.addmm_(up, down, alpha=scale)
 
     def _post(self, m, args, output):
         state = m._aimdo
@@ -664,6 +692,10 @@ class Offloader:
             state.ready = False; state.dst = None; state.ev = None
         m.weight = state.ph
         return output
+
+    #----------------------------------------------------------------------------------------------
+    # Teardown
+    #----------------------------------------------------------------------------------------------
 
     def free(self):
         if self._freed:
