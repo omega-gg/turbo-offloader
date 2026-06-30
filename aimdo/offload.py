@@ -41,10 +41,12 @@ from comfy_aimdo.model_vbar import ( # VBAR residency allocator
 )
 
 #--------------------------------------------------------------------------------------------------
-# Pinned host memory -- ported from ComfyUI [CU model_management.py L1486-L1581]. cudaHostRegister
-# per region, tracking the global pinned total; a register that is over-budget or OOMs returns
-# False so the weight streams pageable instead -- partial pinning, never a wedged context.
+# Pinned host memory
 #--------------------------------------------------------------------------------------------------
+
+# Ported from ComfyUI [CU model_management.py L1486-L1581]: cudaHostRegister per region, tracking
+# the global pinned total; a register that is over-budget or OOMs returns False so the weight
+# streams pageable instead -- partial pinning, never a wedged context.
 
 PINNED_MEMORY = {}
 TOTAL_PINNED_MEMORY = 0
@@ -417,7 +419,7 @@ class Offloader:
     def _pin_memory(self, linears, offsets):
         # Stage streamed weights into a HostBuffer (up to pin_budget) and pin each region with the
         # ported pin_memory(): it partial-pins what fits the budget / page-lock ceiling and skips
-        # the rest (-> stream pageable from the page cache), never wedging the context. See aimdo.md.
+        # the rest (-> stream pageable), never wedging the context. See aimdo.md.
         used = 0; pinned = []
         for m, weight_key in linears.items():
             a = _align(offsets[weight_key].num_bytes)

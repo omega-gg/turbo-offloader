@@ -20,6 +20,8 @@ Based on:
 The `[CU <file> Lnn]` references below point into the ComfyUI tree; `[AI <file> Lnn]` into
 comfy-aimdo. Re-verify and bump the line numbers when bumping either commit.
 
+**Style:** code and comments wrap at 99 columns.
+
 ## How it works (vs ComfyUI LOWVRAM)
 
 Derived from ComfyUI's LOWVRAM cast path; two changes make it DynamicVRAM:
