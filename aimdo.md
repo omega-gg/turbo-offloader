@@ -49,7 +49,7 @@ prefetch overlap is an optional add (file path, RAM-bound only).
 | `_offsets` | `_comfy_tensor_file_slice` (file_ref/offset/size) [CU memory_management.py L36-L75] | name → (file, offset, num_bytes, dtype, shape) |
 | manager (`_LOADED` / `_ACTIVE` / `_activate` / `partially_unload` / `restore_loaded_backups`) | current_loaded_models + load_models_gpu [CU model_management.py L849]; free_memory [CU L805-834]; partially_unload + restore_loaded_backups [CU model_patcher.py L1937-1941, L1768] | coexisting dynamic VBAR models; reclaim at the load boundary |
 | `vbar.prioritize` / `deprioritize` | [CU model_patcher.py L1808-1809] / [AI model_vbar.py L60, L63] | VRAM retention priority |
-| pinning (`_pin_memory`, `pins`, `pin_budget`) | pin_memory + cudaHostRegister [CU pinned_memory.py L66-L119, L98]; pinned_hostbuf_size [CU L1500]; ensure_pin_budget [CU L645]; priority balancer [CU pinned_memory.py L12] | optional truly-async H2D when the set fits RAM |
+| pinning (`pin_memory`, `ensure_pin_budget`, `ensure_pin_registerable`, `MAX_PINNED_MEMORY`) | ported from [CU model_management.py L1486-L1581]: pin_memory [CU L1515], unpin_memory [CU L1553], ensure_pin_budget [CU L645], ensure_pin_registerable [CU L680], discard_cuda_async_error [CU L1505], MAX_PINNED_MEMORY [CU L1488] | per-region cudaHostRegister; partial-pin what fits, skip over-budget/OOM to pageable |
 | on-cast LoRA (`_load_lora`, applied in `_pre`/`_do_read`) | weight_function during cast_to [CU ops.py L357-L380] | add scale·(up@down) to the freshly-read base weight |
 | `_pre` / `_fetch` / `_pre_prefetch` / `_post` | cast_bias_weight + cast_modules_with_vbar [CU ops.py L128-L177]; prefetch [CU model_prefetch.py L34, ops.py L316-L334]; unpin [CU ops.py L392] | per-forward fault/read/use/unpin (+ optional prefetch) |
 | dtype guard (DIFFERENCE #3) | cast_to [CU model_management.py L1453] | we keep the stored dtype (== compute, bf16); ComfyUI casts on the copy |
@@ -59,7 +59,7 @@ prefetch overlap is an optional add (file path, RAM-bound only).
 | `__init__.py` seam (`pre_torch_init`/`available`/`supports`/`load_pipe`/`prepare`/`reclaim`/`release`) | — | license-neutral interface the runner discovers as `backend/<mode>/` and drives |
 | `_load_streamed` two managed VBARs (transformer + text encoder) | DynamicVram cast path [CU ops.py cast_bias_weight L281, model_patcher.py L1779]; both in current_loaded_models [CU model_management.py L945, load_models_gpu L849]; ModelVBAR / _vbar_get [CU model_patcher.py L1743, L1799]; dynamic-for-dynamic no-unload [CU model_management.py L824-828] | transformer + TE coexist as managed dynamic VBARs |
 | text-encoder initial device | text_encoder_initial_device [CU model_management.py L1138] | TE offloaded, streamed via its own VBAR |
-| placement budgets (`placement.py`) | ensure_pin_budget [CU model_management.py L645-L656]; MAX_PINNED_MEMORY [CU L1488]; MIN_WEIGHT_MEMORY_RATIO [CU L453]; extra reserved [CU L789-L793]; minimum_inference_memory [CU L802]; get_free_memory [CU L1653]; lowvram_model_memory [CU L935] | measured GPU resident budget + RAM pin budget |
+| placement budgets (`placement.py`) | ensure_pin_budget [CU model_management.py L645-L656]; MIN_WEIGHT_MEMORY_RATIO [CU L453]; extra reserved [CU L789-L793]; minimum_inference_memory [CU L802]; get_free_memory [CU L1653]; lowvram_model_memory [CU L935] | measured GPU resident budget + RAM pin budget |
 
 ## Notes / rationale
 
@@ -69,12 +69,13 @@ prefetch overlap is an optional add (file path, RAM-bound only).
   rather than via comfy-aimdo's on-demand cross-VBAR eviction, which underperformed here. Host RAM
   stays bounded because every big weight streams from disk (page cache only).
 
-- **All-or-nothing pinning.** Pin the streamed set into a HostBuffer only when the *whole* set fits
-  the measured RAM budget — available RAM minus a ~2 GB floor, capped at `MAX_PINNED_MEMORY` (the OS
-  page-lock ceiling: 40% of RAM on Windows, 90% elsewhere). Partial-pinning a >RAM model on a tight
-  GPU exhausts host-registration / BAR mapping and OOMs the next alloc, so a set over the budget
-  streams pageable from the page cache instead. ComfyUI partial-pins via a headroom balancer we
-  don't replicate.
+- **Pinning (ComfyUI port).** Stage the streamed set into a HostBuffer and pin each region with the
+  ported `pin_memory` [CU model_management.py L1515]: it tracks `TOTAL_PINNED_MEMORY` against
+  `MAX_PINNED_MEMORY` (the OS page-lock ceiling: 40% of RAM on Windows, 90% elsewhere) and returns
+  False — so that weight streams pageable — when over budget or when `cudaHostRegister` OOMs. The
+  budget is optimistic (`available` counts reclaimable cache the OS may not be able to page-lock),
+  so a register can OOM mid-set; we partial-pin what fits and stream the rest pageable, never
+  wedging the context. Prefetch overlap stays ON only when the *whole* set pinned.
 
 - **Measured prefetch.** Double-buffer overlap is ON only when every weight is pinned (RAM-bound);
   OFF when some weights stream from disk (disk-bound — overlap can't beat the disk and adds sync

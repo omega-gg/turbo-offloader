@@ -27,7 +27,7 @@
 #    ComfyUI      @ 5955ddff52a2eda2ba0cf7f3fb0927c93fb2fbb8
 #    comfy-aimdo  @ ace72abefa1ede12a4b8a4e2c99919804e5f38e0
 # =================================================================================================
-import os, json, struct, torch
+import os, json, struct, torch, psutil
 from collections import namedtuple
 
 import comfy_aimdo.control as _ctl    # device init / CUDA alloc hooks
@@ -39,6 +39,102 @@ from comfy_aimdo.model_vbar import ( # VBAR residency allocator
     ModelVBAR, vbar_fault, vbar_unpin, vbar_signature_compare,
     vbars_reset_watermark_limits,
 )
+
+#--------------------------------------------------------------------------------------------------
+# Pinned host memory -- ported from ComfyUI [CU model_management.py L1486-L1581]. cudaHostRegister
+# per region, tracking the global pinned total; a register that is over-budget or OOMs returns
+# False so the weight streams pageable instead -- partial pinning, never a wedged context.
+#--------------------------------------------------------------------------------------------------
+
+PINNED_MEMORY = {}
+TOTAL_PINNED_MEMORY = 0
+RAM_CACHE_HEADROOM = 0
+
+PINNING_ALLOWED_TYPES = set(["Tensor", "Parameter"])
+
+# OS page-lock ceiling for pinned host memory. [CU model_management.py MAX_PINNED_MEMORY L1488]
+WINDOWS = os.name == "nt"
+MAX_PINNED_MEMORY = -1
+ram = psutil.virtual_memory().total
+if WINDOWS:
+    MAX_PINNED_MEMORY = ram * 0.40  # Windows limit is apparently 50%
+else:
+    MAX_PINNED_MEMORY = ram * 0.90
+
+
+def discard_cuda_async_error():
+    # Drain a sticky async CUDA error (e.g. a failed cudaHostRegister) so it doesn't resurface.
+    # [CU model_management.py discard_cuda_async_error L1505]
+    try:
+        a = torch.tensor([1], dtype=torch.uint8, device="cuda")
+        b = torch.tensor([1], dtype=torch.uint8, device="cuda")
+        _ = a + b
+        torch.cuda.synchronize()
+    except RuntimeError:
+        pass
+
+
+def ensure_pin_budget(size):
+    # Host RAM must hold this pin plus a floor (single model: nothing to free, so check only).
+    # [CU model_management.py ensure_pin_budget L645]
+    return size + max(RAM_CACHE_HEADROOM // 2, 2 * 1024 ** 3) <= psutil.virtual_memory().available
+
+
+def ensure_pin_registerable(size):
+    # Stay under the OS page-lock ceiling. [CU model_management.py ensure_pin_registerable L680]
+    return TOTAL_PINNED_MEMORY + size <= MAX_PINNED_MEMORY
+
+
+def pin_memory(tensor):
+    # [CU model_management.py pin_memory L1515]
+    global TOTAL_PINNED_MEMORY
+    if MAX_PINNED_MEMORY <= 0:
+        return False
+
+    if type(tensor).__name__ not in PINNING_ALLOWED_TYPES:
+        return False
+
+    if tensor.device.type != "cpu":
+        return False
+
+    if tensor.is_pinned():
+        return False
+
+    if not tensor.is_contiguous():
+        return False
+
+    size = tensor.nbytes
+    if not ensure_pin_budget(size) or not ensure_pin_registerable(size):
+        return False
+
+    ptr = tensor.data_ptr()
+    if ptr == 0:
+        return False
+
+    if torch.cuda.cudart().cudaHostRegister(ptr, size, 1) == 0:
+        PINNED_MEMORY[ptr] = size
+        TOTAL_PINNED_MEMORY += size
+        return True
+    else:
+        discard_cuda_async_error()
+
+    return False
+
+
+def unpin_memory(tensor):
+    # [CU model_management.py unpin_memory L1553]
+    global TOTAL_PINNED_MEMORY
+    ptr = tensor.data_ptr()
+    if PINNED_MEMORY.get(ptr) is None:
+        return False
+
+    if torch.cuda.cudart().cudaHostUnregister(ptr) == 0:
+        TOTAL_PINNED_MEMORY -= PINNED_MEMORY.pop(ptr)
+        return True
+    else:
+        discard_cuda_async_error()
+
+    return False
 
 
 #--------------------------------------------------------------------------------------------------
@@ -259,10 +355,9 @@ class Offloader:
         # fit.
         self.vbar.prioritize()
 
-        # Pin the streamed set into the HostBuffer only if the WHOLE set fits the RAM budget;
-        # partial-pinning a >RAM model exhausts host-registration and OOMs, so >RAM streams
-        # pageable from the page cache. See aimdo.md.
-        if 0 < total <= self.pin_budget:
+        # Stage + pin the streamed set: pin_memory() pins per region up to the budget / page-lock
+        # ceiling and skips the rest (-> stream pageable), so a partial set is fine. See aimdo.md.
+        if total > 0:
             self._pin_memory(linears, offsets)
 
         # Prefetch ON iff every streamed weight is pinned (RAM-bound), else OFF. Env forces it.
@@ -319,18 +414,10 @@ class Offloader:
                  len(specs if isinstance(specs, (list, tuple)) else [specs])), flush=True)
         return lora
 
-    def _discard_cuda_async_error(self):
-        # Drain a sticky async CUDA error (e.g. a failed cudaHostRegister) so it doesn't resurface.
-        try:
-            a = torch.ones(1, dtype=torch.uint8, device=self.device); _ = a + a
-            torch.cuda.synchronize(self.device)
-        except RuntimeError:
-            pass
-
     def _pin_memory(self, linears, offsets):
-        # Pin the streamed weights into a HostBuffer up to pin_budget bytes for truly-async H2D:
-        # read each file slice in, cudaHostRegister it, keep the pinned view as the H2D source.
-        # In-order up to the budget. See aimdo.md.
+        # Stage streamed weights into a HostBuffer (up to pin_budget) and pin each region with the
+        # ported pin_memory(): it partial-pins what fits the budget / page-lock ceiling and skips
+        # the rest (-> stream pageable from the page cache), never wedging the context. See aimdo.md.
         used = 0; pinned = []
         for m, weight_key in linears.items():
             a = _align(offsets[weight_key].num_bytes)
@@ -353,14 +440,12 @@ class Offloader:
             layout[weight_key] = (offset, num_bytes, dtype, shape)
 
         host = _at.hostbuf_to_tensor(self.hb)  # uint8 view over the staged buffer
-        base = host.data_ptr(); cudart = torch.cuda.cudart(); ok = 0
+        ok = 0
         for weight_key, (offset, num_bytes, dtype, shape) in layout.items():
-            # cudaHostRegister the exact region so torch sees a pinned (async-copy) H2D source.
-            if int(cudart.cudaHostRegister(base + offset, num_bytes, 0)) == 0:
-                self._registered.append(base + offset); ok += num_bytes
-            else:
-                self._discard_cuda_async_error()
-            self.pins[weight_key] = host[offset:offset + num_bytes].view(dtype).view(shape)
+            view = host[offset:offset + num_bytes]   # contiguous uint8 region
+            if pin_memory(view):
+                self._registered.append(view); ok += num_bytes
+                self.pins[weight_key] = view.view(dtype).view(shape)
 
         print("[aimdo] pinned %d/%d streamed weight(s) = %.2f GB (budget %.2f GB)"
               % (len(self.pins), len(linears), ok / 1024 ** 3,
@@ -727,12 +812,10 @@ class Offloader:
         except Exception:
             pass
 
-        # cudaHostUnregister every pinned region BEFORE freeing the HostBuffer, else the next
-        # HostBuffer (often the same host addresses) fails with "already mapped".
-        cudart = torch.cuda.cudart()
-        for ptr in getattr(self, "_registered", []):
-            if int(cudart.cudaHostUnregister(ptr)) != 0:
-                self._discard_cuda_async_error()
+        # unpin every pinned region BEFORE freeing the HostBuffer, else the next HostBuffer (often
+        # the same host addresses) fails with "already mapped".
+        for tensor in getattr(self, "_registered", []):
+            unpin_memory(tensor)
         self._registered = []
         hb = getattr(self, "hb", None)
         if hb is not None:

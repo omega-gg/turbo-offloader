@@ -36,10 +36,6 @@ MIN_WEIGHT_MEMORY_RATIO = 0.4
 
 _WINDOWS = os.name == "nt"
 
-# OS page-lock ceiling for pinned host memory: 40% of RAM on Windows (~50% limit), 90% elsewhere.
-# [CU model_management.py MAX_PINNED_MEMORY L1488]
-MAX_PINNED_MEMORY = psutil.virtual_memory().total * (0.40 if _WINDOWS else 0.90)
-
 
 def extra_reserved_memory(total_vram_bytes):
     # VRAM held back for everything that is not streamed weights: 400 MB, 600 MB on Windows
@@ -85,9 +81,10 @@ def resident_budget(free_vram, reserve):
 
 
 def pin_budget():
-    # RAM budget for pinning streamed weights: available minus PIN_HEADROOM, capped at the OS
-    # page-lock ceiling MAX_PINNED_MEMORY. Mirrors ComfyUI's ensure_pin_budget. See aimdo.md.
-    return int(max(0, min(psutil.virtual_memory().available - PIN_HEADROOM, MAX_PINNED_MEMORY)))
+    # Host-RAM budget bounding how much of the streamed set is staged for pinning: available RAM
+    # minus a ~2 GB floor. The page-lock ceiling is enforced per region by offload.pin_memory. See
+    # aimdo.md.
+    return int(max(0, psutil.virtual_memory().available - PIN_HEADROOM))
 
 
 def placement(model_size, free_vram, reserve):
