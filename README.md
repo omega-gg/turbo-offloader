@@ -28,6 +28,7 @@ PR(s) are welcomed
 ## Platforms
 
 - Windows 10 and later
+- macOS 64 bit
 - Linux 64 bit
 
 ## Requirements
