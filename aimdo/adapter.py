@@ -115,8 +115,42 @@ def make_patchable(model):
     what those models would report anyway once loaded). No-op if `device` is already settable."""
     cls = type(model)
     if isinstance(getattr(cls, "device", None), property):
-        model.__class__ = type(cls.__name__ + "_aimdo", (cls,), {"device": None})
+        # Masquerade as the parent for str(cls): transformers 5.x keys its output-capture registry
+        # on `str(self.__class__)` (_CAN_RECORD_REGISTRY.get(str(self.__class__))), so a subclass
+        # with a new class string silently loses output_hidden_states. Copying __module__/__qualname__
+        # makes str(subclass) == str(cls), so the lookup (and hidden-state capture) keeps working.
+        ns = {"device": None, "__module__": cls.__module__, "__qualname__": cls.__qualname__}
+        model.__class__ = type(cls.__name__, (cls,), ns)
     return model
+
+
+def keep_uncastable_resident(model, device):
+    """Move every parameter/buffer that ComfyUI's offloader will NOT stream onto `device`, so it
+    stays resident. The offloader only streams the weight/bias of CastWeightBiasOp leaves (the ones
+    comfy_ize converted); anything else -- a custom leaf norm (transformers' Qwen3RMSNorm, forward
+    `self.weight * hidden_states`), or a bare parameter/buffer hung directly on a container module
+    (diffusers' `x_pad_token`, rotary caches, class tokens) -- would otherwise be left on the
+    offload device by ModelPatcher.load() and blow up mid-forward with a cuda-vs-cpu mismatch.
+
+    We walk ALL modules and move only their DIRECT (recurse=False) params/buffers, skipping
+    CastWeightBiasOp modules entirely so their big weights keep streaming. These stragglers are
+    almost always tiny; returns (count, bytes) for logging so a large one is visible."""
+    moved = 0
+    nbytes = 0
+    for _name, m in model.named_modules():
+        if isinstance(m, ops.CastWeightBiasOp):
+            continue  # its weight/bias stream via the cast path -- leave on the offload device
+        for _n, p in m.named_parameters(recurse=False):
+            if p is not None and p.device != device:
+                p.data = p.data.to(device)
+                moved += 1
+                nbytes += p.numel() * p.element_size()
+        for bn, b in m.named_buffers(recurse=False):
+            if b is not None and b.device != device:
+                m._buffers[bn] = b.to(device)
+                moved += 1
+                nbytes += b.numel() * b.element_size()
+    return moved, nbytes
 
 
 def build_patcher(model, load_device=None, offload_device=None, size=0):

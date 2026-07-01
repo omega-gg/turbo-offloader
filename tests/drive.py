@@ -15,17 +15,19 @@
 #==================================================================================================
 #
 #   End-to-end driver for the v2 native offload seam, bypassing the runner (drives the seam directly:
-#   pre_torch_init / load_pipe / prepare / <generate> / reclaim / release). Handy for validating the
-#   device-agnostic path on a small GPU: the flux2 transformer (~7.75GB) + text encoder (~8GB) are
-#   offloaded through ComfyUI's ModelPatcher and streamed to the compute device per forward, so the
-#   pipe runs even when neither model fits VRAM.
+#   pre_torch_init / load_pipe / prepare / <generate> / reclaim / release). Validates the
+#   device-agnostic path on a small GPU: the big models (transformer + text encoder) are offloaded
+#   through ComfyUI's ModelPatcher and streamed to the compute device per forward, so the pipe runs
+#   even when neither model fits VRAM.
 #
-#   The model directory is read from AIMDO_FLUX2_MODEL (a diffusers layout with transformer/,
-#   text_encoder/, vae/ ...), so no machine-specific path is baked in.
+#   The model directory is read from AIMDO_MODEL (a diffusers layout with transformer/, text_encoder/,
+#   vae/ ...), so no machine-specific path is baked in.
 #
 #   Run:
-#       AIMDO_FLUX2_MODEL=/path/to/FLUX.2-klein-4B python tests/drive_flux2.py cuda 1024 768 4
-#       args: <device=cuda> <width=128> <height=128> <steps=1>   (device: cpu|cuda|mps)
+#       AIMDO_MODEL=/path/to/FLUX.2-klein-4B  python tests/drive.py flux2   cuda 1024 768 4
+#       AIMDO_MODEL=/path/to/Z-Image-Turbo    python tests/drive.py z-image cuda 512  512  8
+#       args: <engine> <device=cuda> <width=512> <height=512> <steps=8>
+#             engine: flux2 | z-image | qwen-image-edit   device: cpu | cuda | mps
 #
 #==================================================================================================
 
@@ -39,29 +41,38 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-DEVICE = sys.argv[1] if len(sys.argv) > 1 else "cuda"
-WIDTH = int(sys.argv[2]) if len(sys.argv) > 2 else 128
-HEIGHT = int(sys.argv[3]) if len(sys.argv) > 3 else 128
-STEPS = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+ENGINE = sys.argv[1] if len(sys.argv) > 1 else "flux2"
+DEVICE = sys.argv[2] if len(sys.argv) > 2 else "cuda"
+WIDTH = int(sys.argv[3]) if len(sys.argv) > 3 else 512
+HEIGHT = int(sys.argv[4]) if len(sys.argv) > 4 else 512
+STEPS = int(sys.argv[5]) if len(sys.argv) > 5 else 8
 
-MODEL = os.environ.get("AIMDO_FLUX2_MODEL")
+MODEL = os.environ.get("AIMDO_MODEL")
 if not MODEL:
-    sys.exit("set AIMDO_FLUX2_MODEL to a flux2 diffusers model directory")
+    sys.exit("set AIMDO_MODEL to the engine's diffusers model directory")
+
+# Per-engine generate kwargs (guidance differs: flux2 uses distilled CFG=0, z-image/qwen use ~1).
+GEN = {
+    "flux2": dict(guidance_scale=0.0),
+    "z-image": dict(),
+    "qwen-image-edit": dict(true_cfg_scale=1.0),
+}.get(ENGINE, {})
 
 import aimdo
 
 aimdo.pre_torch_init()
-print("available:", aimdo.available())
+print("engine:", ENGINE, "| available:", aimdo.available())
 
 import torch
 
 dtype = torch.bfloat16 if DEVICE == "cuda" else (torch.float16 if DEVICE == "mps" else torch.float32)
 if DEVICE == "cuda":
+    torch.cuda.reset_peak_memory_stats()
     print("GPU:", torch.cuda.get_device_name(0),
           "| VRAM %.1f GB" % (torch.cuda.get_device_properties(0).total_memory / 1e9))
 
 t0 = time.time()
-pipe = aimdo.load_pipe(model=MODEL, dtype=dtype, engine="flux2", device=DEVICE)
+pipe = aimdo.load_pipe(model=MODEL, dtype=dtype, engine=ENGINE, device=DEVICE)
 print("load_pipe: %.1fs" % (time.time() - t0))
 
 aimdo.prepare(pipe)
@@ -71,12 +82,13 @@ gen = torch.Generator(device="cpu").manual_seed(42)
 t1 = time.time()
 with torch.inference_mode():
     img = pipe(prompt="a knight in armor", width=WIDTH, height=HEIGHT,
-               guidance_scale=0.0, num_inference_steps=STEPS, generator=gen).images[0]
+               num_inference_steps=STEPS, generator=gen, **GEN).images[0]
 print("generate: %.1fs" % (time.time() - t1))
 if DEVICE == "cuda":
     print("peak VRAM: %.2f GB" % (torch.cuda.max_memory_allocated() / 1e9))
 
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out_flux2_%s_%dx%d.png" % (DEVICE, WIDTH, HEIGHT))
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                   "out_%s_%s_%dx%d.png" % (ENGINE, DEVICE, WIDTH, HEIGHT))
 img.save(out)
 print("Saved:", out)
 

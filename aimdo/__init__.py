@@ -104,14 +104,18 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     patchers = []
 
-    # Transformer: the big model -> comfy-ize + ModelPatcher.
+    # Transformer: the big model -> comfy-ize its standard leaves, keep custom param leaves (norms
+    # etc.) resident so they aren't stranded on the offload device, then wrap in a ModelPatcher.
     adapter.comfy_ize(p.transformer)
+    adapter.keep_uncastable_resident(p.transformer, load_dev)
     transformer_patcher = adapter.build_patcher(p.transformer)
     patchers.append(transformer_patcher)
 
-    # Text encoder: also large for flux2/qwen -> its own managed patcher.
+    # Text encoder: also large for flux2/qwen -> its own managed patcher. Its custom norms (e.g.
+    # Qwen3RMSNorm) can't be comfy-ized, so keep them resident too.
     if getattr(p, "text_encoder", None) is not None:
         adapter.comfy_ize(p.text_encoder)
+        adapter.keep_uncastable_resident(p.text_encoder, load_dev)
         encoder_patcher = adapter.build_patcher(p.text_encoder)
         patchers.append(encoder_patcher)
         p._aimdo_encoder = encoder_patcher
