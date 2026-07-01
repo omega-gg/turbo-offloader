@@ -61,20 +61,17 @@ def supports(engine):
 
 
 def pre_torch_init():
-    """Optionally install the comfy-aimdo CUDA hooks, then bring up the vendored offloader. Unlike
-    v1 this NEVER raises when comfy-aimdo is absent (cpu/mps builds): the native ComfyUI cast path
-    is used instead and only the optional VBAR accelerator is skipped."""
-    global _available
+    """Bring up the vendored offloader. The native (device-agnostic) path needs NO comfy-aimdo, so
+    this never raises and never touches CUDA -- importing the adapter just establishes the `comfy`
+    alias and validates the vendored package.
 
-    try:
-        import comfy_aimdo.control as ctl
-        ctl.init()
-        ctl.set_log_warning()
-        # Flip the vendored flag so ComfyUI's VBAR branches engage (Phase D). Left False here until
-        # the VBAR path is re-homed; the native path runs regardless.
-        # import comfy.memory_management as _memm; _memm.aimdo_enabled = True
-    except Exception:
-        pass  # no comfy-aimdo -> pure native offloading
+    We deliberately do NOT call comfy_aimdo.control.init() here. Its CUDA allocator / VBAR hooks map
+    physical VRAM through a separate CUDA VMM that competes with torch's pool (v1 aimdo.md), and they
+    also reserve lockable host RAM -- both of which starve the native cast path (measured: stole
+    enough VRAM to OOM z-image on a 4.3GB GPU, and pushed pinning over the RAM ceiling). comfy-aimdo
+    is only initialised in Phase D, behind an explicit opt-in, when the VBAR accelerator is enabled
+    (aimdo_enabled=True)."""
+    global _available
 
     # Importing the adapter establishes the `comfy` alias and validates the vendored package.
     import aimdo.adapter  # noqa: F401

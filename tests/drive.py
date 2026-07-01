@@ -37,7 +37,11 @@ import time
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Mirror turboCLI's run.sh environment so tests match deployment. CUDA: stream-ordered allocator so
+# large VAE decodes fit and avoid the WDDM RAM spill. MPS: CPU fallback + disable the memory cap.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
