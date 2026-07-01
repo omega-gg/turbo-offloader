@@ -24,7 +24,7 @@
 #   comment-outs. Re-syncing a newer ComfyUI = re-copy the files, re-apply that short list.
 #
 #   Source snapshots (bump together with the files):
-#       ComfyUI     dd17debce517f8818ae9910b437cb1ebaa673176  (v0.0.2-3160-gdd17debc)
+#       ComfyUI     bb131be9e83d2f773c90f1d6f1e4b248a498c8c5  (v0.27.0)
 #       comfy-aimdo afa70d91ec9f6e1ab6758089d1b551f0269b6457
 #
 #==================================================================================================

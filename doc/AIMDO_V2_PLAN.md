@@ -203,7 +203,7 @@ benchmark script, not deployed turboCLI); the real turboCLI seam stays untouched
 ## Step 0 (on approval): commit this plan into the repo
 
 `turbo-aimdo` is its own git repo (`C:\dev\workspace\msvc\turbo-aimdo`). The first action after
-approval is to copy this plan into the repo (e.g. `turbo-aimdo/AIMDO_V2_PLAN.md`) and commit it, so
+approval is to copy this plan into the repo (e.g. `turbo-aimdo/doc/AIMDO_V2_PLAN.md`) and commit it, so
 the design is versioned alongside the code before implementation begins. (Git writes aren't possible
 while in plan mode; this happens as the first implementation step.)
 

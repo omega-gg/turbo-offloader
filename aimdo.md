@@ -1,7 +1,7 @@
 # aimdo (v2)
 
 GPL offload backend for the turboCLI diffusion runner. Instead of cherry-picking lines from
-ComfyUI (v1, see `aimdo_v1.md`), v2 **vendors ComfyUI's offloading subsystem verbatim** and adds a
+ComfyUI (v1, see `doc/aimdo_v1.md`), v2 **vendors ComfyUI's offloading subsystem verbatim** and adds a
 **thin adapter** so turboCLI's diffusers pipelines reuse ComfyUI's own memory manager with 1:1
 parity. The same code runs a model larger than VRAM — even larger than VRAM+RAM — by streaming its
 weights disk→VRAM per forward.

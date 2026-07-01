@@ -97,7 +97,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     the VBAR dynamic path (streams disk->VRAM, runs models larger than VRAM+RAM); otherwise the
     portable native cast path. lora_files kept for parity (wired later)."""
     import torch  # noqa: F401
-    import aimdo.adapter as adapter
+    from . import adapter
 
     load_dev = adapter.set_device(device)
 

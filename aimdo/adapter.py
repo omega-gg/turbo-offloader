@@ -32,7 +32,7 @@
 #
 #==================================================================================================
 
-import aimdo.comfy  # noqa: F401  establishes the top-level `comfy` alias (see aimdo/comfy/__init__.py)
+from . import comfy  # noqa: F401  establishes the top-level `comfy` alias (see aimdo/comfy/__init__.py)
 
 import os
 
