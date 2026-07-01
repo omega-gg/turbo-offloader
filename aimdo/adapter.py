@@ -403,6 +403,45 @@ def install_prefetch(model):
     return len(sequences)
 
 
+_LORA_SUFFIXES = (".lora_down.weight", ".lora_up.weight", ".lora_A.weight", ".lora_B.weight",
+                  ".alpha", ".dora_scale", ".diff", ".diff_b")
+
+
+def add_lora(patcher, lora_specs):
+    """Apply LoRAs on-cast, the ComfyUI way: build the {lora_base_key -> model_weight_key} map, hand
+    it to comfy.lora.load_lora (which uses the vendored weight_adapter classes to read lora_up/down
+    or lora_A/B + alpha), and register the result via ModelPatcher.add_patches. The patches become
+    LowVramPatch weight_functions that comfy.lora.calculate_weight applies while each weight streams
+    in -- no fusing, no extra resident copy. lora_specs is [(path, strength), ...]."""
+    import comfy.utils as cu
+    import comfy.lora as clora
+
+    model_keys = set(n for n, _ in patcher.model.named_parameters())
+    applied = 0
+    for path, strength in lora_specs:
+        sd = cu.load_torch_file(path, safe_load=True)
+        bases = set()
+        for k in sd:
+            for suf in _LORA_SUFFIXES:
+                if k.endswith(suf):
+                    bases.add(k[:-len(suf)])
+                    break
+        to_load = {}
+        for base in bases:
+            mk = base
+            for pre in ("transformer.", "diffusion_model.", "lora_unet_"):
+                if mk.startswith(pre):
+                    mk = mk[len(pre):]
+                    break
+            mk = mk + ".weight"
+            if mk in model_keys:
+                to_load[base] = mk
+        patch_dict = clora.load_lora(sd, to_load, log_missing=False)
+        patcher.add_patches(patch_dict, strength)
+        applied += len(patch_dict)
+    return applied
+
+
 def build_dynamic_patcher(model, load_device=None, offload_device=None, size=0):
     """Wrap a streamed model in ModelPatcherDynamic (the VBAR-aware patcher). On a CPU load_device it
     transparently reroutes to a plain ModelPatcher (VBAR is GPU-only)."""

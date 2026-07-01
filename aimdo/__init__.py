@@ -136,6 +136,12 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
         adapter.keep_uncastable_resident(p.transformer, load_dev)
         adapter.prefer_cudnn_attention(p.transformer)
         transformer_patcher = adapter.build_patcher(p.transformer)
+    # On-cast LoRA (e.g. qwen's Lightning 4-step speed LoRA): applied to the transformer while its
+    # weights stream in, via ComfyUI's add_patches -> calculate_weight. lora_files: [(path, strength)].
+    if lora_files:
+        n = adapter.add_lora(transformer_patcher, lora_files)
+        print("aimdo: applied %d LoRA patches" % n, flush=True)
+
     patchers.append(transformer_patcher)
 
     # Text encoder: also large for flux2/qwen -> its own managed patcher. Its custom norms (e.g.
