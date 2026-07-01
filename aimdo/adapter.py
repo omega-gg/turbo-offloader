@@ -231,11 +231,35 @@ def _shards(model_dir):
             if n.endswith(".safetensors")]
 
 
+def _match_by_suffix(live_name, live_tensor, disk_by_shape):
+    """Pick the disk key for `live_name` among same-shape/dtype candidates by longest common dotted
+    suffix; return it only if that best match is unique (mirrors v1's _match_disk_keys). Handles
+    checkpoints whose keys were renamed by a prefix (e.g. transformers' `model.` -> `language_model.`
+    for Qwen2.5-VL) where a direct name lookup misses."""
+    cands = disk_by_shape.get((tuple(live_tensor.shape), live_tensor.dtype))
+    if not cands:
+        return None
+    live_parts = live_name.split(".")
+
+    def common_suffix(disk_name):
+        dp = disk_name.split(".")
+        n = 0
+        while n < len(dp) and n < len(live_parts) and dp[-1 - n] == live_parts[-1 - n]:
+            n += 1
+        return n
+
+    scored = sorted(((common_suffix(dk), dk) for dk in cands), reverse=True)
+    if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
+        return scored[0][1]
+    return None
+
+
 def assign_streamed_weights(model, model_dir):
     """Replace `model`'s weights with mmap-backed, file-sliced tensors from its .safetensors shard(s)
-    (via ComfyUI's own load_safetensors), so the VBAR path can fault each straight from disk. Assumes
-    disk keys match model.named_parameters() (true for diffusers transformers and standard
-    transformers text encoders alike). Returns the list of disk keys with no matching param."""
+    (via ComfyUI's own load_safetensors), so the VBAR path can fault each straight from disk. Matches
+    disk keys to model.named_parameters() by name; for any that don't match directly (checkpoints
+    with renamed prefixes, e.g. the Qwen2.5-VL text encoder), falls back to structural shape+suffix
+    matching. Returns the list of disk keys that still found no home."""
     import comfy.utils as cu
 
     sd = {}
@@ -243,15 +267,33 @@ def assign_streamed_weights(model, model_dir):
         part, _meta = cu.load_safetensors(shard)
         sd.update(part)
 
-    own = set(n for n, _ in model.named_parameters())
-    own |= set(n for n, _ in model.named_buffers())
-    missing = []
+    own = {n: p for n, p in model.named_parameters()}
+    own.update({n: b for n, b in model.named_buffers()})
+
+    used = set()
+    # 1) direct name matches.
     for name, tensor in sd.items():
-        if name not in own:
-            missing.append(name)
-            continue
-        cu.set_attr_param(model, name, tensor)  # wraps in Parameter; keeps the file-sliced storage
-    return missing
+        if name in own:
+            cu.set_attr_param(model, name, tensor)  # keeps the file-sliced storage
+            used.add(name)
+
+    # 2) structural fallback for the live params still holding their from_pretrained (materialized)
+    #    weights: match by shape + longest-common dotted suffix among the leftover disk keys.
+    leftover = {k: v for k, v in sd.items() if k not in used}
+    if leftover:
+        disk_by_shape = {}
+        for k, v in leftover.items():
+            disk_by_shape.setdefault((tuple(v.shape), v.dtype), []).append(k)
+        for name, param in own.items():
+            if name in used:
+                continue
+            dk = _match_by_suffix(name, param, disk_by_shape)
+            if dk is not None and dk in leftover:
+                cu.set_attr_param(model, name, leftover[dk])
+                used.add(dk)
+                disk_by_shape[(tuple(param.shape), param.dtype)].remove(dk)
+
+    return [k for k in sd if k not in used]
 
 
 def load_streamed(model_cls, model_dir, dtype):
