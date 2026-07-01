@@ -13,26 +13,28 @@
 #   requirements will be met: https://www.gnu.org/licenses/gpl.html.
 #
 #==================================================================================================
-
-# =================================================================================================
-#  aimdo offload backend -- the GPL "custom block" the (LGPL) runner discovers as backend/<mode>/
-#  (here backend/aimdo/ for cuda_offload="aimdo") and drives through this seam only:
+#
+#  aimdo offload backend (v2) -- the GPL "custom block" the (LGPL) runner discovers as
+#  backend/<mode>/ (here backend/aimdo/ for cuda_offload="aimdo") and drives through this seam only:
 #
 #      pre_torch_init()                       - one-time setup; MUST run before `import torch`
-#      available()                            - True once comfy-aimdo initialised (CUDA-only)
+#      available()                            - True once the vendored offloader imports (any device)
 #      supports(engine)                       - True if this backend can place `engine`
 #      load_pipe(model, dtype, engine, ...)   - build a fully-placed diffusers pipeline
-#      prepare/reclaim/release(pipe)          - optional per-generation / teardown hooks (no-ops
-#                                               unless the host caches + reuses the pipe)
+#      prepare/reclaim/release(pipe)          - per-generation / teardown hooks
 #
-#  All GPL-derived code lives in this package (__init__.py + offload.py + placement.py); the
-#  calling shell scripts stay GPL-free. Design + upstream line references: aimdo.md.
+#  v2 delegates all offloading to a byte-for-byte vendored ComfyUI snapshot (aimdo/comfy/) via the
+#  thin bridge in aimdo/adapter.py, so the SAME device-agnostic path serves CPU / CUDA / MPS.
+#  comfy-aimdo's CUDA-only VBAR is an optional accelerator (aimdo_enabled), off by default. The v1
+#  VBAR streamer (offload.py + placement.py) is kept as reference until Phase D re-homes it.
+#
 # =================================================================================================
 
 import os
+import traceback
 
-# Set by pre_torch_init(): True once comfy-aimdo brought up a device. cpu/mps builds don't ship
-# comfy-aimdo, so pre_torch_init() raises there and the caller leaves the backend out.
+# True once pre_torch_init() has run. Unlike v1, the native path needs no comfy-aimdo, so this is
+# True on CPU/MPS too.
 _available = False
 
 
@@ -59,44 +61,75 @@ def supports(engine):
 
 
 def pre_torch_init():
-    """Install the comfy-aimdo CUDA hooks. MUST be called before torch is imported.
-
-    Raises if comfy-aimdo is not installed (cpu/mps builds), so a host that wants to degrade
-    gracefully should call this inside try/except and gate on available().
-    """
+    """Optionally install the comfy-aimdo CUDA hooks, then bring up the vendored offloader. Unlike
+    v1 this NEVER raises when comfy-aimdo is absent (cpu/mps builds): the native ComfyUI cast path
+    is used instead and only the optional VBAR accelerator is skipped."""
     global _available
 
-    import comfy_aimdo.control as ctl
+    try:
+        import comfy_aimdo.control as ctl
+        ctl.init()
+        ctl.set_log_warning()
+        # Flip the vendored flag so ComfyUI's VBAR branches engage (Phase D). Left False here until
+        # the VBAR path is re-homed; the native path runs regardless.
+        # import comfy.memory_management as _memm; _memm.aimdo_enabled = True
+    except Exception:
+        pass  # no comfy-aimdo -> pure native offloading
 
-    _available = bool(ctl.init())
-    ctl.set_log_warning()
+    # Importing the adapter establishes the `comfy` alias and validates the vendored package.
+    import aimdo.adapter  # noqa: F401
+    _available = True
 
 
 def available():
-    """True once pre_torch_init() has brought up comfy-aimdo (CUDA-only; absent on cpu/mps
-    builds)."""
+    """True once pre_torch_init() has brought up the vendored offloader (any device)."""
     return _available
 
 
 def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
-    """Resource-driven placement of `engine` (all budgets MEASURED -- placement.py): full_resident
-    when the transformer fits VRAM, else streamed through the VBAR offloader. lora_files: on-cast
-    LoRA specs (path or (path, weight)); None for engines without LoRA. See aimdo.md."""
-    from . import placement
+    """Build a diffusers pipeline whose big models (transformer, text encoder) are offloaded through
+    ComfyUI's ModelPatcher and streamed to the compute device per forward. Device-agnostic: `device`
+    selects CPU / CUDA / MPS via the adapter. lora_files kept for parity (wired in Phase C)."""
+    import torch  # noqa: F401
+    import aimdo.adapter as adapter
 
-    plan = placement.probe(model)
-    print(placement.describe(plan), flush=True)
+    load_dev = adapter.set_device(device)
 
-    if plan["mode"] == "full_resident":
-        # Whole transformer fits VRAM: load resident, no offloader. Reached only by small models on
-        # big GPUs (qwen never fits).
-        PipelineCls, _ = _classes(engine)
+    PipelineCls, _Transformer = _classes(engine)
 
-        p = PipelineCls.from_pretrained(model, torch_dtype=dtype, use_safetensors=True,
-                                        low_cpu_mem_usage=True, local_files_only=True)
-        p.to("cuda")
-    else:
-        p = _load_streamed(model, dtype, engine, lora_files)   # unified merged VBAR offloader
+    # Load every module onto the offload device (CPU) with mmap-backed safetensors. ModelPatcher
+    # then streams weights to `load_dev` per forward -- exactly like ComfyUI offloads a UNet.
+    p = PipelineCls.from_pretrained(model, torch_dtype=dtype, use_safetensors=True,
+                                    low_cpu_mem_usage=True, local_files_only=True)
+
+    patchers = []
+
+    # Transformer: the big model -> comfy-ize + ModelPatcher.
+    adapter.comfy_ize(p.transformer)
+    transformer_patcher = adapter.build_patcher(p.transformer)
+    patchers.append(transformer_patcher)
+
+    # Text encoder: also large for flux2/qwen -> its own managed patcher.
+    if getattr(p, "text_encoder", None) is not None:
+        adapter.comfy_ize(p.text_encoder)
+        encoder_patcher = adapter.build_patcher(p.text_encoder)
+        patchers.append(encoder_patcher)
+        p._aimdo_encoder = encoder_patcher
+
+    # Small resident modules (VAE) go straight to the compute device; the offloader handles the
+    # heavy ones. VAE tiling/slicing is left to the caller.
+    if getattr(p, "vae", None) is not None:
+        p.vae.to(load_dev)
+
+    p._aimdo_patchers = patchers
+    p._aimdo_device = load_dev
+
+    # Diffusers reads _execution_device from module placement; pin it to the compute device so inputs
+    # land there while offloaded weights stream in.
+    try:
+        p._execution_device = load_dev
+    except Exception:
+        pass
 
     # NOTE: This might improve performances.
     p.safety_checker = lambda images, **kwargs: (images, [False] * len(images))
@@ -104,102 +137,34 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     return p
 
 
-def _load_streamed(model, dtype, engine, lora_files):
-    # Unified loader: meta-load the transformer (no pageable weight copy), then stream its Linear
-    # weights to the GPU per forward via the VBAR offloader; the text encoder is a second managed
-    # offloader streamed from disk. Both coexist as managed dynamic VBARs (ComfyUI-style); only the
-    # class table + qwen's on-cast LoRA differ per engine. See aimdo.md.
-    from . import offload
-    from . import placement
-
-    from accelerate import init_empty_weights
-
-    PipelineCls, Transformer = _classes(engine)
-
-    tdir = os.path.join(model, "transformer")
-    cfg = Transformer.load_config(tdir)
-
-    with init_empty_weights():
-        meta_transformer = Transformer.from_config(cfg).to(dtype)
-
-    # Build the pipe FIRST so placement.pin_budget() is measured AFTER the text encoder is in host
-    # RAM (conservative). from_pretrained accepts the meta transformer as-is (never loads weights).
-    p = PipelineCls.from_pretrained(
-        model,
-        transformer=meta_transformer,
-        torch_dtype=dtype,
-        use_safetensors=True,
-        low_cpu_mem_usage=True,
-        local_files_only=True
-    )
-
-    p.vae.to("cuda")
-
-    # VAE stays full-frame (slicing is a no-op at batch=1; full-frame fits <=1024x768 with
-    # cudaMallocAsync). The caller can enable VAE tiling (slicing="slice") for higher resolutions.
-    # See aimdo.md.
-
-    # On-cast LoRA (qwen): the caller resolves the specs and passes them as lora_files (each spec
-    # is (path, weight); deltas accumulate). None for flux2/z-image.
-
-    # Transformer = a managed dynamic VBAR. manage=True everywhere mirrors ComfyUI (registration is
-    # unconditional); the manager reclaims the inactive model's GPU footprint at the active one's
-    # load boundary -- made explicit here rather than via comfy-aimdo's on-demand eviction.
-    # aimdo.md.
-    transformer_offloader = offload.Offloader(
-        meta_transformer, tdir, "cuda:0", lora_files=lora_files or None,
-        pin_budget=placement.pin_budget(), manage=True)
-
-    # Text encoder: a managed dynamic VBAR for every engine, streamed from disk via from_module
-    # (_match_disk_keys maps live names -> disk keys model-agnostically, so it works whether the
-    # loader rewrote the keys or not). Big Linears stream (host RAM = page cache); small params
-    # (embedding, norms, qwen's conv3d) stay resident on CUDA. The tied embedding/lm_head is never
-    # streamed, so the tie is preserved. manage=True -> released during denoise, reloaded per
-    # encode. See aimdo.md.
-    encoder_offloader = offload.Offloader(
-        p.text_encoder, tdir=os.path.join(model, "text_encoder"), from_module=True,
-        device="cuda:0", manage=True)
-
-    # prepare() reloads the TE to GPU BEFORE the pipeline reads _execution_device (else input lands
-    # on CPU while the weight is on CUDA). A fresh single-shot pipe runs without it; it matters
-    # only when the pipe is reused. See aimdo.md.
-    p._aimdo_encoder = encoder_offloader
-
-    # Keep both offloaders reachable so release() can free() them (else they leak via the
-    # offloader<->module hook cycle).
-    p._aimdo_offloaders = [transformer_offloader, encoder_offloader]
-
-    return p
-
-
 def prepare(pipe):
-    """Per-generation load boundary: reload the managed text encoder to GPU before pipe() reads
-    _execution_device. No-op for a pipe with no managed encoder, or a fresh single-shot pipe.
-    See aimdo.md."""
-    enc = getattr(pipe, "_aimdo_encoder", None)
+    """Per-generation load boundary: ask ComfyUI to place the managed models on the compute device
+    (partial load + cast-path flags) before the pipeline reads _execution_device / runs a forward."""
+    patchers = getattr(pipe, "_aimdo_patchers", None)
+    if not patchers:
+        return
 
-    if enc is not None:
-        enc.activate()
+    import comfy.model_management as mm
+    mm.load_models_gpu(patchers)
 
 
 def reclaim(pipe):
-    """Per-generation housekeeping: return torch's retained allocator pool + drop the VBAR resident
-    floors so the persistent VBAR weights don't re-stream every layer. No-op without offloaders.
-    See aimdo.md (offload.reclaim_between_runs)."""
-    if getattr(pipe, "_aimdo_offloaders", None):
-        from . import offload
+    """Per-generation housekeeping: free non-resident models + return the allocator pool."""
+    if not getattr(pipe, "_aimdo_patchers", None):
+        return
 
-        offload.reclaim_between_runs()
+    import comfy.model_management as mm
+    dev = getattr(pipe, "_aimdo_device", None)
+    if dev is not None:
+        mm.free_memory(mm.minimum_inference_memory(), dev)
+    mm.soft_empty_cache()
 
 
 def release(pipe):
-    """Tear down any offloaders before the pipe is dropped (free() unregisters pinned regions +
-    decommits the host buffer; a plain del would leak via the offloader<->module cycle). See
-    aimdo.md (offload.Offloader.free)."""
-    import traceback
-
-    for offloader in getattr(pipe, "_aimdo_offloaders", []):
+    """Tear down the offloaders before the pipe is dropped (detach unpatches weights and lets the
+    current_loaded_models finalizers fire)."""
+    for patcher in getattr(pipe, "_aimdo_patchers", []):
         try:
-            offloader.free()
+            patcher.detach(unpatch_all=True)
         except Exception:
             print(traceback.format_exc(), flush=True)
