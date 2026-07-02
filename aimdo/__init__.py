@@ -25,8 +25,9 @@
 #
 #  v2 delegates all offloading to a byte-for-byte vendored ComfyUI snapshot (aimdo/comfy/) via the
 #  thin bridge in aimdo/adapter.py, so the SAME device-agnostic path serves CPU / CUDA / MPS.
-#  comfy-aimdo's CUDA-only VBAR is an optional accelerator (aimdo_enabled) that streams weights
-#  disk->VRAM through ComfyUI's ModelPatcherDynamic, running models larger than VRAM+RAM.
+#  comfy-aimdo's CUDA-only VBAR is an optional accelerator (aimdo_enabled) that runs ComfyUI's
+#  ModelPatcherDynamic (partial GPU residency) instead of the plain patcher -- streaming weights from
+#  host RAM, or disk->VRAM for a component too big for RAM.
 #
 # =================================================================================================
 
@@ -38,7 +39,8 @@ import traceback
 _available = False
 
 
-# Per-engine diffusers classes: (PipelineCls, TransformerCls). Add engines as scripts migrate.
+# Per-engine diffusers classes: (PipelineCls, TransformerCls). The transformer class is used to
+# meta-load an oversized transformer for the disk-stream path. Add engines as scripts migrate.
 def _classes(engine):
     if engine == "flux2":
         from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel
@@ -92,10 +94,11 @@ def available():
 
 def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     """Build a diffusers pipeline whose big models (transformer, text encoder) are offloaded through
-    ComfyUI's ModelPatcher and streamed to the compute device per forward. Device-agnostic: `device`
-    selects CPU / CUDA / MPS via the adapter. On CUDA with comfy-aimdo present the transformer uses
-    the VBAR dynamic path (streams disk->VRAM, runs models larger than VRAM+RAM); otherwise the
-    portable native cast path. lora_files kept for parity (wired later)."""
+    ComfyUI's ModelPatcher and streamed from host RAM to the compute device per forward -- exactly how
+    ComfyUI offloads a UNet. Device-agnostic: `device` selects CPU / CUDA / MPS via the adapter. On
+    CUDA with comfy-aimdo present it uses ComfyUI's ModelPatcherDynamic (partial GPU residency sized
+    from live free VRAM), streaming each component from host RAM or, when it's too big for RAM, from
+    disk; otherwise the portable native cast path. lora_files: [(path, strength)]."""
     import torch  # noqa: F401
     from . import adapter
 
@@ -103,41 +106,51 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     PipelineCls, Transformer = _classes(engine)
 
-    # VBAR acceleration: CUDA + comfy-aimdo (initialised in pre_torch_init) -> flip aimdo_enabled so
-    # ComfyUI's dynamic path engages. Must run before loading so the vendored device-selection /
-    # lazy-load branches see the flag.
+    # VBAR: CUDA + comfy-aimdo (initialised in pre_torch_init) -> flip aimdo_enabled so ComfyUI's
+    # ModelPatcherDynamic engages (the "dynamic VRAM loading" path). Must run before loading so the
+    # vendored device-selection / lazy-load branches see the flag. Off CUDA (or without comfy-aimdo)
+    # this is False and the plain-ModelPatcher native cast path runs instead.
     use_vbar = _vbar_ready and adapter.enable_vbar(device)
 
     patchers = []
 
-    if use_vbar:
-        # Stream the transformer disk->VRAM: meta-load + comfy-ize + assign mmap/file-sliced weights,
-        # then hand the ready module to the pipeline (from_pretrained keeps a provided transformer
-        # as-is, no reload).
-        tdir = os.path.join(model, "transformer")
-        transformer, missing = adapter.load_streamed(Transformer, tdir, dtype)
+    # Weights live in host RAM and stream to VRAM per-forward -- byte-for-byte what ComfyUI does: it
+    # loads the checkpoint to CPU (mmap safetensors), wraps each big model in a ModelPatcher, and
+    # partial-loads / streams to the GPU (ComfyUI's own log: "prepared for dynamic VRAM loading. NNNN
+    # MB Staged"). Residency (how much stays GPU-resident vs streams) is decided GPU-agnostically by
+    # ComfyUI's load_models_gpu from live free VRAM -- no card-specific thresholds.
+    #
+    # A component too big for host RAM instead streams disk->VRAM through file-slices
+    # (adapter.fits_in_ram -> load_streamed / assign_streamed_weights) -- the only way to run a model
+    # larger than RAM (e.g. qwen-image-edit's ~55GB on a small box). That path needs the dynamic
+    # patcher, so it's gated on use_vbar; the fit test is on-disk size vs host RAM, GPU/card-agnostic.
+    build = adapter.build_dynamic_patcher if use_vbar else adapter.build_patcher
+
+    # Transformer: RAM-resident (fast) when it fits, else disk-streamed via a meta-loaded module whose
+    # weights are file-sliced (never materialised in RAM). load_streamed comfy-izes internally.
+    stream_transformer = use_vbar and not adapter.fits_in_ram(os.path.join(model, "transformer"))
+
+    if stream_transformer:
+        transformer, missing = adapter.load_streamed(Transformer, os.path.join(model, "transformer"),
+                                                     dtype)
         if missing:
             print("aimdo: %d transformer weights had no matching module (skipped)" % len(missing),
                   flush=True)
         p = PipelineCls.from_pretrained(model, transformer=transformer, torch_dtype=dtype,
                                         use_safetensors=True, low_cpu_mem_usage=True,
                                         local_files_only=True)
-        adapter.keep_uncastable_resident(p.transformer, load_dev)
-        adapter.install_prefetch(p.transformer)  # overlap block weight streaming with compute
-        adapter.use_comfy_attention(p.transformer)  # ComfyUI's exact SDPA (comfy.ops, cuDNN-first + size gate)
-        adapter.use_kitchen_rope(p.transformer)  # ComfyUI's comfy_kitchen fused RoPE
-        transformer_patcher = adapter.build_dynamic_patcher(p.transformer)
     else:
-        # Native path: load every module onto the offload device (CPU) with mmap-backed safetensors;
-        # ModelPatcher streams weights to `load_dev` per forward -- exactly like ComfyUI offloads a
-        # UNet. Comfy-ize the standard leaves, keep custom param leaves (norms etc.) resident.
         p = PipelineCls.from_pretrained(model, torch_dtype=dtype, use_safetensors=True,
                                         low_cpu_mem_usage=True, local_files_only=True)
         adapter.comfy_ize(p.transformer)
-        adapter.keep_uncastable_resident(p.transformer, load_dev)
-        adapter.use_comfy_attention(p.transformer)
-        adapter.use_kitchen_rope(p.transformer)  # ComfyUI's comfy_kitchen fused RoPE
-        transformer_patcher = adapter.build_patcher(p.transformer)
+
+    adapter.keep_uncastable_resident(p.transformer, load_dev)
+    if use_vbar:
+        adapter.install_prefetch(p.transformer)  # overlap block weight streaming with compute
+    adapter.use_comfy_attention(p.transformer)  # ComfyUI's exact SDPA (comfy.ops, cuDNN-first + size gate)
+    adapter.use_kitchen_rope(p.transformer)  # ComfyUI's comfy_kitchen fused RoPE
+    transformer_patcher = build(p.transformer)
+
     # On-cast LoRA (e.g. qwen's Lightning 4-step speed LoRA): applied to the transformer while its
     # weights stream in, via ComfyUI's add_patches -> calculate_weight. lora_files: [(path, strength)].
     if lora_files:
@@ -146,24 +159,20 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     patchers.append(transformer_patcher)
 
-    # Text encoder: also large for flux2/qwen -> its own managed patcher. Its custom norms (e.g.
-    # Qwen3RMSNorm) can't be comfy-ized, so keep them resident too. On VBAR we swap its weights for
-    # mmap/file-sliced ones and stream via ModelPatcherDynamic (disk keys match the live param names
-    # for standard transformers encoders); otherwise the native cast path.
+    # Text encoder: same gate -- RAM-resident (fast) when it fits, else its weights are swapped for
+    # file-slices and streamed disk->VRAM. Custom norms (e.g. Qwen3RMSNorm) are kept resident by
+    # keep_uncastable_resident since they can't be comfy-ized.
     if getattr(p, "text_encoder", None) is not None:
         adapter.comfy_ize(p.text_encoder)
         adapter.use_comfy_attention(p.text_encoder)
-        if use_vbar:
+        if use_vbar and not adapter.fits_in_ram(os.path.join(model, "text_encoder")):
             te_missing = adapter.assign_streamed_weights(p.text_encoder,
                                                          os.path.join(model, "text_encoder"))
             if te_missing:
                 print("aimdo: %d text-encoder weights had no matching param (skipped)"
                       % len(te_missing), flush=True)
-            adapter.keep_uncastable_resident(p.text_encoder, load_dev)
-            encoder_patcher = adapter.build_dynamic_patcher(p.text_encoder)
-        else:
-            adapter.keep_uncastable_resident(p.text_encoder, load_dev)
-            encoder_patcher = adapter.build_patcher(p.text_encoder)
+        adapter.keep_uncastable_resident(p.text_encoder, load_dev)
+        encoder_patcher = build(p.text_encoder)
         patchers.append(encoder_patcher)
         p._aimdo_encoder = encoder_patcher
 
@@ -189,8 +198,11 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
 
 def prepare(pipe):
-    """Per-generation load boundary: ask ComfyUI to place the managed models on the compute device
-    (partial load + cast-path flags) before the pipeline reads _execution_device / runs a forward."""
+    """Per-generation load boundary: hand the managed models to ComfyUI's load_models_gpu, which
+    partial-loads / streams them to the compute device (its dynamic path streams weights per-forward,
+    so this marks them loaded without pinning the whole set). With the runner's encode cache a repeated
+    prompt never runs the text encoder's forward, so its weights never stream and the transformer keeps
+    the throughput."""
     patchers = getattr(pipe, "_aimdo_patchers", None)
     if not patchers:
         return

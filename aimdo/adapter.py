@@ -85,12 +85,19 @@ def _comfy_class_for(module):
 
 def _prep_rmsnorm(module):
     """Give a re-classed custom RMSNorm the attributes torch.nn.RMSNorm / F.rms_norm read
-    (normalized_shape, eps) that its original class didn't expose under those names."""
+    (normalized_shape, eps) that its original class didn't expose under those names.
+
+    elementwise_affine is set too: it isn't read by F.rms_norm, but torch.nn.RMSNorm.extra_repr()
+    reads it, and ModelPatcher.load() reprs each module in a debug-log line -- that .format() runs
+    eagerly regardless of log level, so a missing key raises KeyError mid-load (native path). The
+    module always carries a weight here, so affine is True."""
     if not hasattr(module, "normalized_shape"):
         module.normalized_shape = tuple(module.weight.shape)
     if not hasattr(module, "eps") or module.eps is None:
         module.eps = (getattr(module, "variance_epsilon", None)
                       or getattr(module, "epsilon", None) or 1e-6)
+    if not hasattr(module, "elementwise_affine"):
+        module.elementwise_affine = True
 
 
 def comfy_ize(model):
@@ -190,12 +197,11 @@ def build_patcher(model, load_device=None, offload_device=None, size=0):
 
 
 # --------------------------------------------------------------------------------------------------
-# Optional VBAR acceleration (Phase D, CUDA only). Flipping comfy.memory_management.aimdo_enabled
-# turns on ComfyUI's own dynamic path: ModelPatcherDynamic allocates a comfy-aimdo ModelVBAR slot per
-# castable module and streams each weight disk->VRAM per forward via TensorFileSlice, so a model far
-# larger than VRAM (or VRAM+RAM) still runs. The weights must be mmap + file-sliced (not real CPU
-# tensors) for this to pay off; load_streamed() below wires that up using ComfyUI's own
-# load_safetensors(). On CPU/MPS this stays off and the native cast_to path runs.
+# VBAR (CUDA only). Flipping comfy.memory_management.aimdo_enabled turns on ComfyUI's own dynamic
+# path: ModelPatcherDynamic streams each RAM-resident weight to VRAM per forward and keeps only what
+# fits GPU-resident (partial residency, sized by load_models_gpu from live free VRAM), so a model
+# larger than VRAM still runs -- exactly as ComfyUI offloads a UNet. On CPU/MPS this stays off and the
+# native cast_to path runs.
 # --------------------------------------------------------------------------------------------------
 def enable_vbar(device):
     """Flip aimdo_enabled so the vendored VBAR dynamic path engages. CUDA only. comfy-aimdo's global
@@ -216,6 +222,21 @@ def enable_vbar(device):
     import comfy.memory_management as memm
     memm.aimdo_enabled = True
     return True
+
+
+def fits_in_ram(model_dir):
+    """True when a component's weights fit in host RAM, so they can stream to the GPU from RAM
+    (ComfyUI's fast path) instead of disk->VRAM. GPU/card-agnostic: the size is the on-disk shard
+    total, the budget is ComfyUI's own get_total_memory(cpu). Only one big component is hot at a time
+    (encode, then sample), so it must fit alone; ~10% is reserved for the OS. A component bigger than
+    this streams disk->VRAM via load_streamed / assign_streamed_weights (comfy-aimdo VBAR), which
+    never materialises it in RAM -- the only way to run a model larger than host RAM."""
+    try:
+        size = sum(os.path.getsize(s) for s in _shards(model_dir))
+    except OSError:
+        return True  # can't size it -> assume RAM path; never force disk on a stat error
+    total_ram = mm.get_total_memory(torch.device("cpu"))
+    return size <= total_ram * 0.9
 
 
 def _shards(model_dir):

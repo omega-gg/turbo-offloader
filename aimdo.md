@@ -3,8 +3,9 @@
 GPL offload backend for the turboCLI diffusion runner. Instead of cherry-picking lines from
 ComfyUI (v1, see `doc/aimdo_v1.md`), v2 **vendors ComfyUI's offloading subsystem verbatim** and adds a
 **thin adapter** so turboCLI's diffusers pipelines reuse ComfyUI's own memory manager with 1:1
-parity. The same code runs a model larger than VRAM — even larger than VRAM+RAM — by streaming its
-weights disk→VRAM per forward.
+parity. The same code runs a model larger than VRAM by streaming its weights to VRAM per forward with
+partial GPU residency — from host RAM when the model fits (ComfyUI's UNet offload), else disk→VRAM via
+comfy-aimdo file-slices for a model larger than RAM.
 
 **Style:** code and comments wrap at 99 columns.
 
@@ -46,10 +47,12 @@ All GPL-derived code lives in this package; the calling runner stays GPL-free.
   mmap); a `ModelPatcher` streams them to the compute device per forward via ComfyUI's cast path
   (`cast_bias_weight` → `cast_to`). Needs the model to fit RAM. `comfy_aimdo` not required.
 - **VBAR (optional, CUDA).** When comfy-aimdo is present, `load_pipe` flips
-  `comfy.memory_management.aimdo_enabled` and uses `ModelPatcherDynamic`: each castable module gets
-  a comfy-aimdo VBAR slot and streams **disk→VRAM** on fault (`TensorFileSlice` +
-  `read_tensor_file_slice_into`). Runs models larger than VRAM+RAM. Weights come from ComfyUI's own
-  `load_safetensors` (mmap + file-sliced), so nothing is materialized.
+  `comfy.memory_management.aimdo_enabled` and uses `ModelPatcherDynamic`, which keeps as much of the
+  model GPU-resident as fits (partial residency, sized from live free VRAM) and streams the rest per
+  forward. Per component (`adapter.fits_in_ram`, on-disk size vs `get_total_memory`): weights stream
+  from **host RAM** when the model fits (fast path — `from_pretrained` tensors, same source as native)
+  else **disk→VRAM** via comfy-aimdo file-slices (`load_streamed` / `assign_streamed_weights`) for a
+  model larger than RAM. This is ComfyUI's "dynamic VRAM loading" path.
 
 The seam picks VBAR automatically on CUDA-with-comfy-aimdo, native otherwise. `set_device()` maps
 the seam's `device=` arg onto `comfy.model_management.cpu_state`, the single knob that switches the
@@ -67,10 +70,6 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
 - **`build_patcher` / `build_dynamic_patcher`** — wrap in `ModelPatcher` / `ModelPatcherDynamic`.
   `make_patchable` shadows diffusers/HF's read-only `.device` property (which ComfyUI assigns to)
   while keeping `str(cls)` identical so transformers' output-capture registry still fires.
-- **`load_streamed` / `assign_streamed_weights`** — meta-load a transformer (no weight RAM) and
-  assign mmap/file-sliced weights from `load_safetensors`; structural (shape + longest-common
-  suffix) key matching handles renamed checkpoints (e.g. the Qwen2.5-VL TE's `model.` →
-  `language_model.`).
 - **`keep_uncastable_resident`** — move every non-castable param/buffer (custom norms, pad tokens,
   rotary caches) to the compute device so nothing is stranded on the offload device mid-forward.
 - **`add_lora`** — on-cast LoRA: build the `{lora_key → model_weight_key}` map, hand it to
@@ -107,7 +106,9 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   `image=`, so the seam is unchanged.
 - **z-image** (`ZImagePipeline`) — text-to-image, Turbo (few-step).
 - **qwen-image-edit** (`QwenImageEditPlusPipeline`) — image-edit; on-cast Lightning 4-step LoRA;
-  ~55GB of weights (transformer + Qwen2.5-VL TE) stream from disk on a small GPU.
+  ~55GB of weights (transformer + Qwen2.5-VL TE). With enough RAM they stream from RAM; on a small box
+  each oversized component streams disk→VRAM via file-slices (the fit gate decides per component), so
+  it runs where it wouldn't fit in RAM.
 
 ## Notes
 
