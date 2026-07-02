@@ -104,6 +104,13 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     load_dev = adapter.set_device(device)
 
+    # ComfyUI's storage-vs-compute dtype split: on a card without bf16 tensor cores (e.g. Turing) a
+    # bf16 checkpoint computes in fp16 (manual_cast) -- weights stay bf16 (mmap, no RAM blow-up),
+    # every matmul runs on fp16 tensor cores (~5x on such cards). None on Ampere+ (compute in bf16).
+    manual_cast = adapter.manual_cast_dtype(dtype, load_dev)
+    if manual_cast is not None:
+        print("aimdo: manual_cast compute dtype %s (storage %s)" % (manual_cast, dtype), flush=True)
+
     PipelineCls, Transformer = _classes(engine)
 
     # VBAR: CUDA + comfy-aimdo (initialised in pre_torch_init) -> flip aimdo_enabled so ComfyUI's
@@ -144,11 +151,13 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
                                         low_cpu_mem_usage=True, local_files_only=True)
         adapter.comfy_ize(p.transformer)
 
-    adapter.keep_uncastable_resident(p.transformer, load_dev)
+    adapter.keep_uncastable_resident(p.transformer, load_dev, manual_cast)
     if use_vbar:
         adapter.install_prefetch(p.transformer)  # overlap block weight streaming with compute
     adapter.use_comfy_attention(p.transformer)  # ComfyUI's exact SDPA (comfy.ops, cuDNN-first + size gate)
     adapter.use_kitchen_rope(p.transformer)  # ComfyUI's comfy_kitchen fused RoPE
+    if manual_cast is not None:
+        adapter.install_manual_cast(p.transformer, manual_cast, dtype)  # bf16 storage, fp16 compute
     transformer_patcher = build(p.transformer)
 
     # On-cast LoRA (e.g. qwen's Lightning 4-step speed LoRA): applied to the transformer while its

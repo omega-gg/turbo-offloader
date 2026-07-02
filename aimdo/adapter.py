@@ -154,9 +154,9 @@ def make_patchable(model):
     return model
 
 
-def keep_uncastable_resident(model, device):
+def keep_uncastable_resident(model, device, compute_dtype=None):
     """Move every parameter/buffer that ComfyUI's offloader will NOT stream onto `device`, so it
-    stays resident. The offloader only streams the weight/bias of CastWeightBiasOp leaves (the ones
+    stays resident. `compute_dtype` (manual_cast): when set, float stragglers are also cast to it. The offloader only streams the weight/bias of CastWeightBiasOp leaves (the ones
     comfy_ize converted); anything else -- a custom leaf norm (transformers' Qwen3RMSNorm, forward
     `self.weight * hidden_states`), or a bare parameter/buffer hung directly on a container module
     (diffusers' `x_pad_token`, rotary caches, class tokens) -- would otherwise be left on the
@@ -165,22 +165,116 @@ def keep_uncastable_resident(model, device):
     We walk ALL modules and move only their DIRECT (recurse=False) params/buffers, skipping
     CastWeightBiasOp modules entirely so their big weights keep streaming. These stragglers are
     almost always tiny; returns (count, bytes) for logging so a large one is visible."""
+    # When manual_cast is active (compute_dtype set), float stragglers must also move to the compute
+    # dtype so they don't mismatch the fp16 activations -- ComfyUI's model runs uniformly in the
+    # compute dtype. Complex/integer buffers (rope caches, indices) keep their dtype.
+    def _cast(t):
+        if compute_dtype is not None and t.is_floating_point() and t.dtype != compute_dtype:
+            return t.to(device=device, dtype=compute_dtype)
+        return t.to(device)
+
     moved = 0
     nbytes = 0
     for _name, m in model.named_modules():
         if isinstance(m, ops.CastWeightBiasOp):
             continue  # its weight/bias stream via the cast path -- leave on the offload device
         for _n, p in m.named_parameters(recurse=False):
-            if p is not None and p.device != device:
-                p.data = p.data.to(device)
+            if p is not None and (p.device != device or (compute_dtype is not None
+                                                         and p.is_floating_point()
+                                                         and p.dtype != compute_dtype)):
+                p.data = _cast(p.data)
                 moved += 1
                 nbytes += p.numel() * p.element_size()
         for bn, b in m.named_buffers(recurse=False):
-            if b is not None and b.device != device:
-                m._buffers[bn] = b.to(device)
+            if b is not None and (b.device != device or (compute_dtype is not None
+                                                        and b.is_floating_point()
+                                                        and b.dtype != compute_dtype)):
+                m._buffers[bn] = _cast(b)
                 moved += 1
                 nbytes += b.numel() * b.element_size()
     return moved, nbytes
+
+
+def manual_cast_dtype(storage_dtype, device):
+    """ComfyUI's storage-vs-compute dtype split -- comfy/model_management.py::unet_manual_cast
+    (vendored). Returns the COMPUTE dtype to run in when `storage_dtype` is not natively fast on
+    `device`, else None (compute stays in storage dtype). On a card without bf16 tensor cores
+    (e.g. Turing sm_75) a bf16 checkpoint -> torch.float16; on Ampere+ bf16 -> None. The decision
+    is comfy's own, unchanged -- GPU-agnostic."""
+    return mm.unet_manual_cast(storage_dtype, device)
+
+
+def install_manual_cast(model, compute_dtype, storage_dtype):
+    """Copy ComfyUI's manual_cast (should_use_bf16 False path): keep weights in their storage dtype
+    (bf16, mmap-backed -- no load-time materialisation, so RAM use is unchanged from the working
+    path) but run the forward in `compute_dtype` (fp16). The comfy-ized leaves' cast_bias_weight
+    already casts each weight to the INPUT activation dtype at forward (comfy/ops.py), so casting the
+    transformer's float inputs to `compute_dtype` makes every streamed weight cast bf16->fp16 on the
+    GPU per layer and every matmul run on fp16 tensor cores -- exactly what ComfyUI does when the card
+    has no bf16 tensor cores. Complex (rope freqs_cis) and integer inputs are left untouched. The
+    output is cast back to `storage_dtype` so the diffusers pipeline's latent dtype contract holds.
+    Sets model.manual_cast_dtype to mirror comfy's model attribute (read by ModelPatcher)."""
+    model.manual_cast_dtype = compute_dtype
+
+    def _to(v, dt):
+        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != dt:
+            return v.to(dt)
+        return v
+
+    def _cast_inputs(_m, args, kwargs):
+        return (tuple(_to(a, compute_dtype) for a in args),
+                {k: _to(v, compute_dtype) for k, v in kwargs.items()})
+
+    def _cast_output(_m, _args, _kwargs, out):
+        if isinstance(out, torch.Tensor):
+            return _to(out, storage_dtype)
+        if isinstance(out, tuple):
+            return tuple(_to(o, storage_dtype) for o in out)
+        s = getattr(out, "sample", None)
+        if s is not None:
+            out.sample = _to(s, storage_dtype)
+        return out
+
+    model.register_forward_pre_hook(_cast_inputs, with_kwargs=True, prepend=True)
+    model.register_forward_hook(_cast_output, with_kwargs=True)
+
+    # Per-leaf input cast -- the crux of manual_cast. ComfyUI's native model computes EVERY layer in
+    # the manual_cast dtype; the diffusers model computes its time-embedding / adaLN modulation in
+    # fp32, so `norm(x) * scale` promotes fp16 -> fp32 and cast_bias_weight then casts weights to fp32,
+    # dropping every matmul onto the FP32 (volta_sgemm) path instead of fp16 tensor cores (measured:
+    # ~63% of the step). Casting each weighted op's float input to compute_dtype at its forward forces
+    # weight (cast_bias_weight follows input.dtype) and matmul back to fp16 -- exactly ComfyUI's
+    # "compute in the manual_cast dtype" invariant. Int inputs (Embedding indices) are left untouched.
+    def _leaf_cast(_m, args):
+        if args and isinstance(args[0], torch.Tensor) and args[0].is_floating_point() \
+                and args[0].dtype != compute_dtype:
+            return (args[0].to(compute_dtype),) + tuple(args[1:])
+        return None
+
+    for _leaf in model.modules():
+        if isinstance(_leaf, ops.CastWeightBiasOp):
+            _leaf.register_forward_pre_hook(_leaf_cast)
+
+    # ComfyUI clamps activations to the fp16 range after each transformer block (clamp_fp16,
+    # comfy/ldm/lumina/model.py:68-71): without it fp16 overflow -> inf -> NaN -> black image. The
+    # diffusers model has no such guard, so replicate it when computing in fp16. Model-agnostic: hook
+    # the output of every nn.ModuleList child (the block stacks) rather than a named class. nan_to_num
+    # is a near-no-op on in-range values, so over-applying it (e.g. to a norm list) is harmless.
+    if compute_dtype == torch.float16:
+        _MAX = 65504.0
+
+        def _clamp(_m, _a, out):
+            if isinstance(out, torch.Tensor) and out.dtype == torch.float16:
+                return torch.nan_to_num(out, nan=0.0, posinf=_MAX, neginf=-_MAX)
+            return out
+
+        seen = set()
+        for _mod in model.modules():
+            if isinstance(_mod, torch.nn.ModuleList):
+                for _blk in _mod:
+                    if id(_blk) not in seen:
+                        _blk.register_forward_hook(_clamp)
+                        seen.add(id(_blk))
 
 
 def build_patcher(model, load_device=None, offload_device=None, size=0):
