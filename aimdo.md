@@ -84,10 +84,20 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
 - **`install_prefetch`** — drives ComfyUI's `comfy.model_prefetch` (`prefetch_queue_pop`) via
   forward hooks on the transformer's block lists, so block N+1's weights stream while block N
   computes (overlap; helps when streaming-bound).
-- **`prefer_cudnn_attention`** — wraps the forward in `sdpa_kernel` with ComfyUI's exact backend
-  priority `[CUDNN, FLASH, EFFICIENT, MATH]` (cuDNN flash ≈ 2× the cutlass efficient kernel torch
-  otherwise picks). We can't redirect `F.sdpa` to `comfy.ops.scaled_dot_product_attention` — that
-  wrapper calls `F.sdpa` itself and self-recurses — so we apply the same mechanism it uses.
+- **`use_comfy_attention`** — a verbatim copy of `comfy.ops.scaled_dot_product_attention`
+  (`comfy/ops.py:39-64`): on Windows+CUDA it forces the SDPA priority `[CUDNN, FLASH, EFFICIENT,
+  MATH]` **per call**, but only for large inputs (`q.nelement() >= 1024*128`); small attentions use
+  torch's default backend. We reproduce it (rather than import it) because it calls `F.sdpa`
+  internally, so pointing torch's `F.sdpa` at it self-recurses; instead we patch
+  `torch.nn.functional.scaled_dot_product_attention` once (diffusers calls it by attribute) and
+  delegate to the saved original. **The per-call size gate matters:** forcing cuDNN on *every*
+  attention (incl. small inputs, which comfy skips) makes the first z-image forward after a
+  flux2→z-image switch pick a nondeterministic cuDNN plan and diverge; copying comfy's gate verbatim
+  is deterministic.
+- **`use_kitchen_rope`** — routes the diffusers transformer's RoPE through comfy-kitchen's fused
+  `apply_rope1` (the kernel ComfyUI's `comfy/ldm/flux/math.py` uses), via a `(cos,sin)→freqs_cis`
+  shim + a module-scoped patch of `diffusers.models.embeddings.apply_rotary_emb`. Lazy: comfy-kitchen
+  is imported only on a matching call, so engines with their own rope (z-image) never touch it.
 - **fused RMSNorm** — routing custom norms through `disable_weight_init.RMSNorm` gives ComfyUI's
   fused `F.rms_norm` (≈ 3.5× the eager `mul`/`rsqrt` diffusers/transformers use).
 

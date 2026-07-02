@@ -39,9 +39,15 @@ faithful and lower-maintenance than a hand-written `args` stub (no field list to
   All comfy_aimdo *usage* is gated on `memory_management.aimdo_enabled` (default False), so the
   stand-ins are never dereferenced off-CUDA. **No vendored file is edited for comfy_aimdo.**
 
-### (2) optional `comfy_kitchen` — no edit needed
+### (2) optional `comfy_kitchen` — no vendored edit
 Upstream `float.py` / `quant_ops.py` already wrap `import comfy_kitchen` in try/except and log a
-warning when absent. Left verbatim; import proceeds without it (fp8/fp4 quant paths disabled).
+warning when absent, so nothing is edited here. comfy-kitchen is now **pip-installed** into the
+runtime venv (turboCLI `bash/turbo/build.sh`, pinned `43b413e` / `0.2.16`, Apache-2.0) — a native
+wheel, so it is **not vendored** into `aimdo/comfy/`. Present → `quant_ops.py` configures its backends
+(cuda disabled unless torch cu130+, triton unless flagged) exactly as ComfyUI does, and
+`aimdo/adapter.py:use_kitchen_rope` routes diffusers' `apply_rotary_emb` through `ck.apply_rope1`
+(the same fused kernel ComfyUI's `comfy/ldm/flux/math.py` uses). Absent → fp8/fp4 quant paths and the
+rope routing both degrade to the native path.
 
 ### (3) `# [aimdo] disabled for turboCLI:` comment-outs — 3 one-line edits total
 Each is a single commented import for a dependency that is **off the offloader's code path**, so the

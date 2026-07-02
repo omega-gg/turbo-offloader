@@ -124,7 +124,8 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
                                         local_files_only=True)
         adapter.keep_uncastable_resident(p.transformer, load_dev)
         adapter.install_prefetch(p.transformer)  # overlap block weight streaming with compute
-        adapter.prefer_cudnn_attention(p.transformer)  # ComfyUI's cuDNN-flash SDPA priority
+        adapter.use_comfy_attention(p.transformer)  # ComfyUI's exact SDPA (comfy.ops, cuDNN-first + size gate)
+        adapter.use_kitchen_rope(p.transformer)  # ComfyUI's comfy_kitchen fused RoPE
         transformer_patcher = adapter.build_dynamic_patcher(p.transformer)
     else:
         # Native path: load every module onto the offload device (CPU) with mmap-backed safetensors;
@@ -134,7 +135,8 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
                                         low_cpu_mem_usage=True, local_files_only=True)
         adapter.comfy_ize(p.transformer)
         adapter.keep_uncastable_resident(p.transformer, load_dev)
-        adapter.prefer_cudnn_attention(p.transformer)
+        adapter.use_comfy_attention(p.transformer)
+        adapter.use_kitchen_rope(p.transformer)  # ComfyUI's comfy_kitchen fused RoPE
         transformer_patcher = adapter.build_patcher(p.transformer)
     # On-cast LoRA (e.g. qwen's Lightning 4-step speed LoRA): applied to the transformer while its
     # weights stream in, via ComfyUI's add_patches -> calculate_weight. lora_files: [(path, strength)].
@@ -150,7 +152,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # for standard transformers encoders); otherwise the native cast path.
     if getattr(p, "text_encoder", None) is not None:
         adapter.comfy_ize(p.text_encoder)
-        adapter.prefer_cudnn_attention(p.text_encoder)
+        adapter.use_comfy_attention(p.text_encoder)
         if use_vbar:
             te_missing = adapter.assign_streamed_weights(p.text_encoder,
                                                          os.path.join(model, "text_encoder"))
@@ -198,11 +200,34 @@ def prepare(pipe):
 
 
 def reclaim(pipe):
-    """Per-generation housekeeping: free non-resident models + return the allocator pool."""
+    """Per-generation housekeeping: run ComfyUI's per-execution aimdo teardown, then free non-resident
+    models + return the allocator pool.
+
+    The teardown copies what ComfyUI runs in the `finally` after EVERY node execution when aimdo is on
+    (comfy/execution.py:544-549): reset_cast_buffers + cleanup_prefetch_queues +
+    vbars_reset_watermark_limits. It resets the VBAR streaming state (the globally-cached cast buffers,
+    the block prefetch queues, the VBAR watermarks) between generations. reclaim() is our analog of
+    that per-execution boundary, so we do the same thing ComfyUI does. (This is faithful teardown /
+    hygiene; it is NOT what fixed the flux2->z-image first-gen nondeterminism -- that was copying
+    ComfyUI's exact SDPA size gate in adapter.use_comfy_attention.)"""
     if not getattr(pipe, "_aimdo_patchers", None):
         return
 
     import comfy.model_management as mm
+    import comfy.memory_management as memm
+
+    if getattr(memm, "aimdo_enabled", False):
+        try:
+            mm.reset_cast_buffers()
+
+            import comfy.model_prefetch as mp
+            mp.cleanup_prefetch_queues()
+
+            import comfy_aimdo.model_vbar as mv
+            mv.vbars_reset_watermark_limits()
+        except Exception:
+            print(traceback.format_exc(), flush=True)
+
     dev = getattr(pipe, "_aimdo_device", None)
     if dev is not None:
         mm.free_memory(mm.minimum_inference_memory(), dev)

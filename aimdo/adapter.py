@@ -310,17 +310,31 @@ def load_streamed(model_cls, model_dir, dtype):
     return model, missing
 
 
-def prefer_cudnn_attention(model):
-    """Give a diffusers/transformers model ComfyUI's attention behavior: prioritize the cuDNN-flash
-    SDPA backend (~2x the cutlass efficient kernel torch otherwise picks here).
+_sdpa_patched = False
 
-    ComfyUI applies this inside comfy.ops.scaled_dot_product_attention via sdpa_kernel(). We can't
-    just redirect torch's F.scaled_dot_product_attention to that wrapper -- the wrapper calls
-    F.scaled_dot_product_attention itself, so the redirect self-recurses. So we apply the SAME
-    mechanism (torch.nn.attention.sdpa_kernel with the SAME priority list comfy uses) around the
-    model's forward, which every internal F.sdpa call then respects. No-op if torch lacks
-    set_priority."""
+
+def use_comfy_attention(model=None):
+    """Route diffusers' attention through a copy of ComfyUI's own `comfy.ops.scaled_dot_product_attention`
+    (comfy/ops.py:39-64), so our SDPA behaves EXACTLY like ComfyUI's -- not an approximation.
+
+    ComfyUI, on Windows+CUDA with a recent torch, forces the SDPA backend priority
+    [CUDNN, FLASH, EFFICIENT, MATH] -- but ONLY per call and ONLY for large inputs
+    (`q.nelement() >= 1024*128`); small attentions fall through to torch's default backend (cuDNN is
+    slower there). We reproduce that verbatim. diffusers calls `torch.nn.functional.scaled_dot_product_attention`
+    by attribute (diffusers/models/attention_dispatch.py), so we patch that one name, once and
+    process-global (idempotent), delegating to the saved original -- no self-recursion. `model` is
+    accepted only for signature parity with the other patchers; the patch is global, as ComfyUI's is.
+    No-op off Windows/CUDA or on a torch without set_priority (exactly ComfyUI's own guard)."""
+    global _sdpa_patched
+    if _sdpa_patched:
+        return True
+
+    import torch.nn.functional as F
+    import comfy.model_management as mm
+
     try:
+        if not (torch.cuda.is_available() and getattr(mm, "WINDOWS", False)):
+            return False
         from torch.nn.attention import SDPBackend, sdpa_kernel
         import inspect
         if "set_priority" not in inspect.signature(sdpa_kernel).parameters:
@@ -328,16 +342,124 @@ def prefer_cudnn_attention(model):
     except Exception:
         return False
 
-    # Same list comfy.ops builds (ops.py: [CUDNN, FLASH, EFFICIENT, MATH]).
+    # comfy/ops.py builds [FLASH, EFFICIENT, MATH] then inserts CUDNN at the front (ops.py:48-54).
     priority = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
                 SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
-    orig_forward = model.forward
+    orig = F.scaled_dot_product_attention
 
-    def forward(*args, **kwargs):
+    def scaled_dot_product_attention(*args, **kwargs):
+        # comfy/ops.py:56-60 verbatim (the branch + sdpa_kernel), only the arg handling differs:
+        # ComfyUI's models call comfy.ops.scaled_dot_product_attention(q, k, v, ...) POSITIONALLY,
+        # but diffusers calls torch's F.sdpa by KEYWORD (query=/key=/value=, attention_dispatch.py),
+        # so we take the query tensor from args[0] or kwargs["query"] and forward the call untouched.
+        q = args[0] if args else kwargs.get("query")
+        if q is None or q.nelement() < 1024 * 128:  # comfy: small inputs -> default backend
+            return orig(*args, **kwargs)
         with sdpa_kernel(priority, set_priority=True):
-            return orig_forward(*args, **kwargs)
+            return orig(*args, **kwargs)
 
-    model.forward = forward
+    F.scaled_dot_product_attention = scaled_dot_product_attention
+    _sdpa_patched = True
+    return True
+
+
+# --------------------------------------------------------------------------------------------------
+# comfy-kitchen fused RoPE. ComfyUI runs its flux RoPE through comfy_kitchen's fused kernel
+# (comfy/ldm/flux/math.py:apply_rope1 -> comfy.quant_ops.ck.apply_rope1) on the normal bf16 path. We
+# use diffusers models, so we route diffusers' rope through the SAME kernel. No kernel is
+# reimplemented: we import comfy_kitchen (via the vendored, already-backend-configured
+# comfy.quant_ops.ck) and only add a tiny format shim between diffusers' (cos, sin) and ck's
+# freqs_cis. Like ComfyUI, we do NOT device-gate -- ck's own registry picks the backend per device
+# (CUDA kernel on cu130+, eager on cpu/mps).
+# --------------------------------------------------------------------------------------------------
+
+_KITCHEN_ROPE = os.environ.get("AIMDO_KITCHEN_ROPE", "1") != "0"
+
+
+def _build_freqs_cis(cos, sin):
+    """Pack diffusers' (cos, sin) -- each frequency duplicated across its adjacent pair -- into
+    comfy_kitchen / ComfyUI's rope() layout [[cos, -sin], [sin, cos]] of shape [..., D/2, 2, 2], in
+    float32 (matching diffusers' float accumulation). Reproduces comfy/ldm/flux/math.py:rope() from
+    precomputed cos/sin. cos/sin arrive already broadcast to the input rank (via the sequence_dim
+    None-insertion), so freqs_cis broadcasts against ck.apply_rope1's reshaped x directly."""
+    c = cos[..., 0::2].float()
+    s = sin[..., 0::2].float()
+    return torch.stack([c, -s, s, c], dim=-1).reshape(*c.shape, 2, 2)
+
+
+def _make_kitchen_rope(orig):
+    """Build the replacement for a diffusers `apply_rotary_emb`. `orig` is the module's own binding
+    (the fall-through target). comfy_kitchen is resolved LAZILY on the first *matching* call, so a
+    module whose calls never match (or a model we patch but never run) imports nothing."""
+    ck_state = {"ck": None, "resolved": False}
+
+    def _ck():
+        if not ck_state["resolved"]:
+            ck_state["resolved"] = True
+            try:
+                import comfy.quant_ops as qo  # configures ck backends exactly as ComfyUI does
+                if getattr(qo, "_CK_AVAILABLE", False):
+                    ck_state["ck"] = qo.ck
+                    print("aimdo: kitchen rope engaged; comfy_kitchen backends=%s"
+                          % qo.ck.list_backends(), flush=True)
+            except Exception:
+                ck_state["ck"] = None
+        return ck_state["ck"]
+
+    def apply_rotary_emb(x, freqs_cis, use_real=True, use_real_unbind_dim=-1, sequence_dim=2):
+        # Only the flux interleaved convention on a (cos, sin) pair, at inference; else native.
+        if (not use_real or use_real_unbind_dim != -1 or torch.is_grad_enabled()
+                or sequence_dim not in (1, 2) or not isinstance(freqs_cis, (tuple, list))
+                or x.dtype not in (torch.bfloat16, torch.float16)):
+            return orig(x, freqs_cis, use_real, use_real_unbind_dim, sequence_dim)
+
+        ck = _ck()
+        if ck is None:
+            return orig(x, freqs_cis, use_real, use_real_unbind_dim, sequence_dim)
+
+        cos, sin = freqs_cis  # [S, D]
+        # Same broadcast diffusers applies (embeddings.py), so freqs_cis lands on the right axis.
+        if sequence_dim == 2:
+            cos, sin = cos[None, None, :, :], sin[None, None, :, :]
+        else:
+            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+
+        fc = _build_freqs_cis(cos.to(x.device), sin.to(x.device))
+        return ck.apply_rope1(x, fc)
+
+    apply_rotary_emb._aimdo_kitchen = True
+    return apply_rotary_emb
+
+
+def use_kitchen_rope(model):
+    """Route a diffusers transformer's `apply_rotary_emb` through comfy_kitchen's fused `apply_rope1`
+    -- the same kernel ComfyUI uses for flux RoPE (comfy/ldm/flux/math.py). ComfyUI wires this into
+    each model's own code; the diffusers analogue is that each transformer does
+    `from ..embeddings import apply_rotary_emb`, binding the name BY VALUE in its own module at import.
+    So we patch that name in the TRANSFORMER'S module (`type(model).__module__`) -- patching
+    `embeddings` alone would not reach an already-imported binding.
+
+    Fully model-scoped and safe:
+      * Only the model's own module is touched -- other engines' modules are never affected, so a
+        long-lived server that runs flux2 then z-image is fine.
+      * A model whose module has no such symbol (e.g. z-image, whose rope is a complex-valued nested
+        function, not a `from ..embeddings import apply_rotary_emb`) is skipped -- nothing is patched,
+        numerics byte-for-byte unchanged.
+      * Per call, anything outside the flux interleaved convention falls through to the original; ck
+        is imported lazily only on a matching call. No device gate (ck's registry picks per device).
+    No-op when AIMDO_KITCHEN_ROPE=0. Idempotent (won't double-wrap). Returns True if it patched."""
+    if not _KITCHEN_ROPE:
+        return False
+
+    import sys
+
+    mod = sys.modules.get(type(model).__module__)
+    orig = getattr(mod, "apply_rotary_emb", None)
+
+    if orig is None or getattr(orig, "_aimdo_kitchen", False):
+        return False  # no module-level rope symbol here (e.g. z-image), or already patched
+
+    mod.apply_rotary_emb = _make_kitchen_rope(orig)
     return True
 
 
