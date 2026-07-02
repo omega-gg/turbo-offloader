@@ -180,7 +180,9 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
             if te_missing:
                 print("aimdo: %d text-encoder weights had no matching param (skipped)"
                       % len(te_missing), flush=True)
-        adapter.keep_uncastable_resident(p.text_encoder, load_dev)
+        adapter.keep_uncastable_resident(p.text_encoder, load_dev, manual_cast)
+        if manual_cast is not None:
+            adapter.install_manual_cast(p.text_encoder, manual_cast, dtype)  # ComfyUI runs the TE fp16 too
         encoder_patcher = build(p.text_encoder)
         patchers.append(encoder_patcher)
         p._aimdo_encoder = encoder_patcher
