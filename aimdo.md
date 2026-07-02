@@ -72,6 +72,8 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
   while keeping `str(cls)` identical so transformers' output-capture registry still fires.
 - **`keep_uncastable_resident`** — move every non-castable param/buffer (custom norms, pad tokens,
   rotary caches) to the compute device so nothing is stranded on the offload device mid-forward.
+  Under manual_cast (below) it also casts float stragglers to the compute dtype, matching ComfyUI's
+  params being built in that dtype.
 - **`add_lora`** — on-cast LoRA: build the `{lora_key → model_weight_key}` map, hand it to
   `comfy.lora.load_lora` (vendored `weight_adapter`), register via `ModelPatcher.add_patches`. The
   deltas apply while each weight streams in — no fuse, no resident copy.
@@ -86,6 +88,27 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
 
 Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not reimplemented:
 
+- **`manual_cast_dtype` / `install_manual_cast`** — ComfyUI's storage-vs-compute dtype split
+  (`comfy.model_management.unet_manual_cast`). On a GPU without bf16 tensor cores (e.g. Turing sm_75)
+  a bf16 checkpoint's matmuls fall off the tensor cores and run ~5× slower than fp16; ComfyUI computes
+  such a model in **fp16** while the weights stay bf16. We do the same: storage stays bf16 (mmap — no
+  load-time cast, so no RAM blow-up), compute runs fp16. ComfyUI enforces this *inside* its native
+  model; the diffusers model doesn't, so we reproduce the same dtype discipline from outside via
+  forward hooks, each mirroring a specific comfy cast:
+    - input cast ← `model_base.py:207` (`xc = xc.to(dtype)`);
+    - **per-leaf input cast** ← `lumina/model.py:826` (`t_embedder(..., dtype=x.dtype)`) — the crux:
+      diffusers computes the time-embed/adaLN in fp32, so `norm(x) * scale` promotes to fp32 and
+      `cast_bias_weight` then casts weights to fp32, dropping every matmul onto the fp32 `volta_sgemm`
+      path; casting each comfy-ized leaf's input back to the compute dtype forces fp16 tensor cores
+      (`s1688gemm`);
+    - straggler cast (in `keep_uncastable_resident`) ← lumina params built `dtype=x.dtype`;
+    - `clamp_fp16` ← `lumina/model.py:68-71` — guards fp16 overflow (→ NaN → black image) after each
+      block; without it the output is all-zero;
+    - output cast back to the storage dtype (diffusers pipeline latent-dtype contract).
+  The per-layer weight cast itself is comfy's own `cast_bias_weight`, unchanged. Applied to both the
+  transformer and the text encoder (ComfyUI runs the TE fp16 too — `text_encoder_dtype`). Gated by
+  `unet_manual_cast`, so **Ampere+ is unchanged** (returns None → compute stays bf16). z-image 1024×768
+  warm: ~10.4 → ~2.3 s/step, matching ComfyUI; output seed-valid.
 - **`install_prefetch`** — drives ComfyUI's `comfy.model_prefetch` (`prefetch_queue_pop`) via
   forward hooks on the transformer's block lists, so block N+1's weights stream while block N
   computes (overlap; helps when streaming-bound).
