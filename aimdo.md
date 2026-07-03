@@ -145,6 +145,21 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   log, same ~13GB pinned host working set (shown as Windows "shared GPU memory", not a VRAM spill).
   Streaming is ~2s/step from pinned RAM; the residual gap vs ComfyUI on some engines is diffusers'
   unfused-qkv model compute, not the offloader.
+- **Per-step streaming residual on a RAM/VRAM-tight box (investigated, z-image on Turing 16GB/8GB).**
+  After the fp16 fix, compute is at parity with ComfyUI (identical `s1688gemm` / `cutlassF_f16`
+  kernels); the only per-step difference is the weight streaming: ComfyUI streams **pinned** (`Memcpy
+  HtoD Pinned`, whole offloaded set in the pinned hostbuf → ~0.5s), turbo streams **pageable** (~1.5s)
+  because it materializes weights (`from_pretrained`) rather than mmap. Loading mmap-backed
+  (`assign_streamed_weights` for both models) frees the RAM and *does* flip streaming to pinned and
+  the steady step to ~2s — but adds a ~30s **per-gen first-step disk re-fault**: `reset_cast_buffers`
+  bounces the mmap between gens, and turbo only pins ~4.7GB of its 7GB offloaded set while ComfyUI
+  pins all 6.3GB, so turbo's unpinned remainder re-reads from disk. That residency/pin split is set by
+  `comfy_aimdo`'s compiled VBAR heuristics — which give the diffusers transformer a smaller
+  resident+pinned set than ComfyUI's native model — and is **not reachable from the Python bridge**
+  (mmap-load, keep-loaded, `--high-ram`, and comfy's `prepare_sampling` `memory_required` sizing were
+  all tried; none close it). Net: the **materialized path is kept as default** — it streams from fast
+  anonymous RAM (no re-fault), giving ~2.3s/step and ~20s/image, which already beats ComfyUI's ~31s
+  end-to-end (ComfyUI pays a per-request CPU→GPU reload turbo avoids by keeping the model resident).
 - **comfy-kitchen** is a quantization-kernel library, unrelated to offloading — not a dependency.
 - **Re-syncing** a newer ComfyUI: re-copy the files and re-apply the short edit set in
   `comfy/resync.md`; bump the commit pins there, in `comfy/__init__.py`, and in `README.md`.
