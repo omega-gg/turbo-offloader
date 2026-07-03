@@ -468,6 +468,23 @@ def use_comfy_attention(model=None):
         # but diffusers calls torch's F.sdpa by KEYWORD (query=/key=/value=, attention_dispatch.py),
         # so we take the query tensor from args[0] or kwargs["query"] and forward the call untouched.
         q = args[0] if args else kwargs.get("query")
+        # manual_cast (fp16 compute on a bf16 checkpoint) can leave the attention inputs mismatched:
+        # transformers' qwen3 RoPE promotes q,k to fp32 (fp16 * fp32 cos/sin) while v stays fp16, and
+        # torch's SDPA requires one dtype. Coerce to the lowest-precision float present -- the compute
+        # dtype -- exactly what a uniform native fp16 model would run. Only fires on an actual mismatch.
+        k = args[1] if len(args) > 1 else kwargs.get("key")
+        v = args[2] if len(args) > 2 else kwargs.get("value")
+        if q is not None and k is not None and v is not None and not (q.dtype == k.dtype == v.dtype):
+            floats = [t.dtype for t in (q, k, v) if t.dtype.is_floating_point]
+            if floats:
+                tgt = min(floats, key=lambda d: torch.finfo(d).bits)
+                args = list(args)
+                for i, name in ((0, "query"), (1, "key"), (2, "value")):
+                    if i < len(args) and args[i] is not None:
+                        args[i] = args[i].to(tgt)
+                    elif name in kwargs and kwargs[name] is not None:
+                        kwargs[name] = kwargs[name].to(tgt)
+                q = args[0] if args else kwargs.get("query")
         if q is None or q.nelement() < 1024 * 128:  # comfy: small inputs -> default backend
             return orig(*args, **kwargs)
         with sdpa_kernel(priority, set_priority=True):
