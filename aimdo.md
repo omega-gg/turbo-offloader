@@ -121,7 +121,13 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   delegate to the saved original. **The per-call size gate matters:** forcing cuDNN on *every*
   attention (incl. small inputs, which comfy skips) makes the first z-image forward after a
   flux2→z-image switch pick a nondeterministic cuDNN plan and diverge; copying comfy's gate verbatim
-  is deterministic.
+  is deterministic. **Dtype-mismatch coercion (`adapter.py:471-490`):** under manual_cast (fp16
+  compute on a bf16 checkpoint) some native HF models leave the attention inputs mismatched --
+  transformers' qwen3 RoPE (flux2's text encoder) promotes q,k to fp32 while v stays fp16 -- and
+  torch's SDPA requires one dtype. We coerce mismatched q/k/v to the lowest-precision float present
+  (the compute dtype); ComfyUI never hits this because it runs its OWN qwen3, but its attention does
+  the same class of thing (upcasts q/k/v, `comfy/ldm/modules/attention.py:244-287`). Model/GPU-
+  agnostic: fires only on a real mismatch, no-op on Ampere+ / non-manual-cast.
 - **`use_kitchen_rope`** — routes the diffusers transformer's RoPE through comfy-kitchen's fused
   `apply_rope1` (the kernel ComfyUI's `comfy/ldm/flux/math.py` uses), via a `(cos,sin)→freqs_cis`
   shim + a module-scoped patch of `diffusers.models.embeddings.apply_rotary_emb`. Lazy: comfy-kitchen
