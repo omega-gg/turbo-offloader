@@ -38,6 +38,16 @@ import os
 
 import torch
 
+# ComfyUI's model_management runs get_torch_device() at IMPORT (module level); with cpu_state's default
+# of GPU that calls torch.cuda.current_device(), which asserts "Torch not compiled with CUDA enabled" on
+# a CPU-only build. ComfyUI avoids this because a CPU user passes `--cpu` (-> args.cpu -> cpu_state=CPU,
+# model_management.py:156). We parse no argv, so set args.cpu ourselves when there is no GPU at all,
+# BEFORE model_management imports -- then it initialises cpu_state=CPU and never touches torch.cuda.
+_mps = getattr(torch.backends, "mps", None)
+if not torch.cuda.is_available() and not (_mps is not None and _mps.is_available()):
+    from comfy.cli_args import args as _cli_args
+    _cli_args.cpu = True
+
 import comfy.model_management as mm
 import comfy.model_patcher as model_patcher
 import comfy.ops as ops
