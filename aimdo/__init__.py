@@ -32,6 +32,7 @@
 # =================================================================================================
 
 import os
+import glob
 import traceback
 
 # True once pre_torch_init() has run. Unlike v1, the native path needs no comfy-aimdo, so this is
@@ -92,6 +93,39 @@ def available():
     return _available
 
 
+def _direct_load(module, component_dir, device):
+    """Materialise `module`'s weights straight into `device` memory via ComfyUI's load_torch_file
+    (safetensors safe_open ON the device), then bind them with torch's load_state_dict(assign=True).
+    This is exactly how ComfyUI loads a model on MPS -- read direct to the compute device -- and it
+    halves placement vs diffusers' CPU load followed by load_models_gpu's per-leaf CPU->device copy.
+
+    Model-agnostic: globs every *.safetensors in the diffusers component dir and merges them, so a
+    single-file component (flux2, z-image) and a sharded one (qwen-image-edit's index+shards) both
+    work with no per-model filename knowledge. load_state_dict is torch's, not ComfyUI's: ComfyUI only
+    applies state dicts to its own model classes, so there is no comfy helper for a foreign
+    diffusers/transformers module. assign=True rebinds the params to the device-resident tensors (a
+    plain copy_ would first need them on device, defeating the point); that breaks tied-weight sharing
+    (e.g. Qwen3 tie_word_embeddings, whose lm_head.weight is omitted from the file), so re-tie
+    afterwards. On any failure fall back silently: the weights stay as from_pretrained left them and
+    load_models_gpu places them the normal way."""
+    try:
+        from .comfy.utils import load_torch_file
+        shards = sorted(glob.glob(os.path.join(component_dir, "*.safetensors")))
+        if not shards:
+            return False
+        sd = {}
+        for shard in shards:
+            sd.update(load_torch_file(shard, device=device))
+        module.load_state_dict(sd, assign=True, strict=False)
+        if hasattr(module, "tie_weights"):
+            module.tie_weights()
+        return True
+    except Exception:
+        print("aimdo: direct load failed for %s, using normal placement:\n%s"
+              % (component_dir, traceback.format_exc()), flush=True)
+        return False
+
+
 def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     """Build a diffusers pipeline whose big models (transformer, text encoder) are offloaded through
     ComfyUI's ModelPatcher and streamed from host RAM to the compute device per forward -- exactly how
@@ -118,6 +152,18 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # vendored device-selection / lazy-load branches see the flag. Off CUDA (or without comfy-aimdo)
     # this is False and the plain-ModelPatcher native cast path runs instead.
     use_vbar = _vbar_ready and adapter.enable_vbar(device)
+
+    # Direct-to-device load, MPS only. On MPS (unified memory) we read the big models straight into
+    # device memory (below) instead of diffusers' CPU load + load_models_gpu's per-leaf CPU->device
+    # copy. Safe only here: MPS has no separate VRAM pool, so full residency is always chosen and can
+    # never OOM -- whereas on CUDA load_models_gpu's partial-residency / VBAR streaming decisions must
+    # stand (a full direct load would OOM a smaller-than-model card), and on CPU the weights already
+    # load there so there is nothing to gain. LoRA is fine: direct-load only places the base weights;
+    # load_models_gpu still merges each patch on top via patch_weight_to_device (verified bit-identical
+    # to the normal path). Gated off manual_cast, whose bf16-storage/fp16-compute split relies on the
+    # ModelPatcher cast path a direct assign would bypass (never hit on MPS+fp16 anyway -> None).
+    import comfy.model_management as mm
+    direct_load = mm.is_device_mps(load_dev) and manual_cast is None
 
     patchers = []
 
@@ -150,6 +196,8 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
         p = PipelineCls.from_pretrained(model, torch_dtype=dtype, use_safetensors=True,
                                         low_cpu_mem_usage=True, local_files_only=True)
         adapter.comfy_ize(p.transformer)
+        if direct_load:
+            _direct_load(p.transformer, os.path.join(model, "transformer"), load_dev)
 
     adapter.keep_uncastable_resident(p.transformer, load_dev, manual_cast)
     if use_vbar:
@@ -174,6 +222,8 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     if getattr(p, "text_encoder", None) is not None:
         adapter.comfy_ize(p.text_encoder)
         adapter.use_comfy_attention(p.text_encoder)
+        if direct_load:
+            _direct_load(p.text_encoder, os.path.join(model, "text_encoder"), load_dev)
         if use_vbar and not adapter.fits_in_ram(os.path.join(model, "text_encoder")):
             te_missing = adapter.assign_streamed_weights(p.text_encoder,
                                                          os.path.join(model, "text_encoder"))

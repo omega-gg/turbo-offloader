@@ -147,6 +147,17 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
 
 ## Notes
 
+- **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` reads the transformer + text
+  encoder straight onto the device via ComfyUI's `load_torch_file` (`safetensors.safe_open(device=
+  "mps")`) + `load_state_dict(assign=True)` — exactly how ComfyUI loads on Apple Silicon — instead of
+  diffusers' CPU load followed by `load_models_gpu`'s per-leaf CPU→device copy; `load_models_gpu` then
+  no-ops on the resident weights. Halves placement (flux2-4B ~103s → ~51s), flipping aimdo one-shot
+  from ~70s slower than a plain `.to("mps")` to ~1min faster (also ~15% faster diffusion from the
+  comfy operator swaps → ~21% total). MPS-only: CUDA's separate VRAM pool needs `load_models_gpu`'s
+  partial-residency / VBAR decisions (a full direct load would OOM), CPU already loads there. Model-
+  agnostic (globs component shards); LoRA-safe (patches still merge on top via `patch_weight_to_
+  device`, verified bit-identical); gated off `manual_cast`; any mismatch falls back to normal
+  placement. `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after.
 - **Offloading matches ComfyUI.** Same `ModelPatcherDynamic`, same "N MB Staged / M force-preloaded"
   log, same ~13GB pinned host working set (shown as Windows "shared GPU memory", not a VRAM spill).
   Streaming is ~2s/step from pinned RAM; the residual gap vs ComfyUI on some engines is diffusers'
