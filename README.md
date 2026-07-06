@@ -1,15 +1,16 @@
 # turbo-aimdo
 
-turbo-aimdo is a [turboCLI](https://omega.gg/turboCLI) high performance offloader based on [comfy-aimdo](https://github.com/Comfy-Org/comfy-aimdo).
-Paired with a compliant CUDA GPU it improves generate times substantially through optimal memory
-allocations when the model does not fit into VRAM, even on a very low VRAM GPU.
+turbo-aimdo is a [turboCLI](https://omega.gg/turboCLI) high performance offloader based on [ComfyUI](https://github.com/comfy-org/comfyui).
+It improves generate times substantially through optimal memory allocations when the model does not
+fit into VRAM, even on a very low VRAM GPU. It's particularly useful for CUDA GPU(s) but also works
+on CPU and Apple MPS.
 
 ## ComfyUI
 
-turbo-aimdo's offloader is a **byte-for-byte port** of ComfyUI's memory-management / model-patcher /
-ops subsystem (under `aimdo/comfy`), driven through the thin adapter in `aimdo/adapter.py`. The
-port is pinned to exact upstream commits. Bump these together with the vendored files and re-apply
-the short edit list in [`aimdo/comfy/resync.md`](aimdo/comfy/resync.md):
+turbo-aimdo's offloader is a port of ComfyUI's memory-management / model-patcher / ops subsystem
+(under `aimdo/comfy`), driven through the thin adapter in `aimdo/adapter.py`. The port is pinned to
+exact upstream commits. Bump these together with the vendored files and re-apply the short edit
+list in [`aimdo/comfy/resync.md`](aimdo/comfy/resync.md):
 
 | dependency    | commit                                     | version                 |
 |---------------|--------------------------------------------|-------------------------|
