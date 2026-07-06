@@ -14,14 +14,14 @@
 #
 #==================================================================================================
 #
-#   End-to-end driver for the v2 native offload seam, bypassing the runner (drives the seam directly:
-#   pre_torch_init / load_pipe / prepare / <generate> / reclaim / release). Validates the
-#   device-agnostic path on a small GPU: the big models (transformer + text encoder) are offloaded
-#   through ComfyUI's ModelPatcher and streamed to the compute device per forward, so the pipe runs
-#   even when neither model fits VRAM.
+# End-to-end driver for the v2 native offload seam, bypassing the runner (drives the seam directly:
+# pre_torch_init / load_pipe / prepare / <generate> / reclaim / release). Validates the
+# device-agnostic path on a small GPU: the big models (transformer + text encoder) are offloaded
+# through ComfyUI's ModelPatcher and streamed to the compute device per forward, so the pipe runs
+# even when neither model fits VRAM.
 #
-#   The model directory is read from OFFLOADER_MODEL (a diffusers layout with transformer/, text_encoder/,
-#   vae/ ...), so no machine-specific path is baked in.
+# The model directory is read from OFFLOADER_MODEL (a diffusers layout with transformer/,
+# text_encoder/, vae/ ...), so no machine-specific path is baked in.
 #
 #   Run:
 #       OFFLOADER_MODEL=/path/to/FLUX.2-klein-4B  python tests/drive.py flux2   cuda 1024 768 4
@@ -69,7 +69,8 @@ print("engine:", ENGINE, "| available:", offloader.available())
 
 import torch
 
-dtype = torch.bfloat16 if DEVICE == "cuda" else (torch.float16 if DEVICE == "mps" else torch.float32)
+dtype = (torch.bfloat16 if DEVICE == "cuda"
+         else torch.float16 if DEVICE == "mps" else torch.float32)
 if DEVICE == "cuda":
     torch.cuda.reset_peak_memory_stats()
     print("GPU:", torch.cuda.get_device_name(0),

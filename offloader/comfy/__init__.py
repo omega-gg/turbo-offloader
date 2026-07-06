@@ -30,8 +30,8 @@
 #==================================================================================================
 
 # The vendored files import each other with absolute names (`import comfy.model_management`,
-# `from comfy.cli_args import args`). Alias this package as top-level `comfy` so those resolve to the
-# vendored copies without editing a single import line. Import `offloader.comfy` once to
+# `from comfy.cli_args import args`). Alias this package as top-level `comfy` so those resolve to
+# the vendored copies without editing a single import line. Import `offloader.comfy` once to
 # establish the alias, then always use `comfy.*` (never `offloader.comfy.*`) so there is exactly
 # one module object per vendored file.
 import sys as _sys

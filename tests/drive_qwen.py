@@ -14,9 +14,9 @@
 #
 #==================================================================================================
 #
-#   End-to-end driver for qwen-image-edit (an IMAGE-input / edit engine) through the v2 seam. Drives
-#   the Lightning 4-step speed LoRA on-cast. The transformer (~39GB) + text encoder (~16GB) stream
-#   disk->VRAM via VBAR, so it runs on a tiny GPU (very slow -- 55GB streams from disk).
+# End-to-end driver for qwen-image-edit (an IMAGE-input / edit engine) through the v2 seam. Drives
+# the Lightning 4-step speed LoRA on-cast. The transformer (~39GB) + text encoder (~16GB) stream
+# disk->VRAM via VBAR, so it runs on a tiny GPU (very slow -- 55GB streams from disk).
 #
 #   OFFLOADER_MODEL points at the Qwen-Image-Edit-2511 diffusers dir (holds the LoRA files too).
 #
@@ -95,7 +95,8 @@ if marks:
 if DEVICE == "cuda":
     print("peak VRAM: %.2f GB" % (torch.cuda.max_memory_allocated() / 1e9))
 
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out_qwen_%s_%dx%d.png" % (DEVICE, WIDTH, HEIGHT))
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                   "out_qwen_%s_%dx%d.png" % (DEVICE, WIDTH, HEIGHT))
 img.save(out)
 print("Saved:", out)
 

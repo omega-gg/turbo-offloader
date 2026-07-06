@@ -15,7 +15,8 @@
 #==================================================================================================
 #
 #   Sanity-check a generated image is real content, not a black/uniform frame: prints spread stats
-#   and exits non-zero if the image looks empty (std too low). Used to validate drive_flux2.py output.
+# and exits non-zero if the image looks empty (std too low). Used to validate drive_flux2.py
+# output.
 #
 #   Run:  python tests/check_img.py path/to/image.png
 #
@@ -31,7 +32,8 @@ def main(path):
     im = Image.open(path)
     a = np.asarray(im).astype("float32")
     std = float(a.std())
-    colors = len(np.unique(a.reshape(-1, a.shape[-1]), axis=0)) if a.ndim == 3 else int((a > 0).sum())
+    colors = (len(np.unique(a.reshape(-1, a.shape[-1]), axis=0)) if a.ndim == 3
+              else int((a > 0).sum()))
     print("size:", im.size, "mode:", im.mode)
     print("min/mean/max: %.1f/%.1f/%.1f" % (a.min(), a.mean(), a.max()))
     print("std (>~5 => real content): %.1f" % std)

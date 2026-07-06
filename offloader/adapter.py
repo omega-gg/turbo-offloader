@@ -21,8 +21,8 @@
 #     1. comfy_ize(model): re-class each vanilla torch leaf module (Linear/Conv/Norm/Embedding) to
 #        its ComfyUI `disable_weight_init.*` counterpart. Those classes ARE `torch.nn.X` +
 #        CastWeightBiasOp, so their forward routes through ComfyUI's device-agnostic cast path
-#        (forward_comfy_cast_weights -> cast_bias_weight -> cast_to) exactly when ModelPatcher flags
-#        the module for offload -- and computes identically to the original op otherwise.
+# (forward_comfy_cast_weights -> cast_bias_weight -> cast_to) exactly when ModelPatcher flags the
+# module for offload -- and computes identically to the original op otherwise.
 #
 #     2. build_patcher(model): wrap the comfy-ized module in a ComfyUI ModelPatcher. From there the
 #        seam drives ComfyUI's own load_models_gpu / free_memory to stream weights CPU<->device per
@@ -32,17 +32,19 @@
 #
 #==================================================================================================
 
-from . import comfy  # noqa: F401  establishes the top-level `comfy` alias (see offloader/comfy/__init__.py)
+# Establishes the top-level `comfy` alias (see offloader/comfy/__init__.py).
+from . import comfy  # noqa: F401
 
 import os
 
 import torch
 
-# ComfyUI's model_management runs get_torch_device() at IMPORT (module level); with cpu_state's default
-# of GPU that calls torch.cuda.current_device(), which asserts "Torch not compiled with CUDA enabled" on
-# a CPU-only build. ComfyUI avoids this because a CPU user passes `--cpu` (-> args.cpu -> cpu_state=CPU,
-# model_management.py:156). We parse no argv, so set args.cpu ourselves when there is no GPU at all,
-# BEFORE model_management imports -- then it initialises cpu_state=CPU and never touches torch.cuda.
+# ComfyUI's model_management runs get_torch_device() at IMPORT (module level); with cpu_state's
+# default of GPU that calls torch.cuda.current_device(), which asserts "Torch not compiled with
+# CUDA enabled" on a CPU-only build. ComfyUI avoids this because a CPU user passes `--cpu` (->
+# args.cpu -> cpu_state=CPU, model_management.py:156). We parse no argv, so set args.cpu ourselves
+# when there is no GPU at all, BEFORE model_management imports -- then it initialises cpu_state=CPU
+# and never touches torch.cuda.
 _mps = getattr(torch.backends, "mps", None)
 if not torch.cuda.is_available() and not (_mps is not None and _mps.is_available()):
     from comfy.cli_args import args as _cli_args
@@ -53,11 +55,11 @@ import comfy.model_patcher as model_patcher
 import comfy.ops as ops
 
 
-# --------------------------------------------------------------------------------------------------
-# Op mapping: torch leaf type -> ComfyUI disable_weight_init counterpart (a torch.nn.X subclass that
-# also mixes in CastWeightBiasOp). Checked in order; the first isinstance() match wins. Every diffuser
-# transformer/text-encoder leaf that carries an offloadable weight is one of these.
-# --------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
+# Op mapping: torch leaf type -> ComfyUI disable_weight_init counterpart (a torch.nn.X subclass
+# that also mixes in CastWeightBiasOp). Checked in order; the first isinstance() match wins. Every
+# diffuser transformer/text-encoder leaf that carries an offloadable weight is one of these.
+# -------------------------------------------------------------------------------------------------
 _dwi = ops.disable_weight_init
 
 _OP_MAP = [
@@ -112,9 +114,9 @@ def _prep_rmsnorm(module):
 
 def comfy_ize(model):
     """Re-class every offloadable leaf of `model` in place so its forward routes through ComfyUI's
-    cast path when flagged. Injects exactly the attributes ModelPatcher.load()/cast_bias_weight read
-    (comfy_cast_weights, weight_function, bias_function, and bias=None for weight-only ops). Returns
-    the number of modules converted.
+    cast path when flagged. Injects exactly the attributes ModelPatcher.load()/cast_bias_weight
+    read (comfy_cast_weights, weight_function, bias_function, and bias=None for weight-only ops).
+    Returns the number of modules converted.
 
     Re-classing to ComfyUI's own class (rather than a synthesized mixin) keeps true 1:1 parity: the
     running forward IS disable_weight_init.<Op>.forward. The lazy-init __init__ of those classes is
@@ -130,17 +132,18 @@ def comfy_ize(model):
             _prep_rmsnorm(m)
 
         # Re-class the live instance. torch.nn.X subclasses share a compatible object layout, so
-        # __class__ assignment is valid; diffusers custom subclasses that add only config (no forward
-        # override that matters for weight application) keep working through the base op.
+        # __class__ assignment is valid; diffusers custom subclasses that add only config (no
+        # forward override that matters for weight application) keep working through the base op.
         m.__class__ = dwi_cls
 
-        # cast_bias_weight always reads s.bias; weight-only ops (Embedding/RMSNorm) have none. Mirror
-        # what disable_weight_init.__init__ would have set.
+        # cast_bias_weight always reads s.bias; weight-only ops (Embedding/RMSNorm) have none.
+        # Mirror what disable_weight_init.__init__ would have set.
         if not hasattr(m, "bias"):
             m.bias = None
 
-        # Instance-level (never the shared CastWeightBiasOp class lists) so per-module offload flags
-        # don't alias. ModelPatcher.load() overwrites these when it decides to offload the module.
+        # Instance-level (never the shared CastWeightBiasOp class lists) so per-module offload
+        # flags don't alias. ModelPatcher.load() overwrites these when it decides to offload the
+        # module.
         m.comfy_cast_weights = False
         m.weight_function = []
         m.bias_function = []
@@ -157,8 +160,9 @@ def make_patchable(model):
     if isinstance(getattr(cls, "device", None), property):
         # Masquerade as the parent for str(cls): transformers 5.x keys its output-capture registry
         # on `str(self.__class__)` (_CAN_RECORD_REGISTRY.get(str(self.__class__))), so a subclass
-        # with a new class string silently loses output_hidden_states. Copying __module__/__qualname__
-        # makes str(subclass) == str(cls), so the lookup (and hidden-state capture) keeps working.
+        # with a new class string silently loses output_hidden_states. Copying
+        # __module__/__qualname__ makes str(subclass) == str(cls), so the lookup (and hidden-state
+        # capture) keeps working.
         ns = {"device": None, "__module__": cls.__module__, "__qualname__": cls.__qualname__}
         model.__class__ = type(cls.__name__, (cls,), ns)
     return model
@@ -166,8 +170,9 @@ def make_patchable(model):
 
 def keep_uncastable_resident(model, device, compute_dtype=None):
     """Move every parameter/buffer that ComfyUI's offloader will NOT stream onto `device`, so it
-    stays resident. `compute_dtype` (manual_cast): when set, float stragglers are also cast to it. The offloader only streams the weight/bias of CastWeightBiasOp leaves (the ones
-    comfy_ize converted); anything else -- a custom leaf norm (transformers' Qwen3RMSNorm, forward
+    stays resident. `compute_dtype` (manual_cast): when set, float stragglers are also cast to it.
+    The offloader only streams the weight/bias of CastWeightBiasOp leaves (the ones comfy_ize
+    converted); anything else -- a custom leaf norm (transformers' Qwen3RMSNorm, forward
     `self.weight * hidden_states`), or a bare parameter/buffer hung directly on a container module
     (diffusers' `x_pad_token`, rotary caches, class tokens) -- would otherwise be left on the
     offload device by ModelPatcher.load() and blow up mid-forward with a cuda-vs-cpu mismatch.
@@ -175,9 +180,9 @@ def keep_uncastable_resident(model, device, compute_dtype=None):
     We walk ALL modules and move only their DIRECT (recurse=False) params/buffers, skipping
     CastWeightBiasOp modules entirely so their big weights keep streaming. These stragglers are
     almost always tiny; returns (count, bytes) for logging so a large one is visible."""
-    # When manual_cast is active (compute_dtype set), float stragglers must also move to the compute
-    # dtype so they don't mismatch the fp16 activations -- ComfyUI's model runs uniformly in the
-    # compute dtype. Complex/integer buffers (rope caches, indices) keep their dtype.
+    # When manual_cast is active (compute_dtype set), float stragglers must also move to the
+    # compute dtype so they don't mismatch the fp16 activations -- ComfyUI's model runs uniformly
+    # in the compute dtype. Complex/integer buffers (rope caches, indices) keep their dtype.
     def _cast(t):
         if compute_dtype is not None and t.is_floating_point() and t.dtype != compute_dtype:
             return t.to(device=device, dtype=compute_dtype)
@@ -218,11 +223,12 @@ def install_manual_cast(model, compute_dtype, storage_dtype):
     """Copy ComfyUI's manual_cast (should_use_bf16 False path): keep weights in their storage dtype
     (bf16, mmap-backed -- no load-time materialisation, so RAM use is unchanged from the working
     path) but run the forward in `compute_dtype` (fp16). The comfy-ized leaves' cast_bias_weight
-    already casts each weight to the INPUT activation dtype at forward (comfy/ops.py), so casting the
-    transformer's float inputs to `compute_dtype` makes every streamed weight cast bf16->fp16 on the
-    GPU per layer and every matmul run on fp16 tensor cores -- exactly what ComfyUI does when the card
-    has no bf16 tensor cores. Complex (rope freqs_cis) and integer inputs are left untouched. The
-    output is cast back to `storage_dtype` so the diffusers pipeline's latent dtype contract holds.
+    already casts each weight to the INPUT activation dtype at forward (comfy/ops.py), so casting
+    the transformer's float inputs to `compute_dtype` makes every streamed weight cast bf16->fp16
+    on the GPU per layer and every matmul run on fp16 tensor cores -- exactly what ComfyUI does
+    when the card has no bf16 tensor cores. Complex (rope freqs_cis) and integer inputs are left
+    untouched. The output is cast back to `storage_dtype` so the diffusers pipeline's latent dtype
+    contract holds.
     Sets model.manual_cast_dtype to mirror comfy's model attribute (read by ModelPatcher)."""
     model.manual_cast_dtype = compute_dtype
 
@@ -248,13 +254,14 @@ def install_manual_cast(model, compute_dtype, storage_dtype):
     model.register_forward_pre_hook(_cast_inputs, with_kwargs=True, prepend=True)
     model.register_forward_hook(_cast_output, with_kwargs=True)
 
-    # Per-leaf input cast -- the crux of manual_cast. ComfyUI's native model computes EVERY layer in
-    # the manual_cast dtype; the diffusers model computes its time-embedding / adaLN modulation in
-    # fp32, so `norm(x) * scale` promotes fp16 -> fp32 and cast_bias_weight then casts weights to fp32,
-    # dropping every matmul onto the FP32 (volta_sgemm) path instead of fp16 tensor cores (measured:
-    # ~63% of the step). Casting each weighted op's float input to compute_dtype at its forward forces
-    # weight (cast_bias_weight follows input.dtype) and matmul back to fp16 -- exactly ComfyUI's
-    # "compute in the manual_cast dtype" invariant. Int inputs (Embedding indices) are left untouched.
+    # Per-leaf input cast -- the crux of manual_cast. ComfyUI's native model computes EVERY layer
+    # in the manual_cast dtype; the diffusers model computes its time-embedding / adaLN modulation
+    # in fp32, so `norm(x) * scale` promotes fp16 -> fp32 and cast_bias_weight then casts weights
+    # to fp32, dropping every matmul onto the FP32 (volta_sgemm) path instead of fp16 tensor cores
+    # (measured: ~63% of the step). Casting each weighted op's float input to compute_dtype at its
+    # forward forces weight (cast_bias_weight follows input.dtype) and matmul back to fp16 --
+    # exactly ComfyUI's "compute in the manual_cast dtype" invariant. Int inputs (Embedding
+    # indices) are left untouched.
     def _leaf_cast(_m, args):
         if args and isinstance(args[0], torch.Tensor) and args[0].is_floating_point() \
                 and args[0].dtype != compute_dtype:
@@ -267,9 +274,10 @@ def install_manual_cast(model, compute_dtype, storage_dtype):
 
     # ComfyUI clamps activations to the fp16 range after each transformer block (clamp_fp16,
     # comfy/ldm/lumina/model.py:68-71): without it fp16 overflow -> inf -> NaN -> black image. The
-    # diffusers model has no such guard, so replicate it when computing in fp16. Model-agnostic: hook
-    # the output of every nn.ModuleList child (the block stacks) rather than a named class. nan_to_num
-    # is a near-no-op on in-range values, so over-applying it (e.g. to a norm list) is harmless.
+    # diffusers model has no such guard, so replicate it when computing in fp16. Model-agnostic:
+    # hook the output of every nn.ModuleList child (the block stacks) rather than a named class.
+    # nan_to_num is a near-no-op on in-range values, so over-applying it (e.g. to a norm list) is
+    # harmless.
     if compute_dtype == torch.float16:
         _MAX = 65504.0
 
@@ -300,18 +308,19 @@ def build_patcher(model, load_device=None, offload_device=None, size=0):
                                       offload_device=offload_device, size=size)
 
 
-# --------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 # VBAR (CUDA only). Flipping comfy.memory_management.aimdo_enabled turns on ComfyUI's own dynamic
-# path: ModelPatcherDynamic streams each RAM-resident weight to VRAM per forward and keeps only what
-# fits GPU-resident (partial residency, sized by load_models_gpu from live free VRAM), so a model
-# larger than VRAM still runs -- exactly as ComfyUI offloads a UNet. On CPU/MPS this stays off and the
-# native cast_to path runs.
-# --------------------------------------------------------------------------------------------------
+# path: ModelPatcherDynamic streams each RAM-resident weight to VRAM per forward and keeps only
+# what fits GPU-resident (partial residency, sized by load_models_gpu from live free VRAM), so a
+# model larger than VRAM still runs -- exactly as ComfyUI offloads a UNet. On CPU/MPS this stays
+# off and the native cast_to path runs.
+# -------------------------------------------------------------------------------------------------
 def enable_vbar(device):
-    """Flip aimdo_enabled so the vendored VBAR dynamic path engages. CUDA only. comfy-aimdo's global
+    """Flip aimdo_enabled so the vendored VBAR path engages. CUDA only. comfy-aimdo's global
     init (allocator hooks) must have run in the seam's pre_torch_init() BEFORE torch was imported;
     here -- after torch, with the device known -- we do the per-device init (init_device, like v1)
-    that ModelVBAR needs, then set the flag. Returns True when VBAR is active, False (-> native path)
+    that ModelVBAR needs, then set the flag. Returns True when VBAR is active, False (-> native
+    path)
     off CUDA or if the device init fails."""
     dev = str(device).lower()
     if dev.split(":")[0] != "cuda":
@@ -331,9 +340,10 @@ def enable_vbar(device):
 def fits_in_ram(model_dir):
     """True when a component's weights fit in host RAM, so they can stream to the GPU from RAM
     (ComfyUI's fast path) instead of disk->VRAM. GPU/card-agnostic: the size is the on-disk shard
-    total, the budget is ComfyUI's own get_total_memory(cpu). Only one big component is hot at a time
-    (encode, then sample), so it must fit alone; ~10% is reserved for the OS. A component bigger than
-    this streams disk->VRAM via load_streamed / assign_streamed_weights (comfy-aimdo VBAR), which
+    total, the budget is ComfyUI's own get_total_memory(cpu). Only one big component is hot at a
+    time (encode, then sample), so it must fit alone; ~10% is reserved for the OS. A component
+    bigger than this streams disk->VRAM via load_streamed / assign_streamed_weights (comfy-aimdo
+    VBAR), which
     never materialises it in RAM -- the only way to run a model larger than host RAM."""
     try:
         size = sum(os.path.getsize(s) for s in _shards(model_dir))
@@ -344,8 +354,8 @@ def fits_in_ram(model_dir):
 
 
 def _shards(model_dir):
-    """The .safetensors shard paths for a diffusers component dir, honouring a .index.json if present
-    (mirrors v1's _offsets shard discovery)."""
+    """The .safetensors shard paths for a diffusers component dir, honouring a .index.json
+    if present (mirrors v1's _offsets shard discovery)."""
     import json
     idx = os.path.join(model_dir, "diffusion_pytorch_model.safetensors.index.json")
     if os.path.exists(idx):
@@ -359,7 +369,8 @@ def _shards(model_dir):
 def _match_by_suffix(live_name, live_tensor, disk_by_shape):
     """Pick the disk key for `live_name` among same-shape/dtype candidates by longest common dotted
     suffix; return it only if that best match is unique (mirrors v1's _match_disk_keys). Handles
-    checkpoints whose keys were renamed by a prefix (e.g. transformers' `model.` -> `language_model.`
+    checkpoints whose keys were renamed by a prefix (e.g. transformers' `model.` ->
+    `language_model.`
     for Qwen2.5-VL) where a direct name lookup misses."""
     cands = disk_by_shape.get((tuple(live_tensor.shape), live_tensor.dtype))
     if not cands:
@@ -380,10 +391,11 @@ def _match_by_suffix(live_name, live_tensor, disk_by_shape):
 
 
 def assign_streamed_weights(model, model_dir):
-    """Replace `model`'s weights with mmap-backed, file-sliced tensors from its .safetensors shard(s)
-    (via ComfyUI's own load_safetensors), so the VBAR path can fault each straight from disk. Matches
-    disk keys to model.named_parameters() by name; for any that don't match directly (checkpoints
-    with renamed prefixes, e.g. the Qwen2.5-VL text encoder), falls back to structural shape+suffix
+    """Replace `model`'s weights with mmap-backed, file-sliced tensors from its .safetensors
+    shard(s) (via ComfyUI's own load_safetensors), so the VBAR path faults each straight from disk.
+    Matches disk keys to model.named_parameters() by name; for any that don't match directly
+    (checkpoints with renamed prefixes, e.g. the Qwen2.5-VL text encoder), falls back to structural
+    shape+suffix
     matching. Returns the list of disk keys that still found no home."""
     import comfy.utils as cu
 
@@ -423,7 +435,8 @@ def assign_streamed_weights(model, model_dir):
 
 def load_streamed(model_cls, model_dir, dtype):
     """Build a diffusers model whose weights stream disk->VRAM through the VBAR path: meta-load the
-    module (no weight RAM), comfy-ize it, then assign file-sliced weights. Returns (model, missing)."""
+    module (no weight RAM), comfy-ize it, then assign file-sliced weights. Returns (model,
+    missing)."""
     from accelerate import init_empty_weights
 
     cfg = model_cls.load_config(model_dir)
@@ -439,16 +452,18 @@ _sdpa_patched = False
 
 
 def use_comfy_attention(model=None):
-    """Route diffusers' attention through a copy of ComfyUI's own `comfy.ops.scaled_dot_product_attention`
-    (comfy/ops.py:39-64), so our SDPA behaves EXACTLY like ComfyUI's -- not an approximation.
+    """Route diffusers' attention through a copy of ComfyUI's own
+    `comfy.ops.scaled_dot_product_attention` (comfy/ops.py:39-64), so our SDPA behaves EXACTLY like
+    ComfyUI's -- not an approximation.
 
     ComfyUI, on Windows+CUDA with a recent torch, forces the SDPA backend priority
     [CUDNN, FLASH, EFFICIENT, MATH] -- but ONLY per call and ONLY for large inputs
-    (`q.nelement() >= 1024*128`); small attentions fall through to torch's default backend (cuDNN is
-    slower there). We reproduce that verbatim. diffusers calls `torch.nn.functional.scaled_dot_product_attention`
-    by attribute (diffusers/models/attention_dispatch.py), so we patch that one name, once and
-    process-global (idempotent), delegating to the saved original -- no self-recursion. `model` is
-    accepted only for signature parity with the other patchers; the patch is global, as ComfyUI's is.
+    (`q.nelement() >= 1024*128`); small attentions fall through to torch's default backend (cuDNN
+    is slower there). We reproduce that verbatim. diffusers calls
+    `torch.nn.functional.scaled_dot_product_attention` by attribute
+    (diffusers/models/attention_dispatch.py), so we patch that one name, once and process-global
+    (idempotent), delegating to the saved original -- no self-recursion. `model` is accepted only
+    for signature parity with the other patchers; the patch is global, as ComfyUI's is.
     No-op off Windows/CUDA or on a torch without set_priority (exactly ComfyUI's own guard)."""
     global _sdpa_patched
     if _sdpa_patched:
@@ -475,16 +490,19 @@ def use_comfy_attention(model=None):
     def scaled_dot_product_attention(*args, **kwargs):
         # comfy/ops.py:56-60 verbatim (the branch + sdpa_kernel), only the arg handling differs:
         # ComfyUI's models call comfy.ops.scaled_dot_product_attention(q, k, v, ...) POSITIONALLY,
-        # but diffusers calls torch's F.sdpa by KEYWORD (query=/key=/value=, attention_dispatch.py),
-        # so we take the query tensor from args[0] or kwargs["query"] and forward the call untouched.
+        # but diffusers calls torch's F.sdpa by KEYWORD (query=/key=/value=,
+        # attention_dispatch.py), so we take the query tensor from args[0] or kwargs["query"] and
+        # forward the call untouched.
         q = args[0] if args else kwargs.get("query")
-        # manual_cast (fp16 compute on a bf16 checkpoint) can leave the attention inputs mismatched:
-        # transformers' qwen3 RoPE promotes q,k to fp32 (fp16 * fp32 cos/sin) while v stays fp16, and
-        # torch's SDPA requires one dtype. Coerce to the lowest-precision float present -- the compute
-        # dtype -- exactly what a uniform native fp16 model would run. Only fires on an actual mismatch.
+        # manual_cast (fp16 compute on a bf16 checkpoint) can leave the attention inputs
+        # mismatched: transformers' qwen3 RoPE promotes q,k to fp32 (fp16 * fp32 cos/sin) while v
+        # stays fp16, and torch's SDPA requires one dtype. Coerce to the lowest-precision float
+        # present -- the compute dtype -- exactly what a uniform native fp16 model would run. Only
+        # fires on an actual mismatch.
         k = args[1] if len(args) > 1 else kwargs.get("key")
         v = args[2] if len(args) > 2 else kwargs.get("value")
-        if q is not None and k is not None and v is not None and not (q.dtype == k.dtype == v.dtype):
+        if (q is not None and k is not None and v is not None
+                and not (q.dtype == k.dtype == v.dtype)):
             floats = [t.dtype for t in (q, k, v) if t.dtype.is_floating_point]
             if floats:
                 tgt = min(floats, key=lambda d: torch.finfo(d).bits)
@@ -505,15 +523,15 @@ def use_comfy_attention(model=None):
     return True
 
 
-# --------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 # comfy-kitchen fused RoPE. ComfyUI runs its flux RoPE through comfy_kitchen's fused kernel
-# (comfy/ldm/flux/math.py:apply_rope1 -> comfy.quant_ops.ck.apply_rope1) on the normal bf16 path. We
-# use diffusers models, so we route diffusers' rope through the SAME kernel. No kernel is
+# (comfy/ldm/flux/math.py:apply_rope1 -> comfy.quant_ops.ck.apply_rope1) on the normal bf16 path.
+# We use diffusers models, so we route diffusers' rope through the SAME kernel. No kernel is
 # reimplemented: we import comfy_kitchen (via the vendored, already-backend-configured
 # comfy.quant_ops.ck) and only add a tiny format shim between diffusers' (cos, sin) and ck's
 # freqs_cis. Like ComfyUI, we do NOT device-gate -- ck's own registry picks the backend per device
 # (CUDA kernel on cu130+, eager on cpu/mps).
-# --------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 
 _KITCHEN_ROPE = os.environ.get("OFFLOADER_KITCHEN_ROPE", "1") != "0"
 
@@ -574,21 +592,22 @@ def _make_kitchen_rope(orig):
 
 
 def use_kitchen_rope(model):
-    """Route a diffusers transformer's `apply_rotary_emb` through comfy_kitchen's fused `apply_rope1`
+    """Route a diffusers transformer's `apply_rotary_emb` through comfy_kitchen's `apply_rope1`
     -- the same kernel ComfyUI uses for flux RoPE (comfy/ldm/flux/math.py). ComfyUI wires this into
     each model's own code; the diffusers analogue is that each transformer does
-    `from ..embeddings import apply_rotary_emb`, binding the name BY VALUE in its own module at import.
-    So we patch that name in the TRANSFORMER'S module (`type(model).__module__`) -- patching
-    `embeddings` alone would not reach an already-imported binding.
+    `from ..embeddings import apply_rotary_emb`, binding the name BY VALUE in its own module at
+    import. So we patch that name in the TRANSFORMER'S module (`type(model).__module__`) --
+    patching `embeddings` alone would not reach an already-imported binding.
 
     Fully model-scoped and safe:
       * Only the model's own module is touched -- other engines' modules are never affected, so a
         long-lived server that runs flux2 then z-image is fine.
-      * A model whose module has no such symbol (e.g. z-image, whose rope is a complex-valued nested
-        function, not a `from ..embeddings import apply_rotary_emb`) is skipped -- nothing is patched,
-        numerics byte-for-byte unchanged.
-      * Per call, anything outside the flux interleaved convention falls through to the original; ck
-        is imported lazily only on a matching call. No device gate (ck's registry picks per device).
+      * A model whose module has no such symbol (e.g. z-image, whose rope is a complex-valued
+        nested function, not a `from ..embeddings import apply_rotary_emb`) is skipped --
+        nothing is patched, numerics byte-for-byte unchanged.
+      * Per call, anything outside the flux interleaved convention falls through to the original;
+        ck is imported lazily only on a matching call. No device gate (ck's registry picks per
+        device).
     No-op when OFFLOADER_KITCHEN_ROPE=0. Idempotent (no double-wrap). Returns True if patched."""
     if not _KITCHEN_ROPE:
         return False
@@ -607,13 +626,15 @@ def use_kitchen_rope(model):
 
 def install_prefetch(model):
     """Overlap weight streaming with compute by copying ComfyUI's model_prefetch mechanism onto a
-    diffusers transformer. ComfyUI's own models call prefetch_queue_pop() between transformer blocks
-    so block N+1's weights stream on the offload stream while block N computes (av_model.py:913). A
-    diffusers forward doesn't, so every layer stalls waiting for its weights (~30% of a VBAR step).
+    diffusers transformer. ComfyUI's own models call prefetch_queue_pop() between transformer
+    blocks so block N+1's weights stream on the offload stream while block N computes
+    (av_model.py:913). A diffusers forward doesn't, so every layer stalls waiting for its weights
+    (~30% of a VBAR step).
 
     We reproduce it with forward hooks: for each ModuleList of repeated blocks, build a prefetch
-    queue at the transformer's forward-start and pop it before each block runs; tear the queues down
-    at the transformer's forward-end. No-op unless comfy-aimdo/VBAR is active (make_prefetch_queue
+    queue at the transformer's forward-start and pop it before each block runs; tear the queues
+    down at the transformer's forward-end. No-op unless comfy-aimdo/VBAR is active
+    (make_prefetch_queue
     returns None off the dynamic path). Returns the number of block sequences instrumented."""
     import torch.nn as nn
     import comfy.model_prefetch as mp
@@ -672,10 +693,11 @@ _LORA_SUFFIXES = (".lora_down.weight", ".lora_up.weight", ".lora_A.weight", ".lo
 
 
 def add_lora(patcher, lora_specs):
-    """Apply LoRAs on-cast, the ComfyUI way: build the {lora_base_key -> model_weight_key} map, hand
+    """Apply LoRAs on-cast, ComfyUI-style: build the {lora_base_key -> model_weight_key} map, hand
     it to comfy.lora.load_lora (which uses the vendored weight_adapter classes to read lora_up/down
     or lora_A/B + alpha), and register the result via ModelPatcher.add_patches. The patches become
-    LowVramPatch weight_functions that comfy.lora.calculate_weight applies while each weight streams
+    LowVramPatch weight_functions that comfy.lora.calculate_weight applies while each weight
+    streams
     in -- no fusing, no extra resident copy. lora_specs is [(path, strength), ...]."""
     import comfy.utils as cu
     import comfy.lora as clora
@@ -707,8 +729,8 @@ def add_lora(patcher, lora_specs):
 
 
 def build_dynamic_patcher(model, load_device=None, offload_device=None, size=0):
-    """Wrap a streamed model in ModelPatcherDynamic (the VBAR-aware patcher). On a CPU load_device it
-    transparently reroutes to a plain ModelPatcher (VBAR is GPU-only)."""
+    """Wrap a streamed model in ModelPatcherDynamic (the VBAR-aware patcher). On a CPU load_device
+    it transparently reroutes to a plain ModelPatcher (VBAR is GPU-only)."""
     import comfy.model_patcher as model_patcher
     if load_device is None:
         load_device = mm.get_torch_device()
@@ -721,20 +743,22 @@ def build_dynamic_patcher(model, load_device=None, offload_device=None, size=0):
 
 def install_encode_cache(pipe):
     """Cache the text encoder's output by prompt -- a copy of ComfyUI's default node cache
-    (comfy_execution/caching.py::RAMPressureCache): keep every result keyed by the encode call's full
-    inputs, HOLD IT ON CPU, and evict under host-RAM pressure. Reuses ComfyUI's own memory reading:
-    mm.get_free_memory(cpu) below min(10GB, max(2GB, 10% of RAM)) triggers eviction, worst entry first
-    by 1.3**generation_age * cached_bytes (LRU tiebreak) -- RAMPressureCache.ram_release verbatim minus
-    the node-graph bookkeeping. ComfyUI holds CONDITIONING on the CPU for exactly this; a diffusers
-    pipeline encodes on the compute device, so we stash a CPU copy and move it back on a hit (which
-    also frees the VRAM the embeddings would otherwise pin, and lets them count as RAM for eviction).
+    (comfy_execution/caching.py::RAMPressureCache): keep every result keyed by the encode call's
+    full inputs, HOLD IT ON CPU, and evict under host-RAM pressure. Reuses ComfyUI's own memory
+    reading: mm.get_free_memory(cpu) below min(10GB, max(2GB, 10% of RAM)) triggers eviction, worst
+    entry first by 1.3**generation_age * cached_bytes (LRU tiebreak) --
+    RAMPressureCache.ram_release verbatim minus the node-graph bookkeeping. ComfyUI holds
+    CONDITIONING on the CPU for exactly this; a diffusers pipeline encodes on the compute device,
+    so we stash a CPU copy and move it back on a hit (which also frees the VRAM the embeddings
+    would otherwise pin, and lets them count as RAM for eviction).
 
-    diffusers encodes inside __call__ via self.encode_prompt; wrapping that one method means a repeated
-    prompt skips the encoder's forward entirely -- and since load_models_gpu is idempotent the un-run
-    encoder is never streamed in, leaving the diffusion model resident (why ComfyUI's warm runs spend
-    ~0s on a cached encode). The key is the call's FULL (args, kwargs), like ComfyUI keying a node on
-    its whole input signature: an argument that isn't cleanly hashable -- a tensor/image, e.g. an
-    image-conditioned edit encode -- makes the call uncacheable, so it never gets a false hit. No-op if
+    diffusers encodes inside __call__ via self.encode_prompt; wrapping that one method means a
+    repeated prompt skips the encoder's forward entirely -- and since load_models_gpu is idempotent
+    the un-run encoder is never streamed in, leaving the diffusion model resident (why ComfyUI's
+    warm runs spend ~0s on a cached encode). The key is the call's FULL (args, kwargs), like
+    ComfyUI keying a node on its whole input signature: an argument that isn't cleanly hashable --
+    a tensor/image, e.g. an image-conditioned edit encode -- makes the call uncacheable, so it
+    never gets a false hit. No-op if
     the pipe has no encode_prompt or the cache is already installed."""
     real = getattr(pipe, "encode_prompt", None)
 
@@ -821,11 +845,11 @@ def install_encode_cache(pipe):
     pipe._encode_cache_installed = True
 
 
-# --------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 # Device state: one knob switches ComfyUI's whole device stack. get_torch_device() / offload-device
 # helpers read cpu_state, so setting it from the seam's device= arg routes load/offload to CPU, MPS
 # or the GPU without touching any other code.
-# --------------------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 def set_device(device):
     """Force ComfyUI's cpu_state from a turboCLI renderer string ('cpu'/'mps'/'cuda[:N]'). Returns
     the resolved torch load device."""
