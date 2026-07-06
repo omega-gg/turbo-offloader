@@ -20,8 +20,8 @@
 #
 #   The ONLY edits applied over the upstream files are documented in resync.md and fall in three
 #   categories: (1) this sys.modules alias so the vendored `import comfy.X` resolves here, (2)
-#   try/except around the optional comfy_aimdo imports, (3) `# [offloader] disabled for turboCLI:`
-#   comment-outs. Re-syncing a newer ComfyUI = re-copy the files, re-apply that short list.
+#   try/except around the optional comfy_aimdo imports, (3) `# [turbo-offloader] disabled for
+#   turboCLI:` comment-outs. Re-sync = re-copy the files then re-apply that short list.
 #
 #   Source snapshots (bump together with the files):
 #       ComfyUI     bb131be9e83d2f773c90f1d6f1e4b248a498c8c5  (v0.27.0)

@@ -14,10 +14,11 @@ if TYPE_CHECKING:
 import comfy.lora
 import comfy.model_management
 import comfy.patcher_extension
-# [offloader] disabled for turboCLI: node_helpers is a top-level ComfyUI (node-graph) module outside the
-# offloading subsystem. conditioning_set_values is only used by the conditioning helpers at the
-# bottom of this file (~L692-781), none of which the offloader calls. Commenting the import keeps
-# every hook class/enum ModelPatcher needs (EnumHookMode, HookGroup, ...) verbatim.
+# [turbo-offloader] disabled for turboCLI: node_helpers is a top-level ComfyUI (node-graph)
+# module outside the offloading subsystem. conditioning_set_values is only used by the
+# conditioning helpers at the bottom of this file (~L692-781), none of which the offloader calls.
+# Commenting the import keeps every hook class/enum ModelPatcher needs (EnumHookMode,
+# HookGroup, ...) verbatim.
 # from node_helpers import conditioning_set_values
 
 # #######################################################################################################

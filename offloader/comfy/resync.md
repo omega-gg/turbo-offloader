@@ -49,10 +49,10 @@ wheel, so it is **not vendored** into `offloader/comfy/`. Present → `quant_ops
 (the same fused kernel ComfyUI's `comfy/ldm/flux/math.py` uses). Absent → fp8/fp4 quant paths and the
 rope routing both degrade to the native path.
 
-### (3) `# [offloader] disabled for turboCLI:` comment-outs — 3 one-line edits total
+### (3) `# [turbo-offloader] disabled for turboCLI:` comment-outs — 3 one-line edits total
 Each is a single commented import for a dependency that is **off the offloader's code path**, so the
 offloader is unaffected; only unrelated helper functions would `NameError` if ever called (they are
-not). Grep `# [offloader] disabled for turboCLI:` to find them all.
+not). Grep `# [turbo-offloader] disabled for turboCLI:` to find them all.
 
 | file      | line   | commented import                              | why it's off-path |
 |-----------|--------|-----------------------------------------------|-------------------|
