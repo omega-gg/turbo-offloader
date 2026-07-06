@@ -1,10 +1,10 @@
 #==================================================================================================
 #
-#   Copyright (C) 2026-2026 turbo-aimdo authors. <https://omega.gg/turbo-aimdo>
+#   Copyright (C) 2026-2026 turbo-offloader authors. <https://omega.gg/turbo-offloader>
 #
 #   Author: Benjamin Arnaud. <https://bunjee.me> <bunjee@omega.gg>
 #
-#   This file is part of turbo-aimdo.
+#   This file is part of turbo-offloader.
 #
 #   - GNU General Public License Usage:
 #   This file may be used under the terms of the GNU General Public License version 3 as published
@@ -15,12 +15,12 @@
 #==================================================================================================
 #
 #   Vendored ComfyUI offloading subsystem -- a byte-for-byte snapshot of ComfyUI's memory manager /
-#   model patcher / ops, driven through aimdo/adapter.py so turboCLI's diffusers pipelines reuse
-#   ComfyUI's device-agnostic (CPU/CUDA/MPS) partial-offload path with 1:1 parity.
+#   model patcher / ops, driven through offloader/adapter.py so turboCLI's diffusers pipelines
+#   reuse ComfyUI's device-agnostic (CPU/CUDA/MPS) partial-offload path with 1:1 parity.
 #
 #   The ONLY edits applied over the upstream files are documented in resync.md and fall in three
 #   categories: (1) this sys.modules alias so the vendored `import comfy.X` resolves here, (2)
-#   try/except around the optional comfy_aimdo imports, (3) `# [aimdo] disabled for turboCLI:`
+#   try/except around the optional comfy_aimdo imports, (3) `# [offloader] disabled for turboCLI:`
 #   comment-outs. Re-syncing a newer ComfyUI = re-copy the files, re-apply that short list.
 #
 #   Source snapshots (bump together with the files):
@@ -31,9 +31,9 @@
 
 # The vendored files import each other with absolute names (`import comfy.model_management`,
 # `from comfy.cli_args import args`). Alias this package as top-level `comfy` so those resolve to the
-# vendored copies without editing a single import line. Import `aimdo.comfy` once to establish the
-# alias, then always use `comfy.*` (never `aimdo.comfy.*`) so there is exactly one module object per
-# vendored file.
+# vendored copies without editing a single import line. Import `offloader.comfy` once to
+# establish the alias, then always use `comfy.*` (never `offloader.comfy.*`) so there is exactly
+# one module object per vendored file.
 import sys as _sys
 
 _sys.modules.setdefault("comfy", _sys.modules[__name__])

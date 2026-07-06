@@ -1,10 +1,10 @@
 #==================================================================================================
 #
-#   Copyright (C) 2026-2026 turbo-aimdo authors. <https://omega.gg/turbo-aimdo>
+#   Copyright (C) 2026-2026 turbo-offloader authors. <https://omega.gg/turbo-offloader>
 #
 #   Author: Benjamin Arnaud. <https://bunjee.me> <bunjee@omega.gg>
 #
-#   This file is part of turbo-aimdo.
+#   This file is part of turbo-offloader.
 #
 #   - GNU General Public License Usage:
 #   This file may be used under the terms of the GNU General Public License version 3 as published
@@ -15,8 +15,8 @@
 #==================================================================================================
 #
 #   The thin middleman between turboCLI's diffusers pipelines and the vendored ComfyUI offloading
-#   subsystem (aimdo/comfy/). It contains the ONLY real logic in the package; everything under
-#   aimdo/comfy/ is a verbatim ComfyUI snapshot. The bridge is two ideas:
+#   subsystem (offloader/comfy/). It contains the ONLY real logic in the package; everything under
+#   offloader/comfy/ is a verbatim ComfyUI snapshot. The bridge is two ideas:
 #
 #     1. comfy_ize(model): re-class each vanilla torch leaf module (Linear/Conv/Norm/Embedding) to
 #        its ComfyUI `disable_weight_init.*` counterpart. Those classes ARE `torch.nn.X` +
@@ -32,7 +32,7 @@
 #
 #==================================================================================================
 
-from . import comfy  # noqa: F401  establishes the top-level `comfy` alias (see aimdo/comfy/__init__.py)
+from . import comfy  # noqa: F401  establishes the top-level `comfy` alias (see offloader/comfy/__init__.py)
 
 import os
 
@@ -515,7 +515,7 @@ def use_comfy_attention(model=None):
 # (CUDA kernel on cu130+, eager on cpu/mps).
 # --------------------------------------------------------------------------------------------------
 
-_KITCHEN_ROPE = os.environ.get("AIMDO_KITCHEN_ROPE", "1") != "0"
+_KITCHEN_ROPE = os.environ.get("OFFLOADER_KITCHEN_ROPE", "1") != "0"
 
 
 def _build_freqs_cis(cos, sin):
@@ -542,7 +542,7 @@ def _make_kitchen_rope(orig):
                 import comfy.quant_ops as qo  # configures ck backends exactly as ComfyUI does
                 if getattr(qo, "_CK_AVAILABLE", False):
                     ck_state["ck"] = qo.ck
-                    print("aimdo: kitchen rope engaged; comfy_kitchen backends=%s"
+                    print("offloader: kitchen rope engaged; comfy_kitchen backends=%s"
                           % qo.ck.list_backends(), flush=True)
             except Exception:
                 ck_state["ck"] = None
@@ -569,7 +569,7 @@ def _make_kitchen_rope(orig):
         fc = _build_freqs_cis(cos.to(x.device), sin.to(x.device))
         return ck.apply_rope1(x, fc)
 
-    apply_rotary_emb._aimdo_kitchen = True
+    apply_rotary_emb._offloader_kitchen = True
     return apply_rotary_emb
 
 
@@ -589,7 +589,7 @@ def use_kitchen_rope(model):
         numerics byte-for-byte unchanged.
       * Per call, anything outside the flux interleaved convention falls through to the original; ck
         is imported lazily only on a matching call. No device gate (ck's registry picks per device).
-    No-op when AIMDO_KITCHEN_ROPE=0. Idempotent (won't double-wrap). Returns True if it patched."""
+    No-op when OFFLOADER_KITCHEN_ROPE=0. Idempotent (no double-wrap). Returns True if patched."""
     if not _KITCHEN_ROPE:
         return False
 
@@ -598,7 +598,7 @@ def use_kitchen_rope(model):
     mod = sys.modules.get(type(model).__module__)
     orig = getattr(mod, "apply_rotary_emb", None)
 
-    if orig is None or getattr(orig, "_aimdo_kitchen", False):
+    if orig is None or getattr(orig, "_offloader_kitchen", False):
         return False  # no module-level rope symbol here (e.g. z-image), or already patched
 
     mod.apply_rotary_emb = _make_kitchen_rope(orig)

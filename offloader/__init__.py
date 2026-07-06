@@ -1,10 +1,10 @@
 #==================================================================================================
 #
-#   Copyright (C) 2026-2026 turbo-aimdo authors. <https://omega.gg/turbo-aimdo>
+#   Copyright (C) 2026-2026 turbo-offloader authors. <https://omega.gg/turbo-offloader>
 #
 #   Author: Benjamin Arnaud. <https://bunjee.me> <bunjee@omega.gg>
 #
-#   This file is part of turbo-aimdo.
+#   This file is part of turbo-offloader.
 #
 #   - GNU General Public License Usage:
 #   This file may be used under the terms of the GNU General Public License version 3 as published
@@ -14,8 +14,8 @@
 #
 #==================================================================================================
 #
-#  aimdo offload backend (v2) -- the GPL "custom block" the (LGPL) runner discovers as
-#  backend/<mode>/ (here backend/aimdo/ for cuda_offload="aimdo") and drives through this seam only:
+#  offloader backend (v2) -- the GPL "custom block" the (LGPL) runner discovers as
+#  backend/<mode>/ (here backend/offloader/ for cuda_offload="offloader") and drives through this seam only:
 #
 #      pre_torch_init()                       - one-time setup; MUST run before `import torch`
 #      available()                            - True once the vendored offloader imports (any device)
@@ -23,8 +23,8 @@
 #      load_pipe(model, dtype, engine, ...)   - build a fully-placed diffusers pipeline
 #      prepare/reclaim/release(pipe)          - per-generation / teardown hooks
 #
-#  v2 delegates all offloading to a byte-for-byte vendored ComfyUI snapshot (aimdo/comfy/) via the
-#  thin bridge in aimdo/adapter.py, so the SAME device-agnostic path serves CPU / CUDA / MPS.
+#  v2 delegates all offloading to a byte-for-byte vendored ComfyUI snapshot (offloader/comfy/) via
+#  the thin bridge in offloader/adapter.py, so the SAME device-agnostic path serves CPU/CUDA/MPS.
 #  comfy-aimdo's CUDA-only VBAR is an optional accelerator (aimdo_enabled) that runs ComfyUI's
 #  ModelPatcherDynamic (partial GPU residency) instead of the plain patcher -- streaming weights from
 #  host RAM, or disk->VRAM for a component too big for RAM.
@@ -55,7 +55,7 @@ def _classes(engine):
         from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel
         return QwenImageEditPlusPipeline, QwenImageTransformer2DModel
 
-    raise ValueError("aimdo backend: unsupported engine %r" % (engine,))
+    raise ValueError("offloader backend: unsupported engine %r" % (engine,))
 
 
 def supports(engine):
@@ -121,7 +121,7 @@ def _direct_load(module, component_dir, device):
             module.tie_weights()
         return True
     except Exception:
-        print("aimdo: direct load failed for %s, using normal placement:\n%s"
+        print("offloader: direct load failed for %s, using normal placement:\n%s"
               % (component_dir, traceback.format_exc()), flush=True)
         return False
 
@@ -143,7 +143,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # every matmul runs on fp16 tensor cores (~5x on such cards). None on Ampere+ (compute in bf16).
     manual_cast = adapter.manual_cast_dtype(dtype, load_dev)
     if manual_cast is not None:
-        print("aimdo: manual_cast compute dtype %s (storage %s)" % (manual_cast, dtype), flush=True)
+        print("offloader: manual_cast compute dtype %s (storage %s)" % (manual_cast, dtype), flush=True)
 
     PipelineCls, Transformer = _classes(engine)
 
@@ -187,8 +187,8 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
         transformer, missing = adapter.load_streamed(Transformer, os.path.join(model, "transformer"),
                                                      dtype)
         if missing:
-            print("aimdo: %d transformer weights had no matching module (skipped)" % len(missing),
-                  flush=True)
+            print("offloader: %d transformer weights had no matching module (skipped)"
+                  % len(missing), flush=True)
         p = PipelineCls.from_pretrained(model, transformer=transformer, torch_dtype=dtype,
                                         use_safetensors=True, low_cpu_mem_usage=True,
                                         local_files_only=True)
@@ -212,7 +212,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # weights stream in, via ComfyUI's add_patches -> calculate_weight. lora_files: [(path, strength)].
     if lora_files:
         n = adapter.add_lora(transformer_patcher, lora_files)
-        print("aimdo: applied %d LoRA patches" % n, flush=True)
+        print("offloader: applied %d LoRA patches" % n, flush=True)
 
     patchers.append(transformer_patcher)
 
@@ -228,22 +228,22 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
             te_missing = adapter.assign_streamed_weights(p.text_encoder,
                                                          os.path.join(model, "text_encoder"))
             if te_missing:
-                print("aimdo: %d text-encoder weights had no matching param (skipped)"
+                print("offloader: %d text-encoder weights had no matching param (skipped)"
                       % len(te_missing), flush=True)
         adapter.keep_uncastable_resident(p.text_encoder, load_dev, manual_cast)
         if manual_cast is not None:
             adapter.install_manual_cast(p.text_encoder, manual_cast, dtype)  # ComfyUI runs the TE fp16 too
         encoder_patcher = build(p.text_encoder)
         patchers.append(encoder_patcher)
-        p._aimdo_encoder = encoder_patcher
+        p._offloader_encoder = encoder_patcher
 
     # Small resident modules (VAE) go straight to the compute device; the offloader handles the
     # heavy ones. VAE tiling/slicing is left to the caller.
     if getattr(p, "vae", None) is not None:
         p.vae.to(load_dev)
 
-    p._aimdo_patchers = patchers
-    p._aimdo_device = load_dev
+    p._offloader_patchers = patchers
+    p._offloader_device = load_dev
 
     # Diffusers reads _execution_device from module placement; pin it to the compute device so inputs
     # land there while offloaded weights stream in.
@@ -268,7 +268,7 @@ def prepare(pipe):
     so this marks them loaded without pinning the whole set). When install_encode_cache serves a repeated
     prompt the text encoder's forward never runs, so its weights never stream and the transformer keeps
     the throughput."""
-    patchers = getattr(pipe, "_aimdo_patchers", None)
+    patchers = getattr(pipe, "_offloader_patchers", None)
     if not patchers:
         return
 
@@ -277,17 +277,17 @@ def prepare(pipe):
 
 
 def reclaim(pipe):
-    """Per-generation housekeeping: run ComfyUI's per-execution aimdo teardown, then free non-resident
+    """Per-generation housekeeping: run ComfyUI's per-execution offloader teardown, then free non-resident
     models + return the allocator pool.
 
-    The teardown copies what ComfyUI runs in the `finally` after EVERY node execution when aimdo is on
+    The teardown copies what ComfyUI runs in the `finally` after EVERY node execution when offloader is on
     (comfy/execution.py:544-549): reset_cast_buffers + cleanup_prefetch_queues +
     vbars_reset_watermark_limits. It resets the VBAR streaming state (the globally-cached cast buffers,
     the block prefetch queues, the VBAR watermarks) between generations. reclaim() is our analog of
     that per-execution boundary, so we do the same thing ComfyUI does. (This is faithful teardown /
     hygiene; it is NOT what fixed the flux2->z-image first-gen nondeterminism -- that was copying
     ComfyUI's exact SDPA size gate in adapter.use_comfy_attention.)"""
-    if not getattr(pipe, "_aimdo_patchers", None):
+    if not getattr(pipe, "_offloader_patchers", None):
         return
 
     import comfy.model_management as mm
@@ -305,7 +305,7 @@ def reclaim(pipe):
         except Exception:
             print(traceback.format_exc(), flush=True)
 
-    dev = getattr(pipe, "_aimdo_device", None)
+    dev = getattr(pipe, "_offloader_device", None)
     if dev is not None:
         mm.free_memory(mm.minimum_inference_memory(), dev)
     mm.soft_empty_cache()
@@ -314,7 +314,7 @@ def reclaim(pipe):
 def release(pipe):
     """Tear down the offloaders before the pipe is dropped (detach unpatches weights and lets the
     current_loaded_models finalizers fire)."""
-    for patcher in getattr(pipe, "_aimdo_patchers", []):
+    for patcher in getattr(pipe, "_offloader_patchers", []):
         try:
             patcher.detach(unpatch_all=True)
         except Exception:

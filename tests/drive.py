@@ -1,10 +1,10 @@
 #==================================================================================================
 #
-#   Copyright (C) 2026-2026 turbo-aimdo authors. <https://omega.gg/turbo-aimdo>
+#   Copyright (C) 2026-2026 turbo-offloader authors. <https://omega.gg/turbo-offloader>
 #
 #   Author: Benjamin Arnaud. <https://bunjee.me> <bunjee@omega.gg>
 #
-#   This file is part of turbo-aimdo.
+#   This file is part of turbo-offloader.
 #
 #   - GNU General Public License Usage:
 #   This file may be used under the terms of the GNU General Public License version 3 as published
@@ -20,12 +20,12 @@
 #   through ComfyUI's ModelPatcher and streamed to the compute device per forward, so the pipe runs
 #   even when neither model fits VRAM.
 #
-#   The model directory is read from AIMDO_MODEL (a diffusers layout with transformer/, text_encoder/,
+#   The model directory is read from OFFLOADER_MODEL (a diffusers layout with transformer/, text_encoder/,
 #   vae/ ...), so no machine-specific path is baked in.
 #
 #   Run:
-#       AIMDO_MODEL=/path/to/FLUX.2-klein-4B  python tests/drive.py flux2   cuda 1024 768 4
-#       AIMDO_MODEL=/path/to/Z-Image-Turbo    python tests/drive.py z-image cuda 512  512  8
+#       OFFLOADER_MODEL=/path/to/FLUX.2-klein-4B  python tests/drive.py flux2   cuda 1024 768 4
+#       OFFLOADER_MODEL=/path/to/Z-Image-Turbo    python tests/drive.py z-image cuda 512  512  8
 #       args: <engine> <device=cuda> <width=512> <height=512> <steps=8>
 #             engine: flux2 | z-image | qwen-image-edit   device: cpu | cuda | mps
 #
@@ -51,9 +51,9 @@ WIDTH = int(sys.argv[3]) if len(sys.argv) > 3 else 512
 HEIGHT = int(sys.argv[4]) if len(sys.argv) > 4 else 512
 STEPS = int(sys.argv[5]) if len(sys.argv) > 5 else 8
 
-MODEL = os.environ.get("AIMDO_MODEL")
+MODEL = os.environ.get("OFFLOADER_MODEL")
 if not MODEL:
-    sys.exit("set AIMDO_MODEL to the engine's diffusers model directory")
+    sys.exit("set OFFLOADER_MODEL to the engine's diffusers model directory")
 
 # Per-engine generate kwargs (guidance differs: flux2 uses distilled CFG=0, z-image/qwen use ~1).
 GEN = {
@@ -62,10 +62,10 @@ GEN = {
     "qwen-image-edit": dict(true_cfg_scale=1.0),
 }.get(ENGINE, {})
 
-import aimdo
+import offloader
 
-aimdo.pre_torch_init()
-print("engine:", ENGINE, "| available:", aimdo.available())
+offloader.pre_torch_init()
+print("engine:", ENGINE, "| available:", offloader.available())
 
 import torch
 
@@ -76,10 +76,10 @@ if DEVICE == "cuda":
           "| VRAM %.1f GB" % (torch.cuda.get_device_properties(0).total_memory / 1e9))
 
 t0 = time.time()
-pipe = aimdo.load_pipe(model=MODEL, dtype=dtype, engine=ENGINE, device=DEVICE)
+pipe = offloader.load_pipe(model=MODEL, dtype=dtype, engine=ENGINE, device=DEVICE)
 print("load_pipe: %.1fs" % (time.time() - t0))
 
-aimdo.prepare(pipe)
+offloader.prepare(pipe)
 print("prepared; execution_device:", getattr(pipe, "_execution_device", "?"))
 
 # Per-phase timing: text-encode (start -> first denoise step) vs per-step denoise, via a step
@@ -93,10 +93,10 @@ def _step_cb(pipe_, step, ts, kw):
     return kw
 
 
-# Optional image input (edit / img2img): set AIMDO_IMAGE to a file, or "gradient" for a synthetic
-# one. flux2 and qwen-image-edit accept image=; text-to-image engines leave it unset.
+# Optional image input (edit / img2img): set OFFLOADER_IMAGE to a file, or "gradient" for a
+# synthetic one. flux2 and qwen-image-edit accept image=; text-to-image engines leave it unset.
 call_kwargs = dict(GEN)
-_img_src = os.environ.get("AIMDO_IMAGE")
+_img_src = os.environ.get("OFFLOADER_IMAGE")
 if _img_src:
     from PIL import Image
     if _img_src == "gradient":
@@ -134,6 +134,6 @@ out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 img.save(out)
 print("Saved:", out)
 
-aimdo.reclaim(pipe)
-aimdo.release(pipe)
+offloader.reclaim(pipe)
+offloader.release(pipe)
 print("done")

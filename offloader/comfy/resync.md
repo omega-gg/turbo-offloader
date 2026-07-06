@@ -1,7 +1,7 @@
 # Re-syncing the vendored ComfyUI snapshot
 
-`aimdo/comfy/` is a **byte-for-byte snapshot** of ComfyUI's offloading subsystem, driven through
-`aimdo/adapter.py` so turboCLI's diffusers pipelines reuse ComfyUI's device-agnostic
+`offloader/comfy/` is a **byte-for-byte snapshot** of ComfyUI's offloading subsystem, driven
+through `offloader/adapter.py` so turboCLI's diffusers pipelines reuse ComfyUI's device-agnostic
 (CPU/CUDA/MPS) partial-offload path with 1:1 parity. Keeping the files verbatim is what makes
 upgrades cheap: to move to a newer ComfyUI you **re-copy the files below, then re-apply the short
 edit list here**. Nothing else should differ from upstream.
@@ -19,7 +19,7 @@ Flat modules: `model_management.py`, `model_patcher.py`, `ops.py`, `memory_manag
 `utils.py`, `lora.py`, `float.py`, `quant_ops.py`, `patcher_extension.py`, `hooks.py`,
 `pinned_memory.py`, `model_prefetch.py`, `cli_args.py`, `options.py`.
 
-`model_prefetch.py` is vendored verbatim and driven from `aimdo/adapter.py:install_prefetch`, which
+`model_prefetch.py` is copied verbatim, driven from `offloader/adapter.py:install_prefetch`, which
 reproduces ComfyUI's per-block `prefetch_queue_pop` loop (its own models call it from their forward,
 e.g. `comfy/ldm/lightricks/av_model.py`) via forward hooks on the diffusers transformer's block
 ModuleLists.
@@ -31,9 +31,9 @@ faithful and lower-maintenance than a hand-written `args` stub (no field list to
 
 ## The only edits over upstream — three categories
 
-### (1) `sys.modules` alias + optional-comfy_aimdo shim  — `aimdo/comfy/__init__.py` (NEW, ours)
+### (1) `sys.modules` alias + optional-comfy_aimdo shim — `offloader/comfy/__init__.py` (ours)
 - Aliases this package as top-level `comfy` so the vendored `import comfy.X` lines resolve here
-  with zero per-file edits. Always import via `comfy.*`, never `aimdo.comfy.*`.
+  with zero per-file edits. Always import via `comfy.*`, never `offloader.comfy.*`.
 - When `comfy_aimdo` (CUDA-only VBAR accelerator) is absent (CPU/MPS builds), registers empty
   stand-in submodules in `sys.modules` so the verbatim `import comfy_aimdo.X` lines still resolve.
   All comfy_aimdo *usage* is gated on `memory_management.aimdo_enabled` (default False), so the
@@ -43,16 +43,16 @@ faithful and lower-maintenance than a hand-written `args` stub (no field list to
 Upstream `float.py` / `quant_ops.py` already wrap `import comfy_kitchen` in try/except and log a
 warning when absent, so nothing is edited here. comfy-kitchen is now **pip-installed** into the
 runtime venv (turboCLI `bash/turbo/build.sh`, pinned `43b413e` / `0.2.16`, Apache-2.0) — a native
-wheel, so it is **not vendored** into `aimdo/comfy/`. Present → `quant_ops.py` configures its backends
+wheel, so it is **not vendored** into `offloader/comfy/`. Present → `quant_ops.py` configures its backends
 (cuda disabled unless torch cu130+, triton unless flagged) exactly as ComfyUI does, and
-`aimdo/adapter.py:use_kitchen_rope` routes diffusers' `apply_rotary_emb` through `ck.apply_rope1`
+`offloader/adapter.py:use_kitchen_rope` routes diffusers' `apply_rotary_emb` via `ck.apply_rope1`
 (the same fused kernel ComfyUI's `comfy/ldm/flux/math.py` uses). Absent → fp8/fp4 quant paths and the
 rope routing both degrade to the native path.
 
-### (3) `# [aimdo] disabled for turboCLI:` comment-outs — 3 one-line edits total
+### (3) `# [offloader] disabled for turboCLI:` comment-outs — 3 one-line edits total
 Each is a single commented import for a dependency that is **off the offloader's code path**, so the
 offloader is unaffected; only unrelated helper functions would `NameError` if ever called (they are
-not). Grep `# [aimdo] disabled for turboCLI:` to find them all.
+not). Grep `# [offloader] disabled for turboCLI:` to find them all.
 
 | file      | line   | commented import                              | why it's off-path |
 |-----------|--------|-----------------------------------------------|-------------------|
@@ -62,13 +62,13 @@ not). Grep `# [aimdo] disabled for turboCLI:` to find them all.
 
 ## Re-sync procedure
 
-1. `cp` the files listed above from the new ComfyUI/comfy-aimdo checkouts over `aimdo/comfy/`.
-2. Update the two commits in this file and in `aimdo/comfy/__init__.py`.
+1. `cp` the files listed above from the new ComfyUI/comfy-aimdo checkouts over `offloader/comfy/`.
+2. Update the two commits in this file and in `offloader/comfy/__init__.py`.
 3. Re-apply the 3 comment-outs in category (3) (grep the marker in the OLD tree first to relocate
    them if line numbers moved).
 4. Smoke test — must print `import OK` and `aimdo_enabled= False` on a CPU box:
    ```
-   python -c "import aimdo.comfy; import comfy.model_patcher, comfy.ops, \
+   python -c "import offloader.comfy; import comfy.model_patcher, comfy.ops, \
    comfy.memory_management as m; print('import OK; aimdo_enabled=', m.aimdo_enabled)"
    ```
 5. If new upstream imports pull an off-path top-level module (like `node_helpers`), extend

@@ -1,6 +1,6 @@
 # Benchmarking turboCLI vs ComfyUI (same box, same model)
 
-How to compare turbo-aimdo's diffusion path against ComfyUI head-to-head — both at wall-clock
+How to compare turbo-offloader's diffusion path against ComfyUI head-to-head — both at wall-clock
 (per-step / end-to-end) and at the CUDA-op level — so a per-step gap can be *attributed* (which
 kernels/copies differ) instead of guessed. Written from the z-image / Turing (RTX 2070S) exercise
 where turbo went from ~5× slower to per-step parity.
@@ -26,7 +26,7 @@ where turbo went from ~5× slower to per-step parity.
 ```sh
 cd turboCLI/bash/turbo && SKY_PATH_BIN=D:/omega/sky/bin sh server.sh start   # backgrounded
 cd ../z-image
-sh run.sh "PROMPT" out.png 1024 768 cuda SEED 8 aimdo none none 8080
+sh run.sh "PROMPT" out.png 1024 768 cuda SEED 8 offloader none none 8080
 ```
 
 Per-step comes from the runner's tqdm (`… N/8 (mm:ss, X.XXs/it)`); the `s/it` at step 8 is the
@@ -58,13 +58,13 @@ Wall-clock says *how much* slower; `torch.profiler` says *which ops*. Instrument
 granularity — one warm diffusion-model forward — and diff the self-CUDA tables.
 
 **turbo** — `adapter.install_profiler(model)` (env-gated, temporary; wired in `load_pipe` under
-`AIMDO_PROFILE`). It wraps `transformer.forward`, and on the `AIMDO_PROFILE_SKIP+1`-th call runs
+`OFFLOADER_PROFILE`). Wraps `transformer.forward`, and on `OFFLOADER_PROFILE_SKIP+1`-th call runs
 `torch.profiler` (CPU+CUDA) and prints `key_averages().table(sort_by="self_cuda_time_total")` plus the
 forward's wall time. Run **two** generations and profile a forward in the *second* one so it's fully
-warm — with 8 steps/gen, `AIMDO_PROFILE_SKIP=11` profiles gen-2 step-4:
+warm — with 8 steps/gen, `OFFLOADER_PROFILE_SKIP=11` profiles gen-2 step-4:
 
 ```sh
-AIMDO_PROFILE=1 AIMDO_PROFILE_SKIP=11 sh server.sh start
+OFFLOADER_PROFILE=1 OFFLOADER_PROFILE_SKIP=11 sh server.sh start
 # two gens same prompt (2nd is warm), then read the table from srv.log
 ```
 

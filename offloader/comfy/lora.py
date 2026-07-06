@@ -19,7 +19,7 @@
 import comfy.memory_management
 import comfy.utils
 import comfy.model_management
-# [aimdo] disabled for turboCLI: comfy.model_base is only referenced by model_lora_keys_unet()
+# [offloader] disabled for turboCLI: comfy.model_base is only referenced by model_lora_keys_unet()
 # (LoRA key-mapping at load time), which the adapter bypasses -- it builds the patch dict directly
 # and calls ModelPatcher.add_patches(). calculate_weight/calculate_shape/prefetch_prepared_value
 # (the functions model_patcher actually uses) don't need it, and model_base pulls the whole model

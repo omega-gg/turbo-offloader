@@ -1,10 +1,10 @@
 #==================================================================================================
 #
-#   Copyright (C) 2026-2026 turbo-aimdo authors. <https://omega.gg/turbo-aimdo>
+#   Copyright (C) 2026-2026 turbo-offloader authors. <https://omega.gg/turbo-offloader>
 #
 #   Author: Benjamin Arnaud. <https://bunjee.me> <bunjee@omega.gg>
 #
-#   This file is part of turbo-aimdo.
+#   This file is part of turbo-offloader.
 #
 #   - GNU General Public License Usage:
 #   This file may be used under the terms of the GNU General Public License version 3 as published
@@ -18,10 +18,10 @@
 #   the Lightning 4-step speed LoRA on-cast. The transformer (~39GB) + text encoder (~16GB) stream
 #   disk->VRAM via VBAR, so it runs on a tiny GPU (very slow -- 55GB streams from disk).
 #
-#   AIMDO_MODEL points at the Qwen-Image-Edit-2511 diffusers dir (which also holds the LoRA files).
+#   OFFLOADER_MODEL points at the Qwen-Image-Edit-2511 diffusers dir (holds the LoRA files too).
 #
 #   Run:
-#       AIMDO_MODEL=/path/to/Qwen-Image-Edit-2511  python tests/drive_qwen.py cuda 512 512 4
+#       OFFLOADER_MODEL=/path/to/Qwen-Image-Edit-2511  python tests/drive_qwen.py cuda 512 512 4
 #       args: <device=cuda> <width=512> <height=512> <steps=4>
 #
 #==================================================================================================
@@ -43,18 +43,18 @@ WIDTH = int(sys.argv[2]) if len(sys.argv) > 2 else 512
 HEIGHT = int(sys.argv[3]) if len(sys.argv) > 3 else 512
 STEPS = int(sys.argv[4]) if len(sys.argv) > 4 else 4
 
-MODEL = os.environ.get("AIMDO_MODEL")
+MODEL = os.environ.get("OFFLOADER_MODEL")
 if not MODEL:
-    sys.exit("set AIMDO_MODEL to the Qwen-Image-Edit-2511 directory")
+    sys.exit("set OFFLOADER_MODEL to the Qwen-Image-Edit-2511 directory")
 
 # Lightning 4-step speed LoRA -> apply on-cast so 4 steps suffice.
 LIGHTNING = os.path.join(MODEL, "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
 lora_files = [(LIGHTNING, 1.0)] if os.path.exists(LIGHTNING) else None
 
-import aimdo
+import offloader
 
-aimdo.pre_torch_init()
-print("available:", aimdo.available(), "| lora:", "yes" if lora_files else "no")
+offloader.pre_torch_init()
+print("available:", offloader.available(), "| lora:", "yes" if lora_files else "no")
 
 import torch
 from PIL import Image
@@ -73,11 +73,11 @@ if DEVICE == "cuda":
     print("GPU:", torch.cuda.get_device_name(0))
 
 t0 = time.time()
-pipe = aimdo.load_pipe(model=MODEL, dtype=dtype, engine="qwen-image-edit", device=DEVICE,
+pipe = offloader.load_pipe(model=MODEL, dtype=dtype, engine="qwen-image-edit", device=DEVICE,
                        lora_files=lora_files)
 print("load_pipe: %.1fs" % (time.time() - t0))
 
-aimdo.prepare(pipe)
+offloader.prepare(pipe)
 print("prepared; execution_device:", getattr(pipe, "_execution_device", "?"))
 
 gen = torch.Generator(device="cpu").manual_seed(42)
@@ -99,6 +99,6 @@ out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out_qwen_%s_%dx%
 img.save(out)
 print("Saved:", out)
 
-aimdo.reclaim(pipe)
-aimdo.release(pipe)
+offloader.reclaim(pipe)
+offloader.release(pipe)
 print("done")

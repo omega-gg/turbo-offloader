@@ -1,4 +1,4 @@
-# aimdo (v2)
+# offloader (v2)
 
 GPL offload backend for the turboCLI diffusion runner. Instead of cherry-picking lines from
 ComfyUI (v1, see `doc/aimdo_v1.md`), v2 **vendors ComfyUI's offloading subsystem verbatim** and adds a
@@ -12,13 +12,13 @@ comfy-aimdo file-slices for a model larger than RAM.
 ## Layout
 
 ```
-aimdo/
+offloader/
   __init__.py   backend seam the runner drives (unchanged signatures)
   adapter.py    the thin middleman -- the only real logic in the package
   comfy/        byte-for-byte ComfyUI offloading snapshot (see comfy/resync.md)
 ```
 
-`aimdo/comfy/` is a pristine mirror of ComfyUI's `model_management.py`, `model_patcher.py`,
+`offloader/comfy/` is a pristine mirror of ComfyUI's `model_management.py`, `model_patcher.py`,
 `ops.py`, `memory_management.py`, `model_prefetch.py`, `lora.py`, `utils.py`, etc. Aliased to the
 top-level `comfy` package via a `sys.modules` entry in `comfy/__init__.py`, so the vendored
 `import comfy.X` lines resolve unchanged. The **only** edits over upstream (all documented in
@@ -151,7 +151,7 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   encoder straight onto the device via ComfyUI's `load_torch_file` (`safetensors.safe_open(device=
   "mps")`) + `load_state_dict(assign=True)` — exactly how ComfyUI loads on Apple Silicon — instead of
   diffusers' CPU load followed by `load_models_gpu`'s per-leaf CPU→device copy; `load_models_gpu` then
-  no-ops on the resident weights. Halves placement (flux2-4B ~103s → ~51s), flipping aimdo one-shot
+  no-ops on the resident weights. Halves placement (flux2-4B ~103s → ~51s), flipping offloader one-shot
   from ~70s slower than a plain `.to("mps")` to ~1min faster (also ~15% faster diffusion from the
   comfy operator swaps → ~21% total). MPS-only: CUDA's separate VRAM pool needs `load_models_gpu`'s
   partial-residency / VBAR decisions (a full direct load would OOM), CPU already loads there. Model-
