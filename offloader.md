@@ -165,6 +165,14 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB). VBAR also sizes partial GPU
   residency from live free VRAM, so a model larger than VRAM runs on any card. The residual gap vs
   ComfyUI on some engines is diffusers' unfused-qkv compute, not the offloader.
+- **Pinning matches ComfyUI (measured).** comfy-aimdo pins the streamed working set lazily per
+  module up to `MAX_PINNED_MEMORY` (40% RAM on Windows), degrading via `_steal_pin` past that; the
+  weight VBAR survives `reset_cast_buffers` between gens, so there is **no per-gen re-fault**. Probed
+  on the A1000: full budget pins 12.33/13.6GB; capped to a 16GB-Turing-like 6GB budget it pins 5.49GB
+  (flux2) / 4.94GB (z-image) with gen2/gen3 first-step == steady step (no re-fault). turbo drives the
+  same vendored path ComfyUI does — see [`doc/COMFYUI_OFFLOAD_MAP.md`](doc/COMFYUI_OFFLOAD_MAP.md).
+  (An older note claimed turbo under-pinned ~4.7/6.4GB with a ~30s re-fault; stale — that was the
+  materialized era.)
 - **Why not the static ModelPatcher.** The static lowvram path pins the full model up front
   (`model_management`: `total_pins_required += model_memory()`, gated on `not is_dynamic()`) and is a
   touch faster per step, but its per-layer peak OOMs a small card on a big model — e.g. z-image's 12GB

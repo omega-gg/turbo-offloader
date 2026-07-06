@@ -5,6 +5,8 @@ OTHER_FILES += README.md  \
                offloader.md   \
                doc/aimdo_v1.md      \
                doc/AIMDO_V2_PLAN.md \
+               doc/BENCHMARKING.md  \
+               doc/COMFYUI_OFFLOAD_MAP.md \
 
 # Backend seam + the thin diffusers <-> ComfyUI bridge (the only real logic).
 OTHER_FILES += offloader/__init__.py \
