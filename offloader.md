@@ -158,28 +158,22 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   agnostic (globs component shards); LoRA-safe (patches still merge on top via `patch_weight_to_
   device`, verified bit-identical); gated off `manual_cast`; any mismatch falls back to normal
   placement. `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after.
-- **Pinned streaming via the static patcher (ComfyUI's lowvram path).** The static `ModelPatcher`
-  is how ComfyUI offloads a fits-RAM-but-not-VRAM UNet: `load_models_gpu` reserves full-model host
-  pinning for it (`model_management`: `total_pins_required += model_memory()`, gated on `not
-  is_dynamic()`), so every streamed weight is **pinned** — fast async HtoD that survives
-  `reset_cast_buffers` between generations, so no per-gen re-fault. `ModelPatcherDynamic` (comfy-aimdo
-  VBAR) *skips* that reservation and pins only partially, so it is reserved for a component too big
-  for host RAM (disk→VRAM file-slices, the only way to run larger than RAM). `load_pipe` picks the
-  patcher per component via `fits_in_ram`; the residual gap vs ComfyUI on some engines is diffusers'
-  unfused-qkv model compute, not the offloader.
-- **Regression this fixed (materialized + dynamic).** An earlier default streamed fits-RAM
-  components `from_pretrained`-materialized through `ModelPatcherDynamic`; with no full-model pin
-  reservation on the dynamic path, streaming fell to **pageable** — ~2x slower per step, plus a ~30s
-  per-gen re-fault from the unpinned remainder on a tight-RAM box. Measured on an RTX A1000 (4GB
-  VRAM / 33GB RAM), flux2 1024×768: materialized+dynamic ~10s step1, ~4s/step; static ~2s step1,
-  ~2s/step (~3x). Agnostic: full pinning on any CUDA GPU (budget = 40% RAM); on CPU/MPS there is no
-  HtoD so the native cast path applies.
-- **Tight-RAM caveat (verify on the 16GB/8GB Turing).** The static path loads fits-RAM components
-  materialized (`from_pretrained`), holding weights in anonymous RAM *plus* the pinned copies. On a
-  ~16GB box that can squeeze the pin budget and leave a sliver unpinned; if so, load that path
-  mmap-backed (`assign_streamed_weights`) — file-backed weights leave headroom for the pin buffer,
-  matching ComfyUI's memory profile. The patcher choice (static) is the fix; materialized-vs-mmap is
-  RAM-headroom tuning.
+- **Streaming is mmap file-sliced + pinned (comfy-aimdo VBAR).** Every big model is meta-loaded and
+  its weights swapped for mmap file-slices (`load_streamed` / `assign_streamed_weights`), then wrapped
+  in ComfyUI's `ModelPatcherDynamic`. comfy-aimdo pins the slices in its host buffers, so per-forward
+  streaming is **pinned** (fast async HtoD); the slices come from the page cache when the model fits
+  RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB). VBAR also sizes partial GPU
+  residency from live free VRAM, so a model larger than VRAM runs on any card. The residual gap vs
+  ComfyUI on some engines is diffusers' unfused-qkv compute, not the offloader.
+- **Why not the static ModelPatcher.** The static lowvram path pins the full model up front
+  (`model_management`: `total_pins_required += model_memory()`, gated on `not is_dynamic()`) and is a
+  touch faster per step, but its per-layer peak OOMs a small card on a big model — e.g. z-image's 12GB
+  DiT crashes on 4GB VRAM where VBAR streams it fine. VBAR exists precisely for that, so it stays the
+  default; static is not agnostic.
+- **Regression this fixed (materialized).** commit `25dbb6c` materialized fits-RAM components via
+  `from_pretrained` instead of mmap; materialized host tensors stream **pageable** (~2x slower per
+  step). Reverting to always-mmap restores pinned streaming. Measured on an RTX A1000 (4GB VRAM /
+  33GB RAM): flux2 1024×768 ~4 → ~2.3 s/step; z-image ~5.6 → ~5 s/step, both fit.
 - **comfy-kitchen** is a quantization-kernel library, unrelated to offloading — not a dependency.
 - **Re-syncing** a newer ComfyUI: re-copy the files and re-apply the short edit set in
   `comfy/resync.md`; bump the commit pins there, in `comfy/__init__.py`, and in `README.md`.

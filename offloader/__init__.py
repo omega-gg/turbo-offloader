@@ -175,27 +175,19 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     patchers = []
 
-    # Weights live in host RAM and stream to VRAM per-forward -- exactly how ComfyUI offloads a
-    # UNet: load the checkpoint to CPU, wrap each big model in a ModelPatcher, and partial-load /
-    # stream to the compute device. Residency (how much stays GPU-resident vs streams) is decided
-    # GPU-agnostically by ComfyUI's load_models_gpu from live free VRAM -- no card thresholds.
-    #
-    # Static vs dynamic patcher is THE streaming-speed lever. The static ModelPatcher is ComfyUI's
-    # own lowvram path: load_models_gpu reserves FULL-model host pinning for it (model_management
-    # pins_required += model_memory(), gated on `not is_dynamic()`), so every streamed weight is
-    # pinned -- fast HtoD that survives reset_cast_buffers between gens (no per-gen re-fault). The
-    # dynamic ModelPatcherDynamic (comfy-aimdo VBAR) skips that reservation and pins partially,
-    # so it is used ONLY for a component too big for host RAM, where its disk->VRAM file-slices are
-    # the only way to run (e.g. qwen-image-edit's ~55GB on a small box). fits_in_ram = on-disk size
-    # vs host RAM, GPU/card-agnostic.
-    def build(module, oversized):
-        cons = adapter.build_dynamic_patcher if oversized else adapter.build_patcher
-        return cons(module)
+    # Big models stream to VRAM per-forward through ComfyUI's ModelPatcherDynamic (comfy-aimdo
+    # VBAR): partial GPU residency sized from live free VRAM, so a model larger than VRAM runs
+    # -- exactly ComfyUI's dynamic offload. The static ModelPatcher lowvram path can't: on a small
+    # card its per-layer peak OOMs a big model (z-image's 12GB DiT on 4GB), which is the whole
+    # reason comfy-aimdo's VBAR exists. Off CUDA / without comfy-aimdo -> plain ModelPatcher native
+    # cast path.
+    build = adapter.build_dynamic_patcher if use_vbar else adapter.build_patcher
 
-    # Transformer: RAM-resident (fast) when it fits, else disk-streamed via a meta-loaded module
-    # whose weights are file-sliced (never materialised in RAM). load_streamed comfy-izes
-    # internally.
-    stream_transformer = use_vbar and not adapter.fits_in_ram(os.path.join(model, "transformer"))
+    # Transformer: always meta-loaded + mmap file-sliced (load_streamed) so its weights stream
+    # PINNED via comfy_aimdo host buffers -- fast HtoD. Slices come from the page cache when the
+    # model fits RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB). load_streamed
+    # comfy-izes internally.
+    stream_transformer = use_vbar
 
     if stream_transformer:
         transformer, missing = adapter.load_streamed(
@@ -222,7 +214,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     if manual_cast is not None:
         # bf16 storage, fp16 compute
         adapter.install_manual_cast(p.transformer, manual_cast, dtype)
-    transformer_patcher = build(p.transformer, stream_transformer)
+    transformer_patcher = build(p.transformer)
 
     # On-cast LoRA (e.g. qwen's Lightning 4-step speed LoRA): applied to the transformer while its
     # weights stream in, via ComfyUI's add_patches -> calculate_weight. lora_files: [(path,
@@ -233,16 +225,15 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     patchers.append(transformer_patcher)
 
-    # Text encoder: same gate -- RAM-resident (fast) when it fits, else its weights are swapped for
-    # file-slices and streamed disk->VRAM. Custom norms (e.g. Qwen3RMSNorm) are kept resident by
+    # Text encoder: same as the transformer -- weights swapped for mmap file-slices and streamed
+    # pinned via VBAR. Custom norms (e.g. Qwen3RMSNorm) are kept resident by
     # keep_uncastable_resident since they can't be comfy-ized.
     if getattr(p, "text_encoder", None) is not None:
         adapter.comfy_ize(p.text_encoder)
         adapter.use_comfy_attention(p.text_encoder)
         if direct_load:
             _direct_load(p.text_encoder, os.path.join(model, "text_encoder"), load_dev)
-        stream_text_encoder = use_vbar and not adapter.fits_in_ram(
-            os.path.join(model, "text_encoder"))
+        stream_text_encoder = use_vbar
         if stream_text_encoder:
             te_missing = adapter.assign_streamed_weights(p.text_encoder,
                                                          os.path.join(model, "text_encoder"))
@@ -253,7 +244,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
         if manual_cast is not None:
             # ComfyUI runs the TE fp16 too
             adapter.install_manual_cast(p.text_encoder, manual_cast, dtype)
-        encoder_patcher = build(p.text_encoder, stream_text_encoder)
+        encoder_patcher = build(p.text_encoder)
         patchers.append(encoder_patcher)
         p._offloader_encoder = encoder_patcher
 
