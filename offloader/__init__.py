@@ -15,7 +15,7 @@
 #==================================================================================================
 #
 #  offloader backend (v2) -- the GPL "custom block" the (LGPL) runner discovers as
-# backend/<mode>/ (here backend/offloader/ for cuda_offload="offloader") and drives through this
+# backend/<mode>/ (here backend/offloader/ for offload="offloader") and drives through this
 # seam only:
 #
 #      pre_torch_init()                       - one-time setup; MUST run before `import torch`

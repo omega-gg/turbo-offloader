@@ -176,7 +176,7 @@ VBAR **disk**-streaming (run models > VRAM+RAM, `TensorFileSlice` + `read_tensor
 ## Verification
 
 Primary harness: **`sandbox/aimdo/flux2/run.sh`** (single-shot flux2 generator; `aimdo` is already a
-valid `cuda_offload` value, usage-checked at `run.sh:135`). It drives the seam directly
+valid `offload` value, usage-checked at `run.sh:135`). It drives the seam directly
 (`pre_torch_init()` + `load_pipe(model, dtype, engine="flux2")`) — a light single-shot path that
 exercises `load_pipe` without `prepare/reclaim/release`. Usage:
 `./run.sh "knight in armor" out.png 512 512 <cpu|cuda|mps> 42 4 aimdo`.

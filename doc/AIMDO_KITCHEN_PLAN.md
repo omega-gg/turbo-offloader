@@ -122,7 +122,7 @@ script first). Deploy the updated `backend/aimdo` to the runtime and install the
 - **4b Engaged:** confirm boot log `Found comfy_kitchen backend cuda: available` (not disabled) and
   the one-time `use_kitchen_rope` log shows the CUDA backend serving.
 - **4c Timing:** flux2 on the 4GB GPU is streaming-bound, which masks the rope win — isolate compute:
-  smallest res that fits VRAM with `cuda_offload=none` (weights resident, math-bound), A/B the flag,
+  smallest res that fits VRAM with `offload=none` (weights resident, math-bound), A/B the flag,
   log per-step transformer time. Three-way: ck-cuda vs `ck.disable_backend("cuda")` (eager) vs native.
   Honest expectation: measurable only when compute-bound.
 

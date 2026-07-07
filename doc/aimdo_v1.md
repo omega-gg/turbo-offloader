@@ -17,7 +17,7 @@ Files: `offload.py` (the streamer), `placement.py` (resident-vs-stream decision 
 `load_pipe` / `prepare` / `reclaim` / `release`).
 
 **Supported engines:** flux2, z-image, qwen-image-edit. **CUDA-only** — selected via turboCLI's
-`cuda_offload=aimdo`; cpu/mps builds don't ship `comfy_aimdo`, so the backend is skipped there.
+`offload=aimdo`; cpu/mps builds don't ship `comfy_aimdo`, so the backend is skipped there.
 
 Based on:
 - ComfyUI 5955ddff52a2eda2ba0cf7f3fb0927c93fb2fbb8
