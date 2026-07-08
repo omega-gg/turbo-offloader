@@ -337,22 +337,6 @@ def enable_vbar(device):
     return True
 
 
-def fits_in_ram(model_dir):
-    """True when a component's weights fit in host RAM, so they can stream to the GPU from RAM
-    (ComfyUI's fast path) instead of disk->VRAM. GPU/card-agnostic: the size is the on-disk shard
-    total, the budget is ComfyUI's own get_total_memory(cpu). Only one big component is hot at a
-    time (encode, then sample), so it must fit alone; ~10% is reserved for the OS. A component
-    bigger than this streams disk->VRAM via load_streamed / assign_streamed_weights (comfy-aimdo
-    VBAR), which
-    never materialises it in RAM -- the only way to run a model larger than host RAM."""
-    try:
-        size = sum(os.path.getsize(s) for s in _shards(model_dir))
-    except OSError:
-        return True  # can't size it -> assume RAM path; never force disk on a stat error
-    total_ram = mm.get_total_memory(torch.device("cpu"))
-    return size <= total_ram * 0.9
-
-
 def _shards(model_dir):
     """The .safetensors shard paths for a diffusers component dir, honouring a .index.json
     if present (mirrors v1's _offsets shard discovery)."""

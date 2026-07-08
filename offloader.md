@@ -49,10 +49,11 @@ All GPL-derived code lives in this package; the calling runner stays GPL-free.
 - **VBAR (optional, CUDA).** When comfy-aimdo is present, `load_pipe` flips
   `comfy.memory_management.aimdo_enabled` and uses `ModelPatcherDynamic`, which keeps as much of the
   model GPU-resident as fits (partial residency, sized from live free VRAM) and streams the rest per
-  forward. Per component (`adapter.fits_in_ram`, on-disk size vs `get_total_memory`): weights stream
-  from **host RAM** when the model fits (fast path — `from_pretrained` tensors, same source as native)
-  else **disk→VRAM** via comfy-aimdo file-slices (`load_streamed` / `assign_streamed_weights`) for a
-  model larger than RAM. This is ComfyUI's "dynamic VRAM loading" path.
+  forward. Every component is meta-loaded and mmap file-sliced (`load_streamed` /
+  `assign_streamed_weights`), so its weights fault straight from the file — from the **OS page
+  cache** when the model fits host RAM, else **disk→VRAM** when it doesn't (no materialization, no
+  explicit per-component gate; the page cache makes the choice). This is ComfyUI's "dynamic VRAM
+  loading" path.
 
 The seam picks VBAR automatically on CUDA-with-comfy-aimdo, native otherwise. `set_device()` maps
 the seam's `device=` arg onto `comfy.model_management.cpu_state`, the single knob that switches the
