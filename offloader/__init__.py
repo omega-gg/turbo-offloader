@@ -143,6 +143,19 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     load_dev = adapter.set_device(device)
 
+    import comfy.model_management as mm
+
+    # CPU: match ComfyUI's storage/compute split. turboCLI hands us fp32 on CPU, which would DOUBLE
+    # RAM (store every weight fp32) and skip manual_cast entirely. Instead store the checkpoint's
+    # OWN dtype (model-agnostic: bf16 for flux2/z-image, whatever a future model ships) so the mmap
+    # slices need no upcast, and let manual_cast_dtype pick the compute dtype (unet_manual_cast:
+    # bf16/fp16 aren't natively fast on CPU -> fp32) -- exactly how ComfyUI runs a low-precision
+    # checkpoint on CPU. A genuinely fp32 checkpoint stays fp32 (nothing to gain).
+    if mm.is_device_cpu(load_dev) and dtype == torch.float32:
+        weight_dtype = adapter.weight_dtype(os.path.join(model, "transformer"))
+        if weight_dtype is not None and weight_dtype != torch.float32:
+            dtype = weight_dtype
+
     # ComfyUI's storage-vs-compute dtype split: on a card without bf16 tensor cores (e.g. Turing) a
     # bf16 checkpoint computes in fp16 (manual_cast) -- weights stay bf16 (mmap, no RAM blow-up),
     # every matmul runs on fp16 tensor cores (~5x on such cards). None on Ampere+ (compute in
@@ -176,8 +189,13 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # (verified bit-identical to the normal path). Gated off manual_cast, whose
     # bf16-storage/fp16-compute split relies on the ModelPatcher cast path a direct assign would
     # bypass (never hit on MPS+fp16 anyway -> None).
-    import comfy.model_management as mm
     direct_load = mm.is_device_mps(load_dev) and manual_cast is None
+
+    # CPU has no VRAM to stream into, but the mmap slice path still applies: keep weights file-backed
+    # (safetensors-native mmap) so RAM never holds the whole model -- ComfyUI's low-RAM CPU load.
+    # VBAR (dynamic disk->VRAM faulting, comfy-aimdo) stays CUDA-only; on CPU we use the static
+    # ModelPatcher + manual_cast, so the same components stream without VBAR.
+    is_cpu = mm.is_device_cpu(load_dev)
 
     patchers = []
 
@@ -189,11 +207,12 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # cast path.
     build = adapter.build_dynamic_patcher if use_vbar else adapter.build_patcher
 
-    # Transformer: always meta-loaded + mmap file-sliced (load_streamed) so its weights stream
-    # PINNED via comfy_aimdo host buffers -- fast HtoD. Slices come from the page cache when the
-    # model fits RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB). load_streamed
-    # comfy-izes internally.
-    stream_transformer = use_vbar
+    # Transformer: meta-loaded + mmap file-sliced (load_streamed) so its weights never materialise.
+    # On CUDA the slices are comfy_aimdo-pinned host buffers streamed to VRAM per-forward (VBAR); on
+    # CPU they are safetensors-native mmap, paged from disk on demand. Same load_streamed either way
+    # -- ComfyUI's load_torch_file picks the mmap source per aimdo_enabled. Slices come from the page
+    # cache when the model fits RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB).
+    stream_transformer = use_vbar or is_cpu
 
     if stream_transformer:
         transformer, missing = adapter.load_streamed(
@@ -212,13 +231,13 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
             _direct_load(p.transformer, os.path.join(model, "transformer"), load_dev)
 
     adapter.keep_uncastable_resident(p.transformer, load_dev, manual_cast)
-    if stream_transformer:
+    if stream_transformer and use_vbar:
         adapter.install_prefetch(p.transformer)  # overlap disk->VRAM streaming with compute (VBAR)
     # ComfyUI's exact SDPA (comfy.ops, cuDNN-first + size gate)
     adapter.use_comfy_attention(p.transformer)
     adapter.use_kitchen_rope(p.transformer)  # ComfyUI's comfy_kitchen fused RoPE
     if manual_cast is not None:
-        # bf16 storage, fp16 compute
+        # bf16 storage, manual_cast compute (fp16 on Turing GPUs, fp32 on CPU)
         adapter.install_manual_cast(p.transformer, manual_cast, dtype)
     transformer_patcher = build(p.transformer)
 
@@ -239,7 +258,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
         adapter.use_comfy_attention(p.text_encoder)
         if direct_load:
             _direct_load(p.text_encoder, os.path.join(model, "text_encoder"), load_dev)
-        stream_text_encoder = use_vbar
+        stream_text_encoder = use_vbar or is_cpu
         if stream_text_encoder:
             te_missing = adapter.assign_streamed_weights(p.text_encoder,
                                                          os.path.join(model, "text_encoder"))
@@ -248,7 +267,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
                       % len(te_missing), flush=True)
         adapter.keep_uncastable_resident(p.text_encoder, load_dev, manual_cast)
         if manual_cast is not None:
-            # ComfyUI runs the TE fp16 too
+            # ComfyUI casts the TE the same way (manual_cast compute)
             adapter.install_manual_cast(p.text_encoder, manual_cast, dtype)
         encoder_patcher = build(p.text_encoder)
         patchers.append(encoder_patcher)
@@ -257,7 +276,26 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # Small resident modules (VAE) go straight to the compute device; the offloader handles the
     # heavy ones. VAE tiling/slicing is left to the caller.
     if getattr(p, "vae", None) is not None:
-        p.vae.to(load_dev)
+        # ComfyUI runs the VAE in fp32 on CPU (vae_dtype: bf16/fp16 conv is unsupported / emulated
+        # ~10-30x slower there, so it falls through to fp32). Our CPU storage dtype is bf16, which
+        # would leave the VAE in bf16 -- a multi-minute decode. Upcast it to fp32 on CPU; on GPU keep
+        # the pipeline dtype.
+        if is_cpu:
+            p.vae.to(device=load_dev, dtype=torch.float32)
+            # diffusers' flux2 pipeline hands the VAE bf16 latents; ComfyUI upcasts the latent to the
+            # VAE's own dtype before decode (VAE.decode: samples.to(self.vae_dtype)). Mirror that so
+            # the fp32 VAE never sees bf16 input (else conv raises a dtype mismatch).
+            _vae = p.vae
+
+            def _cast_in(fn):
+                def wrapped(x, *a, **k):
+                    return fn(x.to(torch.float32) if hasattr(x, "to") else x, *a, **k)
+                return wrapped
+
+            _vae.decode = _cast_in(_vae.decode)
+            _vae.encode = _cast_in(_vae.encode)
+        else:
+            p.vae.to(load_dev)
 
     p._offloader_patchers = patchers
     p._offloader_device = load_dev

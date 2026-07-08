@@ -393,19 +393,11 @@ def _match_by_suffix(live_name, live_tensor, disk_by_shape):
     return None
 
 
-def assign_streamed_weights(model, model_dir):
-    """Replace `model`'s weights with mmap-backed, file-sliced tensors from its .safetensors
-    shard(s) (via ComfyUI's own load_safetensors), so the VBAR path faults each straight from disk.
-    Matches disk keys to model.named_parameters() by name; for any that don't match directly
-    (checkpoints with renamed prefixes, e.g. the Qwen2.5-VL text encoder), falls back to structural
-    shape+suffix
-    matching. Returns the list of disk keys that still found no home."""
+def _assign_sd(model, sd):
+    """Rebind `model`'s params/buffers to the tensors in `sd` (kept as-is, so mmap/file-sliced
+    storage survives). Direct name match first, then structural shape+suffix fallback for renamed
+    prefixes. Returns the list of disk keys that found no home."""
     import comfy.utils as cu
-
-    sd = {}
-    for shard in _shards(model_dir):
-        part, _meta = cu.load_safetensors(shard)
-        sd.update(part)
 
     own = {n: p for n, p in model.named_parameters()}
     own.update({n: b for n, b in model.named_buffers()})
@@ -436,10 +428,38 @@ def assign_streamed_weights(model, model_dir):
     return [k for k in sd if k not in used]
 
 
+def weight_dtype(model_dir):
+    """The component's dominant on-disk weight dtype -- ComfyUI's `weight_dtype`, the value its
+    loaders feed to unet_dtype(). Delegates to comfy.utils.weight_dtype over the component's shards
+    read mmap (load_torch_file, no materialisation); returns a torch.dtype, or None if empty.
+    Model-agnostic: any diffusers component (single-file or index+shards)."""
+    import comfy.utils as cu
+
+    sd = {}
+    for shard in _shards(model_dir):
+        sd.update(cu.load_torch_file(shard, device=torch.device("cpu")))
+    return cu.weight_dtype(sd)
+
+
+def assign_streamed_weights(model, model_dir):
+    """Replace `model`'s weights with mmap-backed, file-sliced tensors from its .safetensors
+    shard(s) via ComfyUI's own load_torch_file, which memory-maps each shard: comfy-aimdo's
+    ModelMMAP when the VBAR path is active (CUDA), else safetensors' native mmap (CPU/MPS, no
+    comfy-aimdo). Either way the tensors stay file-backed, so RAM never holds the whole model.
+    Returns the list of disk keys that found no home."""
+    import comfy.utils as cu
+
+    sd = {}
+    for shard in _shards(model_dir):
+        sd.update(cu.load_torch_file(shard, device=torch.device("cpu")))
+    return _assign_sd(model, sd)
+
+
 def load_streamed(model_cls, model_dir, dtype, operations=None):
-    """Build a diffusers model whose weights stream disk->VRAM through the VBAR path: meta-load the
-    module (no weight RAM), comfy-ize it (into `operations`; see comfy_ize), then assign
-    file-sliced weights. Returns (model, missing)."""
+    """Build a diffusers model whose weights stream from mmap file-slices: meta-load the module (no
+    weight RAM), comfy-ize it (into `operations`; see comfy_ize), then assign the file-sliced
+    weights (ComfyUI's load_torch_file -- VBAR disk->VRAM fault on CUDA, native mmap on CPU/MPS).
+    Returns (model, missing)."""
     from accelerate import init_empty_weights
 
     cfg = model_cls.load_config(model_dir)
