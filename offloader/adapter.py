@@ -56,42 +56,43 @@ import comfy.ops as ops
 
 
 # -------------------------------------------------------------------------------------------------
-# Op mapping: torch leaf type -> ComfyUI disable_weight_init counterpart (a torch.nn.X subclass
-# that also mixes in CastWeightBiasOp). Checked in order; the first isinstance() match wins. Every
-# diffuser transformer/text-encoder leaf that carries an offloadable weight is one of these.
+# Op mapping: torch leaf type -> ComfyUI op class NAME (a torch.nn.X subclass that also mixes in
+# CastWeightBiasOp). The name is resolved against a chosen ComfyUI op namespace at re-class time,
+# so the SAME map serves both `disable_weight_init` (plain forward unless offloaded) and
+# `manual_cast` (every leaf casts) -- exactly as ComfyUI's pick_operations picks one namespace for
+# the whole model. Checked in order; the first isinstance() match wins. Every diffuser
+# transformer/text-encoder leaf that carries an offloadable weight is one of these.
 # -------------------------------------------------------------------------------------------------
-_dwi = ops.disable_weight_init
-
 _OP_MAP = [
-    (torch.nn.Linear,    _dwi.Linear),
-    (torch.nn.Conv1d,    _dwi.Conv1d),
-    (torch.nn.Conv2d,    _dwi.Conv2d),
-    (torch.nn.Conv3d,    _dwi.Conv3d),
-    (torch.nn.GroupNorm, _dwi.GroupNorm),
-    (torch.nn.LayerNorm, _dwi.LayerNorm),
-    (torch.nn.Embedding, _dwi.Embedding),
+    (torch.nn.Linear,    "Linear"),
+    (torch.nn.Conv1d,    "Conv1d"),
+    (torch.nn.Conv2d,    "Conv2d"),
+    (torch.nn.Conv3d,    "Conv3d"),
+    (torch.nn.GroupNorm, "GroupNorm"),
+    (torch.nn.LayerNorm, "LayerNorm"),
+    (torch.nn.Embedding, "Embedding"),
 ]
 
 # torch.nn.RMSNorm exists only on recent torch; add it when present (diffusers uses it widely).
-if hasattr(torch.nn, "RMSNorm") and hasattr(_dwi, "RMSNorm"):
-    _OP_MAP.append((torch.nn.RMSNorm, _dwi.RMSNorm))
+if hasattr(torch.nn, "RMSNorm"):
+    _OP_MAP.append((torch.nn.RMSNorm, "RMSNorm"))
 
 
-def _comfy_class_for(module):
-    """The disable_weight_init class to re-class `module` into, or None if it isn't an offloadable
-    leaf op. Skips modules that already are CastWeightBiasOp (idempotent)."""
+def _comfy_class_for(module, operations):
+    """The `operations` (disable_weight_init or manual_cast) class to re-class `module` into, or
+    None if it isn't an offloadable leaf op. Skips CastWeightBiasOp modules (idempotent)."""
     if isinstance(module, ops.CastWeightBiasOp):
         return None
-    for torch_cls, dwi_cls in _OP_MAP:
+    for torch_cls, name in _OP_MAP:
         if isinstance(module, torch_cls):
-            return dwi_cls
+            return getattr(operations, name, None)
     # Custom RMSNorm classes (diffusers/transformers write their own, e.g. Qwen3RMSNorm, not
     # torch.nn.RMSNorm) run an eager mul/rsqrt that is ~3.5x slower than ComfyUI's fused path.
-    # ComfyUI's own disable_weight_init.RMSNorm calls torch.nn.functional.rms_norm; route these
-    # through the SAME vendored class so the kernel (and behavior) matches ComfyUI exactly.
-    if hasattr(_dwi, "RMSNorm") and type(module).__name__.endswith("RMSNorm") \
+    # ComfyUI's own RMSNorm calls torch.nn.functional.rms_norm; route these through the SAME
+    # vendored class so the kernel (and behavior) matches ComfyUI exactly.
+    if hasattr(operations, "RMSNorm") and type(module).__name__.endswith("RMSNorm") \
             and getattr(module, "weight", None) is not None:
-        return _dwi.RMSNorm
+        return operations.RMSNorm
     return None
 
 
@@ -112,39 +113,57 @@ def _prep_rmsnorm(module):
         module.elementwise_affine = True
 
 
-def comfy_ize(model):
+def pick_operations(weight_dtype, compute_dtype, load_device=None):
+    """ComfyUI's own op-namespace selector (comfy.ops.pick_operations): returns `manual_cast` when
+    the compute dtype differs from the weight dtype (every leaf casts, comfy_cast_weights=True at
+    the class level), else `disable_weight_init`. This is the exact call ComfyUI uses to build a
+    model; hand the result to comfy_ize / load_streamed. Its fp8/cublas branches are inert here (we
+    parse no argv, pass no quant_config), so it returns only those two namespaces."""
+    return ops.pick_operations(weight_dtype, compute_dtype, load_device)
+
+
+def comfy_ize(model, operations=None):
     """Re-class every offloadable leaf of `model` in place so its forward routes through ComfyUI's
-    cast path when flagged. Injects exactly the attributes ModelPatcher.load()/cast_bias_weight
-    read (comfy_cast_weights, weight_function, bias_function, and bias=None for weight-only ops).
-    Returns the number of modules converted.
+    cast path. `operations` is the ComfyUI op namespace to re-class into (from pick_operations):
+    `disable_weight_init` (default -- plain forward unless ModelPatcher offloads the leaf) or
+    `manual_cast` (every leaf casts, comfy_cast_weights=True at the class level -- so under
+    manual_cast a RESIDENT leaf casts too, exactly as ComfyUI). Injects the attributes
+    ModelPatcher.load()/cast_bias_weight read. Returns the number of modules converted.
 
     Re-classing to ComfyUI's own class (rather than a synthesized mixin) keeps true 1:1 parity: the
-    running forward IS disable_weight_init.<Op>.forward. The lazy-init __init__ of those classes is
+    running forward IS <operations>.<Op>.forward. The lazy-init __init__ of those classes is
     bypassed here (we mutate existing instances that already hold their weights)."""
+    if operations is None:
+        operations = ops.disable_weight_init
+    rms_cls = getattr(operations, "RMSNorm", None)
     count = 0
     for _name, m in model.named_modules():
-        dwi_cls = _comfy_class_for(m)
-        if dwi_cls is None:
+        target = _comfy_class_for(m, operations)
+        if target is None:
             continue
 
         # Custom RMSNorm needs normalized_shape/eps before re-classing so F.rms_norm can read them.
-        if dwi_cls is _dwi.RMSNorm and not isinstance(m, torch.nn.RMSNorm):
+        if target is rms_cls and not isinstance(m, torch.nn.RMSNorm):
             _prep_rmsnorm(m)
 
         # Re-class the live instance. torch.nn.X subclasses share a compatible object layout, so
         # __class__ assignment is valid; diffusers custom subclasses that add only config (no
         # forward override that matters for weight application) keep working through the base op.
-        m.__class__ = dwi_cls
+        m.__class__ = target
 
         # cast_bias_weight always reads s.bias; weight-only ops (Embedding/RMSNorm) have none.
-        # Mirror what disable_weight_init.__init__ would have set.
+        # Mirror what the op's __init__ would have set.
         if not hasattr(m, "bias"):
             m.bias = None
 
-        # Instance-level (never the shared CastWeightBiasOp class lists) so per-module offload
-        # flags don't alias. ModelPatcher.load() overwrites these when it decides to offload the
-        # module.
-        m.comfy_cast_weights = False
+        # comfy_cast_weights: `manual_cast` ops set it True at the CLASS level (cast every leaf --
+        # ComfyUI's manual_cast path, and it survives ModelPatcher.load for resident leaves). Only
+        # pin an instance False for the `disable_weight_init` path, so a manual_cast leaf keeps its
+        # class-level True. ModelPatcher.load() overwrites this to True for any leaf it offloads
+        # either way. weight_function/bias_function are per-instance lists so per-module offload
+        # patches never alias the shared CastWeightBiasOp class lists.
+        if not getattr(type(m), "comfy_cast_weights", False):
+            m.comfy_cast_weights = False
         m.weight_function = []
         m.bias_function = []
         count += 1
@@ -210,13 +229,13 @@ def keep_uncastable_resident(model, device, compute_dtype=None):
     return moved, nbytes
 
 
-def manual_cast_dtype(storage_dtype, device):
+def manual_cast_dtype(weight_dtype, inference_device):
     """ComfyUI's storage-vs-compute dtype split -- comfy/model_management.py::unet_manual_cast
-    (vendored). Returns the COMPUTE dtype to run in when `storage_dtype` is not natively fast on
-    `device`, else None (compute stays in storage dtype). On a card without bf16 tensor cores
-    (e.g. Turing sm_75) a bf16 checkpoint -> torch.float16; on Ampere+ bf16 -> None. The decision
-    is comfy's own, unchanged -- GPU-agnostic."""
-    return mm.unet_manual_cast(storage_dtype, device)
+    (vendored; same arg names). Returns the COMPUTE dtype to run in when `weight_dtype` is not
+    natively fast on `inference_device`, else None (compute stays in the weight dtype). On a card
+    without bf16 tensor cores (e.g. Turing sm_75) a bf16 checkpoint -> torch.float16; on Ampere+
+    bf16 -> None. The decision is comfy's own, unchanged -- GPU-agnostic."""
+    return mm.unet_manual_cast(weight_dtype, inference_device)
 
 
 def install_manual_cast(model, compute_dtype, storage_dtype):
@@ -417,17 +436,17 @@ def assign_streamed_weights(model, model_dir):
     return [k for k in sd if k not in used]
 
 
-def load_streamed(model_cls, model_dir, dtype):
+def load_streamed(model_cls, model_dir, dtype, operations=None):
     """Build a diffusers model whose weights stream disk->VRAM through the VBAR path: meta-load the
-    module (no weight RAM), comfy-ize it, then assign file-sliced weights. Returns (model,
-    missing)."""
+    module (no weight RAM), comfy-ize it (into `operations`; see comfy_ize), then assign
+    file-sliced weights. Returns (model, missing)."""
     from accelerate import init_empty_weights
 
     cfg = model_cls.load_config(model_dir)
     with init_empty_weights():
         model = model_cls.from_config(cfg).to(dtype)
 
-    comfy_ize(model)
+    comfy_ize(model, operations)
     missing = assign_streamed_weights(model, model_dir)
     return model, missing
 

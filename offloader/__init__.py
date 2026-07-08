@@ -152,6 +152,12 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
         print("offloader: manual_cast compute dtype %s (storage %s)"
               % (manual_cast, dtype), flush=True)
 
+    # ComfyUI's own op-namespace pick (pick_operations): comfy.ops.manual_cast when compute !=
+    # weight (every leaf casts, incl. resident ones -- how ComfyUI runs a bf16 model in fp16 on a
+    # card without bf16 tensor cores), else disable_weight_init (plain forward unless offloaded).
+    # comfy_ize / load_streamed re-class each leaf into this namespace.
+    operations = adapter.pick_operations(dtype, manual_cast, load_dev)
+
     PipelineCls, Transformer = _classes(engine)
 
     # VBAR: CUDA + comfy-aimdo (initialised in pre_torch_init) -> flip aimdo_enabled so ComfyUI's
@@ -191,7 +197,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     if stream_transformer:
         transformer, missing = adapter.load_streamed(
-            Transformer, os.path.join(model, "transformer"), dtype)
+            Transformer, os.path.join(model, "transformer"), dtype, operations)
         if missing:
             print("offloader: %d transformer weights had no matching module (skipped)"
                   % len(missing), flush=True)
@@ -201,7 +207,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     else:
         p = PipelineCls.from_pretrained(model, torch_dtype=dtype, use_safetensors=True,
                                         low_cpu_mem_usage=True, local_files_only=True)
-        adapter.comfy_ize(p.transformer)
+        adapter.comfy_ize(p.transformer, operations)
         if direct_load:
             _direct_load(p.transformer, os.path.join(model, "transformer"), load_dev)
 
@@ -229,7 +235,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # pinned via VBAR. Custom norms (e.g. Qwen3RMSNorm) are kept resident by
     # keep_uncastable_resident since they can't be comfy-ized.
     if getattr(p, "text_encoder", None) is not None:
-        adapter.comfy_ize(p.text_encoder)
+        adapter.comfy_ize(p.text_encoder, operations)
         adapter.use_comfy_attention(p.text_encoder)
         if direct_load:
             _direct_load(p.text_encoder, os.path.join(model, "text_encoder"), load_dev)
