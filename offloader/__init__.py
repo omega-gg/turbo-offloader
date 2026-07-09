@@ -141,7 +141,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     import torch  # noqa: F401
     from . import adapter
 
-    load_dev = adapter.set_device(device)
+    load_device = adapter.set_device(device)
 
     import comfy.model_management as mm
 
@@ -153,7 +153,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # full-load-when-it-fits call, which ComfyUI applies on GPU (free VRAM) but leaves as
     # always-full-load on CPU. OFFLOADER_CPU_MODE=comfy|stream forces one.
     cpu_stream = False
-    if mm.is_device_cpu(load_dev):
+    if mm.is_device_cpu(load_device):
         mode = os.environ.get("OFFLOADER_CPU_MODE")
         if mode not in ("comfy", "stream"):
             mode = "comfy" if adapter.cpu_fits_full_load(model) else "stream"
@@ -169,7 +169,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # bf16 checkpoint computes in fp16 (manual_cast) -- weights stay bf16 (mmap, no RAM blow-up),
     # every matmul runs on fp16 tensor cores (~5x on such cards). None on Ampere+ (compute in
     # bf16).
-    manual_cast = adapter.manual_cast_dtype(dtype, load_dev)
+    manual_cast = adapter.manual_cast_dtype(dtype, load_device)
     if manual_cast is not None:
         print("offloader: manual_cast compute dtype %s (storage %s)"
               % (manual_cast, dtype), flush=True)
@@ -178,7 +178,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # weight (every leaf casts, incl. resident ones -- how ComfyUI runs a bf16 model in fp16 on a
     # card without bf16 tensor cores), else disable_weight_init (plain forward unless offloaded).
     # comfy_ize / load_streamed re-class each leaf into this namespace.
-    operations = adapter.pick_operations(dtype, manual_cast, load_dev)
+    operations = adapter.pick_operations(dtype, manual_cast, load_device)
 
     PipelineCls, Transformer = _classes(engine)
 
@@ -198,7 +198,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # (verified bit-identical to the normal path). Gated off manual_cast, whose
     # bf16-storage/fp16-compute split relies on the ModelPatcher cast path a direct assign would
     # bypass (never hit on MPS+fp16 anyway -> None).
-    direct_load = mm.is_device_mps(load_dev) and manual_cast is None
+    direct_load = mm.is_device_mps(load_device) and manual_cast is None
 
     patchers = []
 
@@ -231,9 +231,9 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
                                         low_cpu_mem_usage=True, local_files_only=True)
         adapter.comfy_ize(p.transformer, operations)
         if direct_load:
-            _direct_load(p.transformer, os.path.join(model, "transformer"), load_dev)
+            _direct_load(p.transformer, os.path.join(model, "transformer"), load_device)
 
-    adapter.keep_uncastable_resident(p.transformer, load_dev, manual_cast)
+    adapter.keep_uncastable_resident(p.transformer, load_device, manual_cast)
     if stream_transformer and use_vbar:
         adapter.install_prefetch(p.transformer)  # overlap disk->VRAM streaming with compute (VBAR)
     # ComfyUI's exact SDPA (comfy.ops, cuDNN-first + size gate)
@@ -257,24 +257,34 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # pinned via VBAR. Custom norms (e.g. Qwen3RMSNorm) are kept resident by
     # keep_uncastable_resident since they can't be comfy-ized.
     if getattr(p, "text_encoder", None) is not None:
+        stream_text_encoder = use_vbar or cpu_stream
+        # ComfyUI runs the text encoder on ComfyUI's own text_encoder_device() -- CPU under
+        # vram_state SHARED (Apple Silicon), the compute device otherwise -- and moves only the
+        # conditioning to the compute device. Honor that for the resident path (device-agnostic via
+        # comfy's own selector): when it lands the TE off the compute device (MPS -> CPU), residency
+        # is the transformer alone and encode runs on te_dev via the bridge below. The streaming
+        # paths (VBAR / CPU-stream) place the TE their own way, so keep load_device there.
+        te_dev = load_device if stream_text_encoder else mm.text_encoder_device()
         adapter.comfy_ize(p.text_encoder, operations)
         adapter.use_comfy_attention(p.text_encoder)
-        if direct_load:
-            _direct_load(p.text_encoder, os.path.join(model, "text_encoder"), load_dev)
-        stream_text_encoder = use_vbar or cpu_stream
+        if direct_load and te_dev == load_device:
+            _direct_load(p.text_encoder, os.path.join(model, "text_encoder"), load_device)
         if stream_text_encoder:
             te_missing = adapter.assign_streamed_weights(p.text_encoder,
                                                          os.path.join(model, "text_encoder"))
             if te_missing:
                 print("offloader: %d text-encoder weights had no matching param (skipped)"
                       % len(te_missing), flush=True)
-        adapter.keep_uncastable_resident(p.text_encoder, load_dev, manual_cast)
+        adapter.keep_uncastable_resident(p.text_encoder, te_dev, manual_cast)
         if manual_cast is not None:
             # ComfyUI casts the TE the same way (manual_cast compute)
             adapter.install_manual_cast(p.text_encoder, manual_cast, dtype)
-        encoder_patcher = build(p.text_encoder)
+        encoder_patcher = (build(p.text_encoder) if te_dev == load_device
+                           else adapter.build_patcher(p.text_encoder, load_device=te_dev,
+                                                      offload_device=te_dev))
         patchers.append(encoder_patcher)
         p._offloader_encoder = encoder_patcher
+        p._offloader_te_device = te_dev
 
     # Small resident modules (VAE) go straight to the compute device; the offloader handles the
     # heavy ones. VAE tiling/slicing is left to the caller.
@@ -284,7 +294,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
         # bf16, which would leave the VAE in bf16 -- a multi-minute decode; upcast it to fp32. In
         # comfy mode the pipeline is already fp32, and on GPU we keep the pipeline dtype.
         if cpu_stream:
-            p.vae.to(device=load_dev, dtype=torch.float32)
+            p.vae.to(device=load_device, dtype=torch.float32)
             # diffusers' flux2 pipeline hands the VAE bf16 latents; ComfyUI upcasts the latent to the
             # VAE's own dtype before decode (VAE.decode: samples.to(self.vae_dtype)). Mirror that so
             # the fp32 VAE never sees bf16 input (else conv raises a dtype mismatch).
@@ -298,20 +308,50 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
             _vae.decode = _cast_in(_vae.decode)
             _vae.encode = _cast_in(_vae.encode)
         else:
-            p.vae.to(load_dev)
+            p.vae.to(load_device)
 
     p._offloader_patchers = patchers
-    p._offloader_device = load_dev
+    p._offloader_device = load_device
 
-    # Diffusers reads _execution_device from module placement; pin it to the compute device so
-    # inputs land there while offloaded weights stream in.
-    try:
-        p._execution_device = load_dev
-    except Exception:
-        pass
+    # Diffusers infers _execution_device from module placement. Normally every managed module sits
+    # on the compute device, so the historical best-effort hint below suffices (and CUDA / CPU keep
+    # exactly that path). Only when the text encoder is placed OFF the compute device (te_dev !=
+    # load_device, e.g. MPS -> CPU) would the property resolve to that other device and build the
+    # timesteps/latents there, mismatching the compute-device transformer -- so in that case pin it
+    # to the compute device via a per-instance subclass (ComfyUI runs the sampler on the compute
+    # device regardless of where the text encoder lives). The encode still runs on te_dev because the
+    # bridge below overrides encode_prompt's device argument explicitly.
+    te_off_device = getattr(p, "_offloader_te_device", load_device) != load_device
+    if te_off_device:
+        _cls = type(p)
+        p.__class__ = type(_cls.__name__, (_cls,),
+                           {"_execution_device": property(lambda self: load_device)})
+    else:
+        try:
+            p._execution_device = load_device
+        except Exception:
+            pass
 
     # NOTE: This might improve performances.
     p.safety_checker = lambda images, **kwargs: (images, [False] * len(images))
+
+    # ComfyUI-faithful encode placement: when the TE lives off the compute device (CPU on MPS),
+    # diffusers' __call__ would still pass device=_execution_device to encode_prompt and stream the
+    # TE to MPS per leaf. Run the encode on the TE's own device instead (native forward, no stream),
+    # then move only the (small) embeddings to the compute device -- ComfyUI's "encode on CPU,
+    # conditioning to GPU". Wrapped BEFORE install_encode_cache so the cache stores the CPU result.
+    te_dev = getattr(p, "_offloader_te_device", load_device)
+    if te_dev != load_device and getattr(p, "encode_prompt", None) is not None:
+        _real_encode = p.encode_prompt
+
+        def _encode_on_te(*args, **kwargs):
+            kwargs["device"] = te_dev
+            out = _real_encode(*args, **kwargs)
+            if isinstance(out, (list, tuple)):
+                return type(out)(o.to(load_device) if isinstance(o, torch.Tensor) else o for o in out)
+            return out.to(load_device) if isinstance(out, torch.Tensor) else out
+
+        p.encode_prompt = _encode_on_te
 
     # Cache the text-encoder output by prompt (ComfyUI's node cache): a repeated prompt then skips
     # the encoder's forward, so the streamed encoder is never loaded and the transformer keeps the
