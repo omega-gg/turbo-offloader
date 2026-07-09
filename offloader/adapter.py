@@ -428,17 +428,19 @@ def _assign_sd(model, sd):
     return [k for k in sd if k not in used]
 
 
-def weight_dtype(model_dir):
-    """The component's dominant on-disk weight dtype -- ComfyUI's `weight_dtype`, the value its
-    loaders feed to unet_dtype(). Delegates to comfy.utils.weight_dtype over the component's shards
-    read mmap (load_torch_file, no materialisation); returns a torch.dtype, or None if empty.
-    Model-agnostic: any diffusers component (single-file or index+shards)."""
-    import comfy.utils as cu
-
-    sd = {}
-    for shard in _shards(model_dir):
-        sd.update(cu.load_torch_file(shard, device=torch.device("cpu")))
-    return cu.weight_dtype(sd)
+def cpu_fits_full_load(model):
+    """True when ComfyUI's plain CPU full-load (fp32, materialised) would fit host RAM -- so the
+    caller can use that faster path instead of streaming. The fp32 model is ~2x the on-disk bf16
+    size; require it under 85% of total RAM (headroom for activations + the OS). Compared against
+    ComfyUI's own get_total_memory(cpu). This is ComfyUI's full-load-when-it-fits call, which
+    ComfyUI applies on GPU (via free VRAM) but not on CPU -- here we apply it to CPU. Model-agnostic:
+    sums the on-disk bytes of each big component (single-file or index+shards)."""
+    total = 0
+    for comp in ("transformer", "text_encoder"):
+        comp_dir = os.path.join(model, comp)
+        if os.path.isdir(comp_dir):
+            total += sum(os.path.getsize(s) for s in _shards(comp_dir))
+    return 2 * total <= mm.get_total_memory(torch.device("cpu")) * 0.85
 
 
 def assign_streamed_weights(model, model_dir):

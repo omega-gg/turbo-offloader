@@ -145,16 +145,25 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
 
     import comfy.model_management as mm
 
-    # CPU: match ComfyUI's storage/compute split. turboCLI hands us fp32 on CPU, which would DOUBLE
-    # RAM (store every weight fp32) and skip manual_cast entirely. Instead store the checkpoint's
-    # OWN dtype (model-agnostic: bf16 for flux2/z-image, whatever a future model ships) so the mmap
-    # slices need no upcast, and let manual_cast_dtype pick the compute dtype (unet_manual_cast:
-    # bf16/fp16 aren't natively fast on CPU -> fp32) -- exactly how ComfyUI runs a low-precision
-    # checkpoint on CPU. A genuinely fp32 checkpoint stays fp32 (nothing to gain).
-    if mm.is_device_cpu(load_dev) and dtype == torch.float32:
-        weight_dtype = adapter.weight_dtype(os.path.join(model, "transformer"))
-        if weight_dtype is not None and weight_dtype != torch.float32:
-            dtype = weight_dtype
+    # CPU placement mode. ComfyUI's default CPU path is fp32 storage, fully materialised -- faster
+    # when the model fits RAM (weights are cast to fp32 once at load, then every forward is a plain
+    # matmul). For a model bigger than RAM that OOMs, so we fall back to a streamed path: bf16
+    # storage (ComfyUI --bf16-unet), mmap-kept (never materialised, RAM bounded), fp32 compute cast
+    # per forward via manual_cast (slower per step). The default auto-picks by fit -- ComfyUI's own
+    # full-load-when-it-fits call, which ComfyUI applies on GPU (free VRAM) but leaves as
+    # always-full-load on CPU. OFFLOADER_CPU_MODE=comfy|stream forces one.
+    cpu_stream = False
+    if mm.is_device_cpu(load_dev):
+        mode = os.environ.get("OFFLOADER_CPU_MODE")
+        if mode not in ("comfy", "stream"):
+            mode = "comfy" if adapter.cpu_fits_full_load(model) else "stream"
+        cpu_stream = mode == "stream"
+        # Drive the storage dtype through ComfyUI's own unet_dtype(): --bf16-unet (bf16) when
+        # streaming, else its CPU default (fp32). manual_cast_dtype (below) then picks fp32 compute.
+        from comfy.cli_args import args as _args
+        _args.bf16_unet = cpu_stream
+        dtype = mm.unet_dtype()
+        print("offloader: CPU mode=%s (storage %s)" % (mode, dtype), flush=True)
 
     # ComfyUI's storage-vs-compute dtype split: on a card without bf16 tensor cores (e.g. Turing) a
     # bf16 checkpoint computes in fp16 (manual_cast) -- weights stay bf16 (mmap, no RAM blow-up),
@@ -191,12 +200,6 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # bypass (never hit on MPS+fp16 anyway -> None).
     direct_load = mm.is_device_mps(load_dev) and manual_cast is None
 
-    # CPU has no VRAM to stream into, but the mmap slice path still applies: keep weights file-backed
-    # (safetensors-native mmap) so RAM never holds the whole model -- ComfyUI's low-RAM CPU load.
-    # VBAR (dynamic disk->VRAM faulting, comfy-aimdo) stays CUDA-only; on CPU we use the static
-    # ModelPatcher + manual_cast, so the same components stream without VBAR.
-    is_cpu = mm.is_device_cpu(load_dev)
-
     patchers = []
 
     # Big models stream to VRAM per-forward through ComfyUI's ModelPatcherDynamic (comfy-aimdo
@@ -212,7 +215,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # CPU they are safetensors-native mmap, paged from disk on demand. Same load_streamed either way
     # -- ComfyUI's load_torch_file picks the mmap source per aimdo_enabled. Slices come from the page
     # cache when the model fits RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB).
-    stream_transformer = use_vbar or is_cpu
+    stream_transformer = use_vbar or cpu_stream
 
     if stream_transformer:
         transformer, missing = adapter.load_streamed(
@@ -258,7 +261,7 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
         adapter.use_comfy_attention(p.text_encoder)
         if direct_load:
             _direct_load(p.text_encoder, os.path.join(model, "text_encoder"), load_dev)
-        stream_text_encoder = use_vbar or is_cpu
+        stream_text_encoder = use_vbar or cpu_stream
         if stream_text_encoder:
             te_missing = adapter.assign_streamed_weights(p.text_encoder,
                                                          os.path.join(model, "text_encoder"))
@@ -277,10 +280,10 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # heavy ones. VAE tiling/slicing is left to the caller.
     if getattr(p, "vae", None) is not None:
         # ComfyUI runs the VAE in fp32 on CPU (vae_dtype: bf16/fp16 conv is unsupported / emulated
-        # ~10-30x slower there, so it falls through to fp32). Our CPU storage dtype is bf16, which
-        # would leave the VAE in bf16 -- a multi-minute decode. Upcast it to fp32 on CPU; on GPU keep
-        # the pipeline dtype.
-        if is_cpu:
+        # ~10-30x slower there, so it falls through to fp32). In stream mode our storage dtype is
+        # bf16, which would leave the VAE in bf16 -- a multi-minute decode; upcast it to fp32. In
+        # comfy mode the pipeline is already fp32, and on GPU we keep the pipeline dtype.
+        if cpu_stream:
             p.vae.to(device=load_dev, dtype=torch.float32)
             # diffusers' flux2 pipeline hands the VAE bf16 latents; ComfyUI upcasts the latent to the
             # VAE's own dtype before decode (VAE.decode: samples.to(self.vae_dtype)). Mirror that so
