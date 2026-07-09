@@ -59,6 +59,26 @@ The seam picks VBAR automatically on CUDA-with-comfy-aimdo, native otherwise. `s
 the seam's `device=` arg onto `comfy.model_management.cpu_state`, the single knob that switches the
 whole device stack.
 
+## CPU placement (`comfy` / `stream`)
+
+On CPU there is no device boundary to manage, so ComfyUI itself just full-loads (its lowvram path
+is `DISABLED` on CPU) at fp32 — fast when the model fits RAM, an OOM when it doesn't. `load_pipe`
+offers both, and picks the way ComfyUI decides on GPU (full-load when it fits, stream otherwise),
+applied to CPU:
+
+- **`comfy`** — ComfyUI's default: fp32 storage, materialised. Faster (weights cast to fp32 once at
+  load, then plain forwards), but needs the whole model resident.
+- **`stream`** — bf16 storage (ComfyUI `--bf16-unet`) + mmap-keep (weights never materialise, RAM
+  bounded) + fp32 compute cast per forward via `manual_cast`. Runs a model larger than RAM; slower
+  per step (casts every forward instead of once).
+
+The default auto-selects via `adapter.cpu_fits_full_load()` — the fp32 model (~2× the on-disk bf16
+size) against ComfyUI's own `get_total_memory(cpu)`, 85% headroom. `OFFLOADER_CPU_MODE=comfy|stream`
+forces one. The dtype is ComfyUI's own call: flip `args.bf16_unet` for the chosen mode and read
+`mm.unet_dtype()` (bf16 or fp32); `manual_cast_dtype` (`mm.unet_manual_cast`) then picks fp32
+compute on CPU. The VAE runs fp32 either way (ComfyUI's `vae_dtype(cpu)`); `stream` upcasts its
+input latents to match.
+
 ## The adapter bridge (`adapter.py`)
 
 turboCLI's models are vanilla diffusers/transformers `nn.Module`s; ComfyUI's offloader expects its
