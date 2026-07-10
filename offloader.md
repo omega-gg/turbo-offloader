@@ -177,8 +177,8 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
 
 ## Notes
 
-- **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` reads the transformer + text
-  encoder straight onto the device via ComfyUI's `load_torch_file`
+- **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` reads the transformer straight
+  onto the device via ComfyUI's `load_torch_file`
   (`safetensors.safe_open(device= "mps")`) + `load_state_dict(assign=True)` — exactly how ComfyUI
   loads on Apple Silicon — instead of diffusers' CPU load followed by `load_models_gpu`'s per-leaf
   CPU→device copy; `load_models_gpu` then no-ops on the resident weights. Halves placement
@@ -188,7 +188,21 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   (a full direct load would OOM), CPU already loads there. Model- agnostic (globs component
   shards); LoRA-safe (patches still merge on top via `patch_weight_to_ device`, verified
   bit-identical); gated off `manual_cast`; any mismatch falls back to normal placement.
-  `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after.
+  `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after — though on MPS the Qwen3
+  text encoder now lands on CPU (next note), so only the transformer takes this direct-load path.
+- **Text encoder on CPU on MPS (ComfyUI's `text_encoder_device()`).** ComfyUI runs the text encoder
+  on `text_encoder_device()` — CPU under `vram_state` SHARED (Apple Silicon), the compute device
+  otherwise — keeping only the transformer resident on the compute device and moving just the
+  conditioning across. `load_pipe` honors that selector for the resident (non-streamed) path:
+  `te_dev = text_encoder_device()`. When it lands the TE off the compute device (MPS → CPU) the TE
+  patcher is built on `te_dev`, `encode_prompt` runs there (native forward) and only the small
+  embeddings move to the compute device, and the pipeline's `_execution_device` is pinned to the
+  compute device (per-instance subclass) so timesteps/latents are built to match the transformer.
+  Gated on `te_dev != load_device`, so the streamed paths (VBAR / CPU-stream, TE placed their own
+  way) and plain CPU (`text_encoder_device()` → CPU == `load_device`) are unchanged; the effect is
+  MPS-only. Was materialising both transformer + TE on MPS (~15GB); now the TE is CPU-resident.
+  Measured on an 8GB M1 (512×512): MPS residency ~15 → 7GB, peak swap 12.8 → 5.3GB, diffusion
+  2:26 → 1:46, total 247 → 188s.
 - **Streaming is mmap file-sliced + pinned (comfy-aimdo VBAR).** Every big model has its weights
   swapped for mmap file-slices (`load_streamed` / `assign_streamed_weights`), then wrapped in
   ComfyUI's `ModelPatcherDynamic`. The transformer is meta-loaded first (`load_streamed`), so it
