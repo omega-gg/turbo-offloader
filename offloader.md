@@ -223,6 +223,27 @@ run* as the laptop thermal-throttles the i7-12800H from ~3.6 → ~1.05 GHz over 
 OOM-thrashes z-image (fp32 working set ~48 GB > 32 GB RAM), so the auto-picker correctly stays on
 `stream`.
 
+**Machine:** Apple M1 (Mac mini, 8-core) · 8 GB unified RAM · MPS · macOS 15.5 · torch 2.12 ·
+Python 3.14.
+
+| Engine (on-disk bf16) | Device | Res | Steps | Wall-clock | Path |
+|---|---|---|---|---|---|
+| flux2-4b (15 GB) | MPS | 512×512 | 4 | ~185 s (~106 s gen) | direct-load, TE-CPU |
+| flux2-4b | MPS | 1024×768 | 4 | ~249 s | direct-load, TE-CPU |
+
+Notes: MPS runs **fp16-resident** (no `manual_cast`) — the transformer is direct-loaded straight
+onto the device (`safe_open(device="mps")`) and stays resident; there is no VBAR/stream path (MPS
+has no separate VRAM pool). The text encoder runs on **CPU** (ComfyUI's `text_encoder_device()`
+under `vram_state` SHARED), so residency is the transformer alone (~7 GB, down from ~15 GB with
+both on-device) and only the conditioning crosses to MPS. On this 8 GB box the run still spills to
+swap and **that** is the scaling wall, not compute: peak swap ~5.3 GB at 512×512, ~9.7 GB at
+1024×768 (both produce clean images — the 1024 corruption seen in image-to-image *edit* is that
+mode's larger footprint, not text-to-image). The faithful fp16-on-CPU encode (~50 s) dominates the
+non-gen time and is cached (`install_encode_cache`), so a repeated prompt skips it. Output is
+bit-deterministic across runs at a fixed seed (verified: two seed-42 runs, identical SHA-256).
+z-image-turbo (20 GB) is not benchmarked here — its working set exceeds this 8 GB box's usable
+RAM+swap headroom, so it belongs on a larger-RAM Mac.
+
 ## Notes
 
 - **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` reads the transformer straight
