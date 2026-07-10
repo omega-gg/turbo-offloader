@@ -183,10 +183,10 @@ change here.
 
 ## Benchmarks
 
-Reference wall-clock (load + generate, seed-fixed, `offloader` mode) on **one box** -- yours will
-differ with disk/RAM/VRAM and thermal state. Both models exceed the 8 GB VRAM *and* 16 GB RAM at
-fp32, so CUDA runs VBAR partial residency and CPU auto-selects `stream` (bf16 mmap + fp32
-`manual_cast`); neither fits a plain full load here.
+Reference wall-clock (load + generate, seed-fixed, `offloader` mode) on the boxes below -- yours
+will differ with disk/RAM/VRAM and thermal state. Both models exceed VRAM (and, at fp32, RAM) on
+both, so CUDA runs VBAR partial residency and CPU auto-selects `stream` (bf16 mmap + fp32
+`manual_cast`); neither fits a plain full load.
 
 **Machine:** Intel i7-4770K (4c/8t, 3.5 GHz) · 16 GB RAM · RTX 2070 SUPER (8 GB, Turing sm_75) ·
 Windows 10 · torch 2.12 + cu130.
@@ -203,6 +203,25 @@ Notes: **CUDA** is streaming-bound on an 8 GB card (the GPU idles between steps 
 VBAR disk/RAM→VRAM fault); the first (cold) generation is ~30–50 % slower than warm as the DiT
 streams cold from disk. **CPU** is fp32 `manual_cast` compute (hence minutes/image); it runs at all
 only because `stream` keeps weights mmap-backed — a plain fp32 full load OOMs both models on 16 GB.
+
+**Machine:** Intel i7-12800H (14c/20t) · 32 GB RAM · RTX A1000 Laptop (4 GB, Ampere sm_86) ·
+Windows 11 · torch 2.12 + cu130.
+
+| Engine (on-disk bf16) | Device | Res | Steps | Wall-clock | Path |
+|---|---|---|---|---|---|
+| flux2-4b (15 GB) | CUDA | 512×512 | 4 | ~30 s warm (~7 s gen) | VBAR stream |
+| flux2-4b | CUDA | 1024×768 | 4 | ~60 s warm (~22 s gen) | VBAR stream |
+| flux2-4b | CPU | 512×512 | 4 | ~220 s | stream |
+| flux2-4b | CPU | 1024×768 | 4 | ~325 s | stream |
+| z-image-turbo (20 GB) | CPU | 512×512 | 8 | ~315 s | stream |
+
+Notes: the A1000 is **Ampere** (sm_86, bf16 tensor cores), so CUDA compute stays bf16 -- no
+`manual_cast` (unlike the Turing box above, which runs fp16); with 32 GB RAM both models fit the
+page cache, so VBAR streaming is RAM-fed rather than disk-bound. **CPU** per-step *climbs within a
+run* as the laptop thermal-throttles the i7-12800H from ~3.6 → ~1.05 GHz over ~5 min (flux2
+1024×768: 61 → 90 s/step). Forcing `comfy` CPU mode (fp32 full-load) is slower at high res and
+OOM-thrashes z-image (fp32 working set ~48 GB > 32 GB RAM), so the auto-picker correctly stays on
+`stream`.
 
 ## Notes
 
