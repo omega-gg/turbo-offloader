@@ -15,20 +15,20 @@
 #==================================================================================================
 #
 #  offloader backend (v2) -- the GPL "custom block" the (LGPL) runner discovers as
-# backend/<mode>/ (here backend/offloader/ for offload="offloader") and drives through this
-# seam only:
+#  backend/<mode>/ (here backend/offloader/ for offload="offloader") and drives through this
+#  seam only:
 #
-#      pre_torch_init()                       - one-time setup; MUST run before `import torch`
-# available()                            - True once the vendored offloader imports (any device)
-# supports(engine)                       - True if this backend can place `engine` load_pipe(model,
-# dtype, engine, ...)   - build a fully-placed diffusers pipeline prepare/reclaim/release(pipe)
-# - per-generation / teardown hooks
+#      pre_torch_init()                     - one-time setup; MUST run before `import torch`
+#      available()                          - True once the vendored offloader imports (any device)
+#      supports(engine)                     - True if this backend can place `engine`
+#      load_pipe(model, dtype, ...)         - build a fully-placed diffusers pipeline
+#      prepare/reclaim/release(pipe)        - per-generation / teardown hooks
 #
 #  v2 delegates all offloading to a byte-for-byte vendored ComfyUI snapshot (offloader/comfy/) via
 #  the thin bridge in offloader/adapter.py, so the SAME device-agnostic path serves CPU/CUDA/MPS.
 #  comfy-aimdo's CUDA-only VBAR is an optional accelerator (aimdo_enabled) that runs ComfyUI's
-# ModelPatcherDynamic (partial GPU residency) instead of the plain patcher -- streaming weights
-# from host RAM, or disk->VRAM for a component too big for RAM.
+#  ModelPatcherDynamic (partial GPU residency) instead of the plain patcher -- streaming weights
+#  from host RAM, or disk->VRAM for a component too big for RAM.
 #
 # =================================================================================================
 
@@ -41,27 +41,13 @@ import traceback
 _available = False
 
 
-# Per-engine diffusers classes: (PipelineCls, TransformerCls). The transformer class is used to
-# meta-load an oversized transformer for the disk-stream path. Add engines as scripts migrate.
-def _classes(engine):
-    if engine == "flux2":
-        from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel
-        return Flux2KleinPipeline, Flux2Transformer2DModel
-
-    if engine == "z-image":
-        from diffusers import ZImagePipeline, ZImageTransformer2DModel
-        return ZImagePipeline, ZImageTransformer2DModel
-
-    if engine == "qwen-image-edit":
-        from diffusers import QwenImageEditPlusPipeline, QwenImageTransformer2DModel
-        return QwenImageEditPlusPipeline, QwenImageTransformer2DModel
-
-    raise ValueError("offloader backend: unsupported engine %r" % (engine,))
-
-
 def supports(engine):
-    """True if this backend can place `engine`."""
-    return engine in ("flux2", "z-image", "qwen-image-edit")
+    """Model-agnostic: the offloader places any diffusers pipeline the runner wires with
+    PIPELINE/TRANSFORMER -- its mechanics key off module structure (comfy_ize by leaf type,
+    rope/attention by detected symbol, file-sliced streaming), never a model name -- so it claims
+    every engine. Offload eligibility (which engines are wired for it) is a turboCLI-side decision,
+    gated on that declaration; the backend keeps no model list."""
+    return True
 
 
 _vbar_ready = False
@@ -130,14 +116,16 @@ def _direct_load(module, component_dir, device):
         return False
 
 
-def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
+def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora_files=None):
     """Build a diffusers pipeline whose big models (transformer, text encoder) are offloaded via
     ComfyUI's ModelPatcher and streamed from host RAM to the compute device per forward -- exactly
     how ComfyUI offloads a UNet. Device-agnostic: `device` selects CPU / CUDA / MPS via the
     adapter. On CUDA with comfy-aimdo present it uses ComfyUI's ModelPatcherDynamic (partial GPU
     residency sized from live free VRAM), streaming each component from host RAM or, when it's too
     big for RAM, from
-    disk; otherwise the portable native cast path. lora_files: [(path, strength)]."""
+    disk; otherwise the portable native cast path. pipeline_cls / transformer_cls are the diffusers
+    classes supplied by the runner from its engine declaration (the transformer class meta-loads an
+    oversized transformer for the disk-stream path). lora_files: [(path, strength)]."""
     import torch  # noqa: F401
     from . import adapter
 
@@ -180,7 +168,9 @@ def load_pipe(model, dtype, engine, device="cuda:0", lora_files=None):
     # comfy_ize / load_streamed re-class each leaf into this namespace.
     operations = adapter.pick_operations(dtype, manual_cast, load_device)
 
-    PipelineCls, Transformer = _classes(engine)
+    # Pipeline + transformer classes come from the runner (turboCLI engine/<name>.py PIPELINE /
+    # TRANSFORMER); the transformer meta-loads an oversized transformer for the disk-stream path.
+    PipelineCls, Transformer = pipeline_cls, transformer_cls
 
     # VBAR: CUDA + comfy-aimdo (initialised in pre_torch_init) -> flip aimdo_enabled so ComfyUI's
     # ModelPatcherDynamic engages (the "dynamic VRAM loading" path). Must run before loading so the
