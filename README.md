@@ -2,15 +2,15 @@
 
 turbo-offloader is a [turboCLI](https://omega.gg/turboCLI) high performance offloader based on [ComfyUI](https://github.com/comfy-org/comfyui).
 It improves generate times substantially through optimal memory allocations when the model does not
-fit into VRAM, even on a very low VRAM GPU. It's particularly useful for CUDA GPU(s) but also works
-on CPU and Apple MPS.
+fit into RAN / VRAM, even on a low end GPU. It's particularly efficient for CUDA GPU(s) but also
+works on CPU and Apple MPS.
 
 ## ComfyUI
 
-turbo-offloader's offloader is a port of ComfyUI's memory-management / model-patcher / ops
-subsystem (under `offloader/comfy`), driven through the thin adapter in `offloader/adapter.py`. The
-port is pinned to exact upstream commits. Bump these together with the vendored files and re-apply
-the short edit list in [`offloader/comfy/resync.md`](offloader/comfy/resync.md):
+turbo-offloader ports ComfyUI's memory-management / model-patcher / ops subsystem
+(under `offloader/comfy`), driven through the thin adapter in `offloader/adapter.py`. The port is
+pinned to exact upstream commits. Bump these together with the vendored files and re-apply the
+short edit list in [`offloader/comfy/resync.md`](offloader/comfy/resync.md):
 
 | dependency    | commit                                     | version                 |
 |---------------|--------------------------------------------|-------------------------|

@@ -13,7 +13,7 @@ disk→VRAM via comfy-aimdo file-slices for a model larger than RAM.
 
 ```
 offloader/
-  __init__.py   backend seam the runner drives (unchanged signatures)
+  __init__.py   backend seam the runner drives (pre_torch_init/available/supports/load_pipe/...)
   adapter.py    the thin middleman -- the only real logic in the package
   comfy/        byte-for-byte ComfyUI offloading snapshot (see comfy/resync.md)
 ```
@@ -33,8 +33,8 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 |---|---|
 | `pre_torch_init()` | init comfy-aimdo's global CUDA hooks **before torch import** (its allocator can't hook afterwards); imports nothing that pulls torch. Optional -- absent/failed → native path. |
 | `available()` | True once the vendored offloader imports (any device) |
-| `supports(engine)` | flux2 / z-image / qwen-image-edit |
-| `load_pipe(model, dtype, engine, device, lora_files)` | build a fully-placed diffusers pipeline (below) |
+| `supports(engine)` | `True` -- **model-agnostic**, claims every engine (its mechanics key off module structure, not a model name). Which engines are offload-wired is a turboCLI-side call, gated on the engine declaring `PIPELINE`/`TRANSFORMER`. |
+| `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); the runner passes the diffusers pipeline + transformer classes it resolved from the engine's `PIPELINE`/`TRANSFORMER` declaration |
 | `prepare(pipe)` | `load_models_gpu(patchers)` -- place managed models on the compute device |
 | `reclaim(pipe)` | `free_memory` + `soft_empty_cache` between generations |
 | `release(pipe)` | `detach` each patcher |
@@ -164,6 +164,12 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   fused `F.rms_norm` (≈ 3.5× the eager `mul`/`rsqrt` diffusers/transformers use).
 
 ## Engines
+
+The offloader is **model-agnostic**: it places whatever diffusers pipeline the runner hands it,
+keying its mechanics off module structure (leaf type, detected rope/attention symbols, file-sliced
+streaming), never a model name. The engines below are the ones **turboCLI** currently wires -- each
+declaring its `PIPELINE`/`TRANSFORMER` classes -- so adding one is a turboCLI-side edit with no
+change here.
 
 - **flux2** (`Flux2KleinPipeline`) — text-to-image and image-input (edit); the pipeline accepts
   `image=`, so the seam is unchanged.
