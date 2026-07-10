@@ -33,8 +33,8 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 |---|---|
 | `pre_torch_init()` | init comfy-aimdo's global CUDA hooks **before torch import** (its allocator can't hook afterwards); imports nothing that pulls torch. Optional -- absent/failed → native path. |
 | `available()` | True once the vendored offloader imports (any device) |
-| `supports(engine)` | `True` -- **model-agnostic**, claims every engine (its mechanics key off module structure, not a model name). Which engines are offload-wired is a turboCLI-side call, gated on the engine declaring `PIPELINE`/`TRANSFORMER`. |
-| `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); the runner passes the diffusers pipeline + transformer classes it resolved from the engine's `PIPELINE`/`TRANSFORMER` declaration |
+| `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
+| `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
 | `prepare(pipe)` | `load_models_gpu(patchers)` -- place managed models on the compute device |
 | `reclaim(pipe)` | `free_memory` + `soft_empty_cache` between generations |
 | `release(pipe)` | `detach` each patcher |
@@ -73,7 +73,7 @@ applied to CPU:
   per step (casts every forward instead of once).
 
 The default auto-selects via `adapter.cpu_fits_full_load()` — the fp32 model (~2× the on-disk bf16
-size) against ComfyUI's own `get_total_memory(cpu)`, 85% headroom. `OFFLOADER_CPU_MODE=comfy|stream`
+size) against ComfyUI's `get_total_memory(cpu)`, 85% headroom. `OFFLOADER_CPU_MODE=comfy|stream`
 forces one. The dtype is ComfyUI's own call: flip `args.bf16_unet` for the chosen mode and read
 `mm.unet_dtype()` (bf16 or fp32); `manual_cast_dtype` (`mm.unet_manual_cast`) then picks fp32
 compute on CPU. The VAE runs fp32 either way (ComfyUI's `vae_dtype(cpu)`); `stream` upcasts its
@@ -194,7 +194,7 @@ change here.
   (a full direct load would OOM), CPU already loads there. Model- agnostic (globs component
   shards); LoRA-safe (patches still merge on top via `patch_weight_to_ device`, verified
   bit-identical); gated off `manual_cast`; any mismatch falls back to normal placement.
-  `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after — though on MPS the Qwen3
+  `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after — on MPS the Qwen3
   text encoder now lands on CPU (next note), so only the transformer takes this direct-load path.
 - **Text encoder on CPU on MPS (ComfyUI's `text_encoder_device()`).** ComfyUI runs the text encoder
   on `text_encoder_device()` — CPU under `vram_state` SHARED (Apple Silicon), the compute device
