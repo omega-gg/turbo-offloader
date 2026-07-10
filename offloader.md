@@ -181,6 +181,29 @@ change here.
   in RAM; the text encoder is loaded by `from_pretrained` then swapped for slices, a transient ~1×
   peak.)
 
+## Benchmarks
+
+Reference wall-clock (load + generate, seed-fixed, `offloader` mode) on **one box** -- yours will
+differ with disk/RAM/VRAM and thermal state. Both models exceed the 8 GB VRAM *and* 16 GB RAM at
+fp32, so CUDA runs VBAR partial residency and CPU auto-selects `stream` (bf16 mmap + fp32
+`manual_cast`); neither fits a plain full load here.
+
+**Machine:** Intel i7-4770K (4c/8t, 3.5 GHz) · 16 GB RAM · RTX 2070 SUPER (8 GB, Turing sm_75) ·
+Windows 10 · torch 2.12 + cu130.
+
+| Engine (on-disk bf16) | Device | Res | Steps | Wall-clock | Path |
+|---|---|---|---|---|---|
+| flux2-4b (15 GB) | CUDA | 1024×768 | 4 | ~140 s warm (~65 s gen) | VBAR stream |
+| z-image-turbo (20 GB) | CUDA | 1024×768 | 8 | ~197 s warm (~104 s gen) | VBAR stream |
+| flux2-4b | CPU | 512×512 | 4 | ~576 s | stream |
+| flux2-4b | CPU | 256×256 | 4 | ~400 s | stream |
+| z-image-turbo | CPU | 256×256 | 8 | ~669 s | stream |
+
+Notes: **CUDA** is streaming-bound on an 8 GB card (the GPU idles between steps waiting on the
+VBAR disk/RAM→VRAM fault); the first (cold) generation is ~30–50 % slower than warm as the DiT
+streams cold from disk. **CPU** is fp32 `manual_cast` compute (hence minutes/image); it runs at all
+only because `stream` keeps weights mmap-backed — a plain fp32 full load OOMs both models on 16 GB.
+
 ## Notes
 
 - **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` reads the transformer straight
