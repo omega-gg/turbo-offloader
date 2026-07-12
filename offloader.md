@@ -291,9 +291,12 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   `load_torch_file`, applies an optional key `convert` (the diffusers single-file remap for the
   transformer -- renames + a fused-qkv `torch.chunk` that returns views, so the mmap slices survive;
   a `model.`-prefix strip for the Qwen3 text encoder), then rebinds by name (`_assign_sd`). The VAE
-  + scheduler + tokenizer come straight from the scaffold, and the shared `_finalize_pipe` tail
-  (VAE placement, execution device, encode bridge/cache) is identical to `load_pipe`. Verified on
-  the A1000 (z-image-turbo 1024×768, VBAR): 0 unmatched weights, seed-valid image.
+  + scheduler + tokenizer come straight from the scaffold. It shares both ends with `load_pipe`: the
+  `_prepare_offload` setup (device / CPU comfy-vs-stream mode / dtype / manual_cast / operations /
+  VBAR / builder) and the `_finalize_pipe` tail (VAE placement, execution device, encode
+  bridge/cache) — only the weight source differs, plus the CPU full-load fit is sized from the
+  single files rather than `cpu_fits_full_load`'s component-dir shards. Verified on the A1000
+  (z-image-turbo 1024×768, VBAR): 0 unmatched weights, seed-valid image.
 - **Pinning matches ComfyUI (measured).** comfy-aimdo pins the streamed working set lazily per
   module up to `MAX_PINNED_MEMORY` (40% RAM on Windows), degrading via `_steal_pin` past that; the
   weight VBAR survives `reset_cast_buffers` between gens, so there is **no per-gen re-fault**.

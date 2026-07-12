@@ -116,6 +116,59 @@ def _direct_load(module, component_dir, device):
         return False
 
 
+def _prepare_offload(device, dtype, fits_full_load):
+    """Shared offloader setup for load_pipe / load_pipe_single_file. Resolves the compute device,
+    then -- exactly as ComfyUI decides -- the CPU comfy/stream mode + storage dtype, the manual_cast
+    compute dtype, the comfy op namespace, whether comfy-aimdo VBAR engages, and the patcher builder.
+    `fits_full_load` is a thunk giving the caller's 'does the fp32 model fit RAM' verdict (consulted
+    only on CPU with no OFFLOADER_CPU_MODE override). Returns
+    (load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build)."""
+    from . import adapter
+
+    import comfy.model_management as mm
+
+    load_device = adapter.set_device(device)
+
+    # CPU placement mode. ComfyUI's default CPU path is fp32 storage, fully materialised -- faster
+    # when the model fits RAM (cast once at load, then plain matmuls), an OOM when it doesn't; the
+    # stream fallback is bf16 storage (--bf16-unet), mmap-kept (never materialised, RAM bounded),
+    # fp32 compute cast per forward. Auto-picks by fit -- ComfyUI's full-load-when-it-fits, applied
+    # to CPU; OFFLOADER_CPU_MODE=comfy|stream forces one.
+    cpu_stream = False
+    if mm.is_device_cpu(load_device):
+        mode = os.environ.get("OFFLOADER_CPU_MODE")
+        if mode not in ("comfy", "stream"):
+            mode = "comfy" if fits_full_load() else "stream"
+        cpu_stream = mode == "stream"
+        # Drive the storage dtype through ComfyUI's own unet_dtype(): --bf16-unet (bf16) when
+        # streaming, else its CPU default (fp32). manual_cast_dtype (below) then picks fp32 compute.
+        from comfy.cli_args import args as _args
+        _args.bf16_unet = cpu_stream
+        dtype = mm.unet_dtype()
+        print("offloader: CPU mode=%s (storage %s)" % (mode, dtype), flush=True)
+
+    # ComfyUI's storage-vs-compute dtype split: on a card without bf16 tensor cores (e.g. Turing) a
+    # bf16 checkpoint computes in fp16 (manual_cast) -- weights stay bf16 (mmap, no RAM blow-up),
+    # every matmul runs on fp16 tensor cores (~5x on such cards). None on Ampere+ (compute in bf16).
+    manual_cast = adapter.manual_cast_dtype(dtype, load_device)
+    if manual_cast is not None:
+        print("offloader: manual_cast compute dtype %s (storage %s)"
+              % (manual_cast, dtype), flush=True)
+
+    # ComfyUI's own op-namespace pick (pick_operations): comfy.ops.manual_cast when compute != weight
+    # (every leaf casts, incl. resident ones), else disable_weight_init (plain forward unless
+    # offloaded). comfy_ize / the streamers re-class each leaf into this namespace.
+    operations = adapter.pick_operations(dtype, manual_cast, load_device)
+
+    # VBAR: CUDA + comfy-aimdo (initialised in pre_torch_init) -> flip aimdo_enabled so ComfyUI's
+    # ModelPatcherDynamic engages (partial GPU residency sized from live free VRAM, streaming the
+    # rest per forward). Off CUDA / without comfy-aimdo -> plain ModelPatcher native cast path.
+    use_vbar = _vbar_ready and adapter.enable_vbar(device)
+    build = adapter.build_dynamic_patcher if use_vbar else adapter.build_patcher
+
+    return load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build
+
+
 def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora_files=None):
     """Build a diffusers pipeline whose big models (transformer, text encoder) are offloaded via
     ComfyUI's ModelPatcher and streamed from host RAM to the compute device per forward -- exactly
@@ -129,54 +182,14 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
     import torch  # noqa: F401
     from . import adapter
 
-    load_device = adapter.set_device(device)
-
     import comfy.model_management as mm
 
-    # CPU placement mode. ComfyUI's default CPU path is fp32 storage, fully materialised -- faster
-    # when the model fits RAM (weights are cast to fp32 once at load, then every forward is a plain
-    # matmul). For a model bigger than RAM that OOMs, so we fall back to a streamed path: bf16
-    # storage (ComfyUI --bf16-unet), mmap-kept (never materialised, RAM bounded), fp32 compute cast
-    # per forward via manual_cast (slower per step). The default auto-picks by fit -- ComfyUI's own
-    # full-load-when-it-fits call, which ComfyUI applies on GPU (free VRAM) but leaves as
-    # always-full-load on CPU. OFFLOADER_CPU_MODE=comfy|stream forces one.
-    cpu_stream = False
-    if mm.is_device_cpu(load_device):
-        mode = os.environ.get("OFFLOADER_CPU_MODE")
-        if mode not in ("comfy", "stream"):
-            mode = "comfy" if adapter.cpu_fits_full_load(model) else "stream"
-        cpu_stream = mode == "stream"
-        # Drive the storage dtype through ComfyUI's own unet_dtype(): --bf16-unet (bf16) when
-        # streaming, else its CPU default (fp32). manual_cast_dtype (below) then picks fp32 compute.
-        from comfy.cli_args import args as _args
-        _args.bf16_unet = cpu_stream
-        dtype = mm.unet_dtype()
-        print("offloader: CPU mode=%s (storage %s)" % (mode, dtype), flush=True)
-
-    # ComfyUI's storage-vs-compute dtype split: on a card without bf16 tensor cores (e.g. Turing) a
-    # bf16 checkpoint computes in fp16 (manual_cast) -- weights stay bf16 (mmap, no RAM blow-up),
-    # every matmul runs on fp16 tensor cores (~5x on such cards). None on Ampere+ (compute in
-    # bf16).
-    manual_cast = adapter.manual_cast_dtype(dtype, load_device)
-    if manual_cast is not None:
-        print("offloader: manual_cast compute dtype %s (storage %s)"
-              % (manual_cast, dtype), flush=True)
-
-    # ComfyUI's own op-namespace pick (pick_operations): comfy.ops.manual_cast when compute !=
-    # weight (every leaf casts, incl. resident ones -- how ComfyUI runs a bf16 model in fp16 on a
-    # card without bf16 tensor cores), else disable_weight_init (plain forward unless offloaded).
-    # comfy_ize / load_streamed re-class each leaf into this namespace.
-    operations = adapter.pick_operations(dtype, manual_cast, load_device)
+    load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build = _prepare_offload(
+        device, dtype, lambda: adapter.cpu_fits_full_load(model))
 
     # Pipeline + transformer classes come from the runner (turboCLI engine/<name>.py PIPELINE /
     # TRANSFORMER); the transformer meta-loads an oversized transformer for the disk-stream path.
     PipelineCls, Transformer = pipeline_cls, transformer_cls
-
-    # VBAR: CUDA + comfy-aimdo (initialised in pre_torch_init) -> flip aimdo_enabled so ComfyUI's
-    # ModelPatcherDynamic engages (the "dynamic VRAM loading" path). Must run before loading so the
-    # vendored device-selection / lazy-load branches see the flag. Off CUDA (or without
-    # comfy-aimdo) this is False and the plain-ModelPatcher native cast path runs instead.
-    use_vbar = _vbar_ready and adapter.enable_vbar(device)
 
     # Direct-to-device load, MPS only. On MPS (unified memory) we read the big models straight into
     # device memory (below) instead of diffusers' CPU load + load_models_gpu's per-leaf CPU->device
@@ -191,14 +204,6 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
     direct_load = mm.is_device_mps(load_device) and manual_cast is None
 
     patchers = []
-
-    # Big models stream to VRAM per-forward through ComfyUI's ModelPatcherDynamic (comfy-aimdo
-    # VBAR): partial GPU residency sized from live free VRAM, so a model larger than VRAM runs
-    # -- exactly ComfyUI's dynamic offload. The static ModelPatcher lowvram path can't: on a small
-    # card its per-layer peak OOMs a big model (z-image's 12GB DiT on 4GB), which is the whole
-    # reason comfy-aimdo's VBAR exists. Off CUDA / without comfy-aimdo -> plain ModelPatcher native
-    # cast path.
-    build = adapter.build_dynamic_patcher if use_vbar else adapter.build_patcher
 
     # Transformer: meta-loaded + mmap file-sliced (load_streamed) so its weights never materialise.
     # On CUDA the slices are comfy_aimdo-pinned host buffers streamed to VRAM per-forward (VBAR); on
@@ -380,32 +385,18 @@ def load_pipe_single_file(scaffold, files, dtype, pipeline_cls, transformer_cls,
         convert_z_image_transformer_checkpoint_to_diffusers as convert_transformer)
     from transformers import AutoConfig, AutoTokenizer, Qwen3Model
 
-    load_device = adapter.set_device(device)
-
     import comfy.model_management as mm
 
-    # CPU full-load-vs-stream pick + storage dtype (as load_pipe, but sized from the single files).
-    cpu_stream = False
-    if mm.is_device_cpu(load_device):
-        mode = os.environ.get("OFFLOADER_CPU_MODE")
-        if mode not in ("comfy", "stream"):
-            big = [files["transformer"], files["text_encoder"]]
-            fits = 2 * sum(os.path.getsize(f) for f in big) <= mm.get_total_memory(load_device) * 0.85
-            mode = "comfy" if fits else "stream"
-        cpu_stream = mode == "stream"
-        from comfy.cli_args import args as _args
-        _args.bf16_unet = cpu_stream
-        dtype = mm.unet_dtype()
-        print("offloader: CPU mode=%s (storage %s)" % (mode, dtype), flush=True)
+    # Same offloader setup as load_pipe, but the CPU fit is sized from the single files (no component
+    # dir for cpu_fits_full_load to glob): fp32 (~2x on-disk bf16) of the two big models vs RAM.
+    def _fits_full_load():
+        big = (files["transformer"], files["text_encoder"])
+        cpu = torch.device("cpu")
+        return 2 * sum(os.path.getsize(f) for f in big) <= mm.get_total_memory(cpu) * 0.85
 
-    manual_cast = adapter.manual_cast_dtype(dtype, load_device)
-    if manual_cast is not None:
-        print("offloader: manual_cast compute dtype %s (storage %s)"
-              % (manual_cast, dtype), flush=True)
-    operations = adapter.pick_operations(dtype, manual_cast, load_device)
+    load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build = _prepare_offload(
+        device, dtype, _fits_full_load)
 
-    use_vbar = _vbar_ready and adapter.enable_vbar(device)
-    build = adapter.build_dynamic_patcher if use_vbar else adapter.build_patcher
     stream = use_vbar or cpu_stream
 
     patchers = []
