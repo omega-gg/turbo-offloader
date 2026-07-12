@@ -118,10 +118,10 @@ def _direct_load(module, component_dir, device):
 
 def _prepare_offload(device, dtype, fits_full_load):
     """Shared offloader setup for load_pipe / load_pipe_single_file. Resolves the compute device,
-    then -- exactly as ComfyUI decides -- the CPU comfy/stream mode + storage dtype, the manual_cast
-    compute dtype, the comfy op namespace, whether comfy-aimdo VBAR engages, and the patcher builder.
-    `fits_full_load` is a thunk giving the caller's 'does the fp32 model fit RAM' verdict (consulted
-    only on CPU with no OFFLOADER_CPU_MODE override). Returns
+    then -- exactly as ComfyUI decides -- the CPU comfy/stream mode + storage dtype, the
+    manual_cast compute dtype, the comfy op namespace, whether comfy-aimdo VBAR engages, and the
+    patcher builder. `fits_full_load` is a thunk giving the caller's 'does the fp32 model fit RAM'
+    verdict (consulted only on CPU with no OFFLOADER_CPU_MODE override). Returns
     (load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build)."""
     from . import adapter
 
@@ -141,7 +141,7 @@ def _prepare_offload(device, dtype, fits_full_load):
             mode = "comfy" if fits_full_load() else "stream"
         cpu_stream = mode == "stream"
         # Drive the storage dtype through ComfyUI's own unet_dtype(): --bf16-unet (bf16) when
-        # streaming, else its CPU default (fp32). manual_cast_dtype (below) then picks fp32 compute.
+        # streaming, else its CPU default (fp32). manual_cast_dtype (below) picks fp32 compute.
         from comfy.cli_args import args as _args
         _args.bf16_unet = cpu_stream
         dtype = mm.unet_dtype()
@@ -149,15 +149,15 @@ def _prepare_offload(device, dtype, fits_full_load):
 
     # ComfyUI's storage-vs-compute dtype split: on a card without bf16 tensor cores (e.g. Turing) a
     # bf16 checkpoint computes in fp16 (manual_cast) -- weights stay bf16 (mmap, no RAM blow-up),
-    # every matmul runs on fp16 tensor cores (~5x on such cards). None on Ampere+ (compute in bf16).
+    # every matmul runs on fp16 tensor cores (~5x there). None on Ampere+ (compute in bf16).
     manual_cast = adapter.manual_cast_dtype(dtype, load_device)
     if manual_cast is not None:
         print("offloader: manual_cast compute dtype %s (storage %s)"
               % (manual_cast, dtype), flush=True)
 
-    # ComfyUI's own op-namespace pick (pick_operations): comfy.ops.manual_cast when compute != weight
-    # (every leaf casts, incl. resident ones), else disable_weight_init (plain forward unless
-    # offloaded). comfy_ize / the streamers re-class each leaf into this namespace.
+    # ComfyUI's own op-namespace pick (pick_operations): comfy.ops.manual_cast when compute !=
+    # weight (every leaf casts, incl. resident ones), else disable_weight_init (plain forward
+    # unless offloaded). comfy_ize / the streamers re-class each leaf into this namespace.
     operations = adapter.pick_operations(dtype, manual_cast, load_device)
 
     # VBAR: CUDA + comfy-aimdo (initialised in pre_torch_init) -> flip aimdo_enabled so ComfyUI's
@@ -287,9 +287,9 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
 def _finalize_pipe(p, patchers, load_device, cpu_stream):
     """Shared tail for the offloader pipes (dir-based load_pipe and single-file
     load_pipe_single_file). Places the small VAE, records the patchers, pins the execution device,
-    wires the ComfyUI-faithful encode bridge, and installs the prompt-encode cache. The heavy models
-    (transformer, text encoder) are already comfy-ized / patched by the caller; p._offloader_te_device
-    tells us where the encoder lives."""
+    wires the ComfyUI-faithful encode bridge, and installs the prompt-encode cache. The heavy
+    models (transformer, text encoder) are already comfy-ized / patched by the caller;
+    p._offloader_te_device tells us where the encoder lives."""
     import torch
     from . import adapter
 
@@ -302,9 +302,9 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
         # comfy mode the pipeline is already fp32, and on GPU we keep the pipeline dtype.
         if cpu_stream:
             p.vae.to(device=load_device, dtype=torch.float32)
-            # diffusers' flux2 pipeline hands the VAE bf16 latents; ComfyUI upcasts the latent to the
-            # VAE's own dtype before decode (VAE.decode: samples.to(self.vae_dtype)). Mirror that so
-            # the fp32 VAE never sees bf16 input (else conv raises a dtype mismatch).
+            # diffusers' flux2 pipeline hands the VAE bf16 latents; ComfyUI upcasts the latent to
+            # the VAE's own dtype before decode (VAE.decode: samples.to(self.vae_dtype)). Mirror
+            # that so the fp32 VAE never sees bf16 input (else conv raises a dtype mismatch).
             _vae = p.vae
 
             def _cast_in(fn):
@@ -326,8 +326,8 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
     # load_device, e.g. MPS -> CPU) would the property resolve to that other device and build the
     # timesteps/latents there, mismatching the compute-device transformer -- so in that case pin it
     # to the compute device via a per-instance subclass (ComfyUI runs the sampler on the compute
-    # device regardless of where the text encoder lives). The encode still runs on te_dev because the
-    # bridge below overrides encode_prompt's device argument explicitly.
+    # device regardless of where the text encoder lives). The encode still runs on te_dev because
+    # the bridge below overrides encode_prompt's device argument explicitly.
     te_off_device = getattr(p, "_offloader_te_device", load_device) != load_device
     if te_off_device:
         _cls = type(p)
@@ -344,7 +344,7 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
 
     # ComfyUI-faithful encode placement: when the TE lives off the compute device (CPU on MPS),
     # diffusers' __call__ would still pass device=_execution_device to encode_prompt and stream the
-    # TE to MPS per leaf. Run the encode on the TE's own device instead (native forward, no stream),
+    # TE to MPS per leaf. Run the encode on the TE's device instead (native forward, no stream),
     # then move only the (small) embeddings to the compute device -- ComfyUI's "encode on CPU,
     # conditioning to GPU". Wrapped BEFORE install_encode_cache so the cache stores the CPU result.
     te_dev = getattr(p, "_offloader_te_device", load_device)
@@ -355,7 +355,8 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
             kwargs["device"] = te_dev
             out = _real_encode(*args, **kwargs)
             if isinstance(out, (list, tuple)):
-                return type(out)(o.to(load_device) if isinstance(o, torch.Tensor) else o for o in out)
+                return type(out)(
+                    o.to(load_device) if isinstance(o, torch.Tensor) else o for o in out)
             return out.to(load_device) if isinstance(out, torch.Tensor) else out
 
         p.encode_prompt = _encode_on_te
@@ -371,11 +372,11 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
 def load_pipe_single_file(scaffold, files, dtype, pipeline_cls, transformer_cls,
                           device="cuda:0", lora_files=None):
     """load_pipe's ComfyUI-reuse sibling: same disk-stream offload, but the big models are meta-
-    loaded straight from ComfyUI's split single files (files[role]) rather than a diffusers component
-    dir. The tiny configs/tokenizer/scheduler come from `scaffold` (the engine's turbo-model dir).
-    Only the weight source differs -- transformer via the diffusers single-file remap, text encoder
-    with the ComfyUI `model.` prefix stripped -- everything after (patchers, placement, encode cache)
-    is the shared _finalize_pipe tail."""
+    loaded straight from ComfyUI's split single files (files[role]) rather than a diffusers
+    component dir. The tiny configs/tokenizer/scheduler come from `scaffold` (the engine's turbo-
+    model dir). Only the weight source differs -- transformer via the diffusers single-file remap,
+    text encoder with the ComfyUI `model.` prefix stripped -- everything after (patchers,
+    placement, encode cache) is the shared _finalize_pipe tail."""
     import os
     import torch  # noqa: F401
     from . import adapter
@@ -387,7 +388,7 @@ def load_pipe_single_file(scaffold, files, dtype, pipeline_cls, transformer_cls,
 
     import comfy.model_management as mm
 
-    # Same offloader setup as load_pipe, but the CPU fit is sized from the single files (no component
+    # Same offloader setup as load_pipe; the CPU fit is sized from the single files (no component
     # dir for cpu_fits_full_load to glob): fp32 (~2x on-disk bf16) of the two big models vs RAM.
     def _fits_full_load():
         big = (files["transformer"], files["text_encoder"])
@@ -433,8 +434,8 @@ def load_pipe_single_file(scaffold, files, dtype, pipeline_cls, transformer_cls,
         print("offloader: applied %d LoRA patches" % n, flush=True)
     patchers.append(transformer_patcher)
 
-    # Text encoder (Qwen3): ComfyUI prefixes every key with `model.`; strip it so the bare Qwen3Model
-    # binds. Streamed like the transformer, else materialised.
+    # Text encoder (Qwen3): ComfyUI prefixes every key with `model.`; strip it so the bare
+    # Qwen3Model binds. Streamed like the transformer, else materialised.
     def _strip_model(sd):
         return {(k[len("model."):] if k.startswith("model.") else k): v for k, v in sd.items()}
 
