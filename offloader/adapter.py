@@ -473,6 +473,26 @@ def load_streamed(model_cls, model_dir, dtype, operations=None):
     return model, missing
 
 
+def stream_single_file(build_meta, weight_file, operations=None, convert=None):
+    """load_streamed's single-file sibling (ComfyUI-reuse engines): meta-load the module via
+    build_meta() (accelerate init_empty_weights, so no weight RAM), comfy-ize it, mmap the ONE
+    ComfyUI safetensors via load_torch_file, optionally run `convert` on the state dict -- the
+    diffusers single-file key remap (renames + a fused-qkv chunk that returns views, so mmap file-
+    slices survive) -- then rebind by name. Returns (model, missing)."""
+    import comfy.utils as cu
+
+    model = build_meta()
+
+    comfy_ize(model, operations)
+
+    sd = cu.load_torch_file(weight_file, device=torch.device("cpu"))
+
+    if convert is not None:
+        sd = convert(sd)
+
+    return model, _assign_sd(model, sd)
+
+
 _sdpa_patched = False
 
 

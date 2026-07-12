@@ -276,6 +276,18 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
         p._offloader_encoder = encoder_patcher
         p._offloader_te_device = te_dev
 
+    return _finalize_pipe(p, patchers, load_device, cpu_stream)
+
+
+def _finalize_pipe(p, patchers, load_device, cpu_stream):
+    """Shared tail for the offloader pipes (dir-based load_pipe and single-file
+    load_pipe_single_file). Places the small VAE, records the patchers, pins the execution device,
+    wires the ComfyUI-faithful encode bridge, and installs the prompt-encode cache. The heavy models
+    (transformer, text encoder) are already comfy-ized / patched by the caller; p._offloader_te_device
+    tells us where the encoder lives."""
+    import torch
+    from . import adapter
+
     # Small resident modules (VAE) go straight to the compute device; the offloader handles the
     # heavy ones. VAE tiling/slicing is left to the caller.
     if getattr(p, "vae", None) is not None:
@@ -349,6 +361,136 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
     adapter.install_encode_cache(p)
 
     return p
+
+
+def load_pipe_single_file(scaffold, files, dtype, pipeline_cls, transformer_cls,
+                          device="cuda:0", lora_files=None):
+    """load_pipe's ComfyUI-reuse sibling: same disk-stream offload, but the big models are meta-
+    loaded straight from ComfyUI's split single files (files[role]) rather than a diffusers component
+    dir. The tiny configs/tokenizer/scheduler come from `scaffold` (the engine's turbo-model dir).
+    Only the weight source differs -- transformer via the diffusers single-file remap, text encoder
+    with the ComfyUI `model.` prefix stripped -- everything after (patchers, placement, encode cache)
+    is the shared _finalize_pipe tail."""
+    import os
+    import torch  # noqa: F401
+    from . import adapter
+    from accelerate import init_empty_weights
+    from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
+    from diffusers.loaders.single_file_utils import (
+        convert_z_image_transformer_checkpoint_to_diffusers as convert_transformer)
+    from transformers import AutoConfig, AutoTokenizer, Qwen3Model
+
+    load_device = adapter.set_device(device)
+
+    import comfy.model_management as mm
+
+    # CPU full-load-vs-stream pick + storage dtype (as load_pipe, but sized from the single files).
+    cpu_stream = False
+    if mm.is_device_cpu(load_device):
+        mode = os.environ.get("OFFLOADER_CPU_MODE")
+        if mode not in ("comfy", "stream"):
+            big = [files["transformer"], files["text_encoder"]]
+            fits = 2 * sum(os.path.getsize(f) for f in big) <= mm.get_total_memory(load_device) * 0.85
+            mode = "comfy" if fits else "stream"
+        cpu_stream = mode == "stream"
+        from comfy.cli_args import args as _args
+        _args.bf16_unet = cpu_stream
+        dtype = mm.unet_dtype()
+        print("offloader: CPU mode=%s (storage %s)" % (mode, dtype), flush=True)
+
+    manual_cast = adapter.manual_cast_dtype(dtype, load_device)
+    if manual_cast is not None:
+        print("offloader: manual_cast compute dtype %s (storage %s)"
+              % (manual_cast, dtype), flush=True)
+    operations = adapter.pick_operations(dtype, manual_cast, load_device)
+
+    use_vbar = _vbar_ready and adapter.enable_vbar(device)
+    build = adapter.build_dynamic_patcher if use_vbar else adapter.build_patcher
+    stream = use_vbar or cpu_stream
+
+    patchers = []
+
+    # Transformer: meta-load + stream from the ComfyUI single file (diffusers rename + qkv-chunk
+    # converter, mmap-preserving), or materialise via from_single_file when not streaming.
+    if stream:
+        def _meta_transformer():
+            cfg = transformer_cls.load_config(os.path.join(scaffold, "transformer"))
+            with init_empty_weights():
+                return transformer_cls.from_config(cfg).to(dtype)
+
+        transformer, missing = adapter.stream_single_file(
+            _meta_transformer, files["transformer"], operations, convert=convert_transformer)
+        if missing:
+            print("offloader: %d transformer weights had no matching module (skipped)"
+                  % len(missing), flush=True)
+    else:
+        transformer = transformer_cls.from_single_file(
+            files["transformer"], config=scaffold, subfolder="transformer",
+            torch_dtype=dtype, local_files_only=True)
+        adapter.comfy_ize(transformer, operations)
+
+    adapter.keep_uncastable_resident(transformer, load_device, manual_cast)
+    if stream and use_vbar:
+        adapter.install_prefetch(transformer)
+    adapter.use_comfy_attention(transformer)
+    adapter.use_kitchen_rope(transformer)
+    if manual_cast is not None:
+        adapter.install_manual_cast(transformer, manual_cast, dtype)
+    transformer_patcher = build(transformer)
+    if lora_files:
+        n = adapter.add_lora(transformer_patcher, lora_files)
+        print("offloader: applied %d LoRA patches" % n, flush=True)
+    patchers.append(transformer_patcher)
+
+    # Text encoder (Qwen3): ComfyUI prefixes every key with `model.`; strip it so the bare Qwen3Model
+    # binds. Streamed like the transformer, else materialised.
+    def _strip_model(sd):
+        return {(k[len("model."):] if k.startswith("model.") else k): v for k, v in sd.items()}
+
+    te_config = os.path.join(scaffold, "text_encoder")
+    te_dev = load_device if stream else mm.text_encoder_device()
+    if stream:
+        def _meta_te():
+            cfg = AutoConfig.from_pretrained(te_config)
+            with init_empty_weights():
+                return Qwen3Model(cfg).to(dtype)
+
+        text_encoder, te_missing = adapter.stream_single_file(
+            _meta_te, files["text_encoder"], operations, convert=_strip_model)
+        if te_missing:
+            print("offloader: %d text-encoder weights had no matching param (skipped)"
+                  % len(te_missing), flush=True)
+    else:
+        import comfy.utils as cu
+        text_encoder = Qwen3Model(AutoConfig.from_pretrained(te_config))
+        text_encoder.load_state_dict(
+            _strip_model(cu.load_torch_file(files["text_encoder"], device=torch.device("cpu"))),
+            strict=False)
+        text_encoder = text_encoder.to(dtype)
+        adapter.comfy_ize(text_encoder, operations)
+
+    adapter.use_comfy_attention(text_encoder)
+    adapter.keep_uncastable_resident(text_encoder, te_dev, manual_cast)
+    if manual_cast is not None:
+        adapter.install_manual_cast(text_encoder, manual_cast, dtype)
+    encoder_patcher = (build(text_encoder) if te_dev == load_device
+                       else adapter.build_patcher(text_encoder, load_device=te_dev,
+                                                  offload_device=te_dev))
+    patchers.append(encoder_patcher)
+
+    # VAE (small) + scheduler + tokenizer come straight from the scaffold; assemble the pipeline.
+    vae = AutoencoderKL.from_single_file(files["vae"], config=scaffold, subfolder="vae",
+                                         torch_dtype=dtype, local_files_only=True)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(scaffold, subfolder="scheduler")
+    tokenizer = AutoTokenizer.from_pretrained(os.path.join(scaffold, "tokenizer"))
+
+    p = pipeline_cls(scheduler=scheduler, vae=vae, text_encoder=text_encoder,
+                     tokenizer=tokenizer, transformer=transformer)
+
+    p._offloader_te_device = te_dev
+    p._offloader_encoder = encoder_patcher
+
+    return _finalize_pipe(p, patchers, load_device, cpu_stream)
 
 
 def prepare(pipe):

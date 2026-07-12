@@ -35,6 +35,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `available()` | True once the vendored offloader imports (any device) |
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
+| `load_pipe_single_file(scaffold, files, dtype, pipeline_cls, transformer_cls, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir; scaffold holds the tiny configs/tokenizer/scheduler |
 | `prepare(pipe)` | `load_models_gpu(patchers)` -- place managed models on the compute device |
 | `reclaim(pipe)` | `free_memory` + `soft_empty_cache` between generations |
 | `release(pipe)` | `detach` each patcher |
@@ -173,7 +174,9 @@ change here.
 
 - **flux2** (`Flux2KleinPipeline`) — text-to-image and image-input (edit); the pipeline accepts
   `image=`, so the seam is unchanged.
-- **z-image** (`ZImagePipeline`) — text-to-image, Turbo (few-step).
+- **z-image** (`ZImagePipeline`) — text-to-image, Turbo (few-step). A `comfy-z-image-turbo` variant
+  reuses a ComfyUI install's split single files (transformer + Qwen3 TE + VAE) via
+  `load_pipe_single_file` — same `TYPE`/pipeline, no re-download.
 - **qwen-image-edit** (`QwenImageEditPlusPipeline`) — image-edit; on-cast Lightning 4-step LoRA;
   ~55GB of weights (transformer + Qwen2.5-VL TE). Both components are mmap file-sliced, so their
   weights fault straight from the file — page cache when the working set fits RAM, disk when it
@@ -282,6 +285,15 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB). VBAR also sizes partial GPU
   residency from live free VRAM, so a model larger than VRAM runs on any card. The residual gap vs
   ComfyUI on some engines is diffusers' unfused-qkv compute, not the offloader.
+- **Single-file streaming (ComfyUI-reuse engines).** `load_pipe_single_file` streams the same way
+  from a ComfyUI install's split single files rather than a diffusers component dir:
+  `adapter.stream_single_file` meta-loads each big model, mmaps the one safetensors via
+  `load_torch_file`, applies an optional key `convert` (the diffusers single-file remap for the
+  transformer -- renames + a fused-qkv `torch.chunk` that returns views, so the mmap slices survive;
+  a `model.`-prefix strip for the Qwen3 text encoder), then rebinds by name (`_assign_sd`). The VAE
+  + scheduler + tokenizer come straight from the scaffold, and the shared `_finalize_pipe` tail
+  (VAE placement, execution device, encode bridge/cache) is identical to `load_pipe`. Verified on
+  the A1000 (z-image-turbo 1024×768, VBAR): 0 unmatched weights, seed-valid image.
 - **Pinning matches ComfyUI (measured).** comfy-aimdo pins the streamed working set lazily per
   module up to `MAX_PINNED_MEMORY` (40% RAM on Windows), degrading via `_steal_pin` past that; the
   weight VBAR survives `reset_cast_buffers` between gens, so there is **no per-gen re-fault**.
