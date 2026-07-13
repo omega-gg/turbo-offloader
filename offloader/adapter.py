@@ -493,6 +493,80 @@ def stream_single_file(build_meta, weight_file, operations=None, convert=None):
     return model, _assign_sd(model, sd)
 
 
+def mixed_precision_operations(compute_dtype, load_device, quant_config):
+    """ComfyUI's mixed-precision op namespace (comfy.ops.mixed_precision_ops) for a scaled-fp8 (or
+    other quantized) checkpoint -- the branch ops.pick_operations takes only when a model_config
+    carries quant_config, which adapter.pick_operations never reaches. Formats the compute device
+    can't run natively are `disabled` -> emulated dequant, exactly as ComfyUI: on Ampere (no fp8
+    tensor cores) float8 runs emulated (dequant to compute_dtype per forward). Reused by
+    load_quant_text_encoder."""
+    disabled = set()
+
+    if not mm.supports_fp8_compute(load_device):
+        disabled |= {"float8_e4m3fn", "float8_e5m2"}
+    if not mm.supports_nvfp4_compute(load_device):
+        disabled.add("nvfp4")
+    if not mm.supports_mxfp8_compute(load_device):
+        disabled.add("mxfp8")
+
+    return ops.mixed_precision_ops(quant_config, compute_dtype, disabled=disabled)
+
+
+def _quant_ize(model, operations, compute_dtype):
+    """Re-class every Linear of `model` to the mixed-precision op namespace and inject the attrs
+    its __init__ would have set -- factory_kwargs / _orig_shape / tensor_class / _full_precision_mm
+    (read by comfy.ops._load_quantized_module) plus the per-instance weight/bias_function lists.
+    Unlike comfy_ize (which re-classes over live weights for cast-only ops), a mixed-precision
+    Linear then LOADS its weight via _load_from_state_dict -> _load_quantized_module (a
+    comfy_kitchen QuantizedTensor); a non-quant Linear (e.g. lm_head) falls through its plain
+    branch. Returns the count re-classed."""
+    count = 0
+
+    for _name, m in model.named_modules():
+        if isinstance(m, torch.nn.Linear) and not isinstance(m, operations.Linear):
+            out_features, in_features = m.weight.shape
+
+            m.__class__ = operations.Linear
+            m.factory_kwargs = {"device": None, "dtype": compute_dtype}
+            m._orig_shape = (out_features, in_features)
+            m.tensor_class = None
+            m._full_precision_mm = operations._full_precision_mm
+            m._full_precision_mm_config = False
+            m.weight_function = []
+            m.bias_function = []
+            count += 1
+
+    return count
+
+
+def load_quant_text_encoder(build_meta, weight_file, load_device, compute_dtype, convert=None):
+    """stream_single_file's fp8 sibling: build a diffusers/transformers module whose Linear weights
+    are loaded as comfy QuantizedTensors from a ComfyUI scaled-fp8 single file, kept fp8 (mmap
+    ~8.7GB, dequantized per forward -- "what comfy does"). Meta-build via build_meta() (no weight
+    RAM), mmap the file (load_torch_file), run comfy's convert_old_quants (classic
+    scale_weight/scale_input -> weight_scale/input_scale + .comfy_quant markers), detect the quant,
+    re-class Linears to the mixed-precision namespace, optionally `convert` the state-dict keys
+    (e.g. a flat->nested rename), then load_state_dict(assign=True) so each quant Linear builds its
+    QuantizedTensor. Returns (model, unexpected_keys)."""
+    import comfy.utils as cu
+
+    model = build_meta()
+
+    sd = cu.load_torch_file(weight_file, device=torch.device("cpu"))
+    sd, _meta = cu.convert_old_quants(sd, "", {})
+    quant_config = cu.detect_layer_quantization(sd, "")
+
+    if convert is not None:
+        sd = convert(sd)
+
+    operations = mixed_precision_operations(compute_dtype, load_device, quant_config)
+    _quant_ize(model, operations, compute_dtype)
+
+    _missing, unexpected = model.load_state_dict(sd, assign=True, strict=False)
+
+    return model, unexpected
+
+
 _sdpa_patched = False
 
 

@@ -35,7 +35,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `available()` | True once the vendored offloader imports (any device) |
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
-| `load_pipe_single_file(scaffold, files, dtype, pipeline_cls, transformer_cls, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir; scaffold holds the tiny configs/tokenizer/scheduler |
+| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir. **Model-agnostic**: the engine passes each big model as a data spec (`{meta, file, convert, quant}`) plus prebuilt small `components` (vae/tokenizer/scheduler); no model classes or names appear here. `quant` routes a scaled-fp8 text encoder through the comfy quant path (below). |
 | `prepare(pipe)` | `load_models_gpu(patchers)` -- place managed models on the compute device |
 | `reclaim(pipe)` | `free_memory` + `soft_empty_cache` between generations |
 | `release(pipe)` | `detach` each patcher |
@@ -99,6 +99,24 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
 - **`add_lora`** — on-cast LoRA: build the `{lora_key → model_weight_key}` map, hand it to
   `comfy.lora.load_lora` (vendored `weight_adapter`), register via `ModelPatcher.add_patches`. The
   deltas apply while each weight streams in — no fuse, no resident copy.
+- **`load_quant_text_encoder` / `mixed_precision_operations`** — `stream_single_file`'s fp8
+  sibling, for a ComfyUI **scaled-fp8** text encoder (qwen-image-edit's `qwen_2.5_vl_7b_fp8_scaled`,
+  ~8.7GB). Meta-build → `convert_old_quants` → `detect_layer_quantization` → re-class each `Linear`
+  to `comfy.ops.mixed_precision_ops` (injecting the `__init__` attrs `_load_quantized_module`
+  reads) → `load_state_dict(assign=True)`, so each Linear builds a comfy `QuantizedTensor`. The
+  weights stay **fp8** (mmap, never materialized) and dequantize per forward — "what comfy does",
+  not a load-time dequant. **Device-agnostic like the rest:** the `disabled` set is computed from
+  comfy's `supports_fp8_compute(load_device)` (& nvfp4/mxfp8), so a device without fp8 tensor cores
+  — CPU, MPS, Ampere sm_86 — emulates the dequant to the compute dtype, as ComfyUI does. The fp8 TE
+  loads and its forward runs on CPU too (probed in isolation: 0 unexpected keys, `QuantizedTensor`
+  weights, forward executing), just slowly. Verified end-to-end on CUDA/Ampere (real image); MPS
+  untested. (Note: the practical blocker to a *full* CPU run is unrelated to the quant path. On CPU
+  `load_torch_file` takes its non-aimdo branch — a full-file `safetensors.safe_open` mmap — and
+  mmapping the 39GB transformer can exceed Windows' commit limit on a 32GB box, OS error 1455
+  "paging file too small", intermittently. On CUDA `aimdo_enabled` routes to comfy-aimdo's
+  file-slice `load_safetensors` instead, so there is no full host mmap and no 1455 — the same reason
+  ComfyUI-on-CUDA is fine. A larger page file fixes the CPU case; a 39GB model on a 32GB box is edge
+  either way, since materializing it wouldn't fit RAM.)
 - **`install_encode_cache`** — wrap the pipeline's `encode_prompt` so a repeated prompt returns
   cached text embeddings and never re-runs (nor re-streams) the encoder — the diffusers analogue of
   ComfyUI's default node cache. Copies `comfy_execution/caching.py::RAMPressureCache`:
@@ -182,7 +200,10 @@ change here.
   weights fault straight from the file — page cache when the working set fits RAM, disk when it
   doesn't — and run where they wouldn't fit VRAM. (The transformer is meta-loaded so it never sits
   in RAM; the text encoder is loaded by `from_pretrained` then swapped for slices, a transient ~1×
-  peak.)
+  peak.) A `comfy-qwen-image-edit-2511` variant reuses a ComfyUI install via `load_pipe_comfy`: bf16
+  transformer streamed, **scaled-fp8** TE through the quant path (`load_quant_text_encoder`), VAE
+  reused (WAN→diffusers convert). It is offloader-only (the fp8 quant path needs comfy ops) and has a
+  `-lightning` sibling that also reuses ComfyUI's Lightning LoRA. All model-specifics live engine-side.
 
 ## Benchmarks
 
@@ -285,18 +306,23 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB). VBAR also sizes partial GPU
   residency from live free VRAM, so a model larger than VRAM runs on any card. The residual gap vs
   ComfyUI on some engines is diffusers' unfused-qkv compute, not the offloader.
-- **Single-file streaming (ComfyUI-reuse engines).** `load_pipe_single_file` streams the same way
+- **Single-file streaming (ComfyUI-reuse engines).** `load_pipe_comfy` streams the same way
   from a ComfyUI install's split single files rather than a diffusers component dir:
   `adapter.stream_single_file` meta-loads each big model, mmaps the one safetensors via
   `load_torch_file`, applies an optional key `convert` (the diffusers single-file remap for the
   transformer -- renames + a fused-qkv `torch.chunk` that returns views, so the mmap slices survive;
-  a `model.`-prefix strip for the Qwen3 text encoder), then rebinds by name (`_assign_sd`). The VAE
-  + scheduler + tokenizer come straight from the scaffold. It shares both ends with `load_pipe`: the
-  `_prepare_offload` setup (device / CPU comfy-vs-stream mode / dtype / manual_cast / operations /
-  VBAR / builder) and the `_finalize_pipe` tail (VAE placement, execution device, encode
-  bridge/cache) — only the weight source differs, plus the CPU full-load fit is sized from the
-  single files rather than `cpu_fits_full_load`'s component-dir shards. Verified on the A1000
-  (z-image-turbo 1024×768, VBAR): 0 unmatched weights, seed-valid image.
+  a `model.`-prefix strip for the Qwen3 text encoder, a flat→nested rename for the Qwen2.5-VL one),
+  then rebinds by name (`_assign_sd`). A scaled-fp8 text encoder takes the quant sibling
+  `load_quant_text_encoder` (spec `{"quant": True}`) instead. The VAE + scheduler + tokenizer come
+  straight from the scaffold, or a reused ComfyUI VAE is rebuilt engine-side (qwen's WAN-keyed VAE →
+  `convert_wan_vae_to_diffusers`) and handed in as a prebuilt `component`. It shares both ends with
+  `load_pipe`: the `_prepare_offload` setup (device / CPU comfy-vs-stream mode / dtype / manual_cast
+  / operations / VBAR / builder) and the `_finalize_pipe` tail (VAE placement, execution device,
+  encode bridge/cache) — only the weight source differs, plus the CPU full-load fit is sized from the
+  single files rather than `cpu_fits_full_load`'s component-dir shards. Model-agnostic: every
+  model-specific piece (meta-builders, key remaps, quant flag, the reused-VAE rebuild) is data the
+  engine passes in; no names here. Verified on the A1000: z-image-turbo 1024×768 (VBAR, 0 unmatched)
+  and comfy-qwen-image-edit-2511 image-to-image (fp8 TE emulated), both seed-valid.
 - **Pinning matches ComfyUI (measured).** comfy-aimdo pins the streamed working set lazily per
   module up to `MAX_PINNED_MEMORY` (40% RAM on Windows), degrading via `_steal_pin` past that; the
   weight VBAR survives `reset_cast_buffers` between gens, so there is **no per-gen re-fault**.
