@@ -244,21 +244,26 @@ Windows 11 · torch 2.12 + cu130.
 | flux2-4b (15 GB) | CUDA | 512×512 | 4 | ~30 s warm (~7 s gen) | VBAR stream |
 | flux2-4b | CUDA | 1024×768 | 4 | ~60 s warm (~22 s gen) | VBAR stream |
 | comfy-z-image-turbo (20 GB) | CUDA | 1024×768 | 8 | ~4.5 s/it (≈ z-image-turbo) | VBAR stream |
-| comfy-qwen-image-edit-2511-lightning (41 GB DiT + 9 GB fp8 TE) | CUDA | 512×512 | 4 | ~34 s/it (≈ stock lightning) | VBAR stream |
+| comfy-qwen-image-edit-2511-lightning (41 GB DiT + 9 GB fp8 TE) | CUDA | 512×512 | 4 | ~22 s/it (vs stock ~31) | VBAR stream |
 | flux2-4b | CPU | 512×512 | 4 | ~220 s | stream |
 | flux2-4b | CPU | 1024×768 | 4 | ~325 s | stream |
 | z-image-turbo (20 GB) | CPU | 512×512 | 8 | ~315 s | stream |
 
 Notes: the A1000 is **Ampere** (sm_86, bf16 tensor cores), so CUDA compute stays bf16 -- no
 `manual_cast` (unlike the Turing box above, which runs fp16); with 32 GB RAM the ≤20 GB models fit
-the page cache, so VBAR streaming is RAM-fed. **The ComfyUI-reuse engines match their stock
+the page cache, so VBAR streaming is RAM-fed. **The ComfyUI-reuse engines match or beat their stock
 counterparts per-step** (same weights + offloader path): `comfy-z-image-turbo` ≈ `z-image-turbo`
-(~4.5 s/it), and `comfy-qwen-image-edit-2511(-lightning)` ≈ stock qwen (~34 s/it @512²). The qwen
-match only holds **after fixing the fp8 text-encoder offload** — `load_quant_text_encoder` must
-`comfy_ize` the non-Linear leaves too, else the ~1 GB input `Embedding` stays pinned resident and
-starves the 41 GB DiT's VBAR budget (free VRAM 3.2 → 2.1 GB), ~2.5× slower per step. **These rows
-quote per-step, not total wall-clock, on purpose:** the A1000 thermal-throttles across a long qwen
-run (a hot back-to-back gen measured 62 s/it vs 34 s/it cool), so per-step at a cool start is the
+(~4.5 s/it), and `comfy-qwen-image-edit-2511(-lightning)` is actually **~30% faster** than stock
+(rigorous cool back-to-back, 2 reps each: ~21.6 vs ~31.1 s/it @512²). Both only **after fixing the
+fp8 text-encoder offload** — `load_quant_text_encoder` must `comfy_ize` the non-Linear leaves too,
+else the ~1 GB input `Embedding` stays pinned resident and starves the 41 GB DiT's VBAR budget
+(free VRAM 3.2 → 2.1 GB), ~2.5× slower per step. The qwen speed-up over stock is because its DiT
+**exceeds the 32 GB RAM** (disk-stream-bound), where comfy has two edges: the fp8 TE is 9 GB vs
+stock's 16.6 GB bf16, leaving ~7 GB more page cache for the DiT; and it streams from one contiguous
+40 GB file vs stock's scattered shards (better readahead). z-image (12 GB DiT, fits RAM) shows
+parity because neither edge matters when it isn't disk-bound. **These rows quote per-step, not
+total wall-clock, on purpose:** the A1000 throttles across a long qwen run (a hot back-to-back gen
+measured 62 s/it vs ~22 s/it cool), so per-step at a cool start is the
 stable number; the qwen 41 GB DiT also exceeds the 32 GB page cache, so it disk-streams (unlike the
 ≤20 GB models). **CPU** per-step *climbs within a run* as the laptop throttles the i7-12800H from
 ~3.6 → ~1.05 GHz over ~5 min (flux2 1024×768: 61 → 90 s/step). Forcing `comfy` CPU mode (fp32
