@@ -545,9 +545,9 @@ def load_quant_text_encoder(build_meta, weight_file, load_device, compute_dtype,
     ~8.7GB, dequantized per forward -- "what comfy does"). Meta-build via build_meta() (no weight
     RAM), mmap the file (load_torch_file), run comfy's convert_old_quants (classic
     scale_weight/scale_input -> weight_scale/input_scale + .comfy_quant markers), detect the quant,
-    re-class Linears to the mixed-precision namespace, optionally `convert` the state-dict keys
-    (e.g. a flat->nested rename), then load_state_dict(assign=True) so each quant Linear builds its
-    QuantizedTensor. Returns (model, unexpected_keys)."""
+    re-class Linears to the mixed-precision namespace (+ comfy_ize the rest), optionally `convert`
+    the state-dict keys (e.g. a flat->nested rename), then load_state_dict(assign=True) so each quant
+    Linear builds its QuantizedTensor. Returns (model, unexpected_keys)."""
     import comfy.utils as cu
 
     model = build_meta()
@@ -561,6 +561,12 @@ def load_quant_text_encoder(build_meta, weight_file, load_device, compute_dtype,
 
     operations = mixed_precision_operations(compute_dtype, load_device, quant_config)
     _quant_ize(model, operations, compute_dtype)
+    # _quant_ize only re-classes Linears (they need the quant _load_from_state_dict); comfy_ize the
+    # REST of the leaves (Embedding, Conv, norms) into the same namespace so they stream too, else
+    # keep_uncastable_resident pins them (e.g. the ~1GB input Embedding), starving the transformer
+    # VRAM stream budget. comfy_ize skips the already-quant Linears (CastWeightBiasOp; see
+    # _comfy_class_for), so it converts only the non-Linear leaves.
+    comfy_ize(model, operations)
 
     _missing, unexpected = model.load_state_dict(sd, assign=True, strict=False)
 

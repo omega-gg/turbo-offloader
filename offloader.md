@@ -103,9 +103,15 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
   sibling, for a ComfyUI **scaled-fp8** text encoder (qwen-image-edit's
   `qwen_2.5_vl_7b_fp8_scaled`, ~8.7GB). Meta-build → `convert_old_quants` →
   `detect_layer_quantization` → re-class each `Linear` to `comfy.ops.mixed_precision_ops`
-  (injecting the `__init__` attrs `_load_quantized_module` reads) → `load_state_dict(assign=True)`,
-  so each Linear builds a comfy `QuantizedTensor`. The weights stay **fp8** (mmap, never
-  materialized) and dequantize per forward — "what comfy does", not a load-time dequant.
+  (injecting the `__init__` attrs `_load_quantized_module` reads) → `comfy_ize` the **non-Linear**
+  leaves (Embedding/Conv/norms) into the same namespace so they stream too → `load_state_dict`
+  (`assign=True`), so each Linear builds a comfy `QuantizedTensor`. The weights stay **fp8** (mmap,
+  never materialized) and dequantize per forward — "what comfy does", not a load-time dequant.
+  **The `comfy_ize` step is load-bearing:** `_quant_ize` only touches Linears, so without it the
+  non-quant leaves — notably the ~1 GB input `Embedding` — would be pinned resident by
+  `keep_uncastable_resident`, stealing the transformer's VBAR VRAM budget (~2.5× slower per step on
+  the 4 GB A1000; see Benchmarks). With it, the fp8 TE offloads to **0 GB resident**, matching the
+  stock bf16 TE.
   **Device-agnostic like the rest:** the `disabled` set is computed from comfy's
   `supports_fp8_compute(load_device)` (& nvfp4/mxfp8), so a device without fp8 tensor cores — CPU,
   MPS, Ampere sm_86 — emulates the dequant to the compute dtype, as ComfyUI does. The fp8 TE loads
@@ -237,17 +243,27 @@ Windows 11 · torch 2.12 + cu130.
 |---|---|---|---|---|---|
 | flux2-4b (15 GB) | CUDA | 512×512 | 4 | ~30 s warm (~7 s gen) | VBAR stream |
 | flux2-4b | CUDA | 1024×768 | 4 | ~60 s warm (~22 s gen) | VBAR stream |
+| comfy-z-image-turbo (20 GB) | CUDA | 1024×768 | 8 | ~4.5 s/it (≈ z-image-turbo) | VBAR stream |
+| comfy-qwen-image-edit-2511-lightning (41 GB DiT + 9 GB fp8 TE) | CUDA | 512×512 | 4 | ~34 s/it (≈ stock lightning) | VBAR stream |
 | flux2-4b | CPU | 512×512 | 4 | ~220 s | stream |
 | flux2-4b | CPU | 1024×768 | 4 | ~325 s | stream |
 | z-image-turbo (20 GB) | CPU | 512×512 | 8 | ~315 s | stream |
 
 Notes: the A1000 is **Ampere** (sm_86, bf16 tensor cores), so CUDA compute stays bf16 -- no
-`manual_cast` (unlike the Turing box above, which runs fp16); with 32 GB RAM both models fit the
-page cache, so VBAR streaming is RAM-fed rather than disk-bound. **CPU** per-step *climbs within a
-run* as the laptop thermal-throttles the i7-12800H from ~3.6 → ~1.05 GHz over ~5 min (flux2
-1024×768: 61 → 90 s/step). Forcing `comfy` CPU mode (fp32 full-load) is slower at high res and
-OOM-thrashes z-image (fp32 working set ~48 GB > 32 GB RAM), so the auto-picker correctly stays on
-`stream`.
+`manual_cast` (unlike the Turing box above, which runs fp16); with 32 GB RAM the ≤20 GB models fit
+the page cache, so VBAR streaming is RAM-fed. **The ComfyUI-reuse engines match their stock
+counterparts per-step** (same weights + offloader path): `comfy-z-image-turbo` ≈ `z-image-turbo`
+(~4.5 s/it), and `comfy-qwen-image-edit-2511(-lightning)` ≈ stock qwen (~34 s/it @512²). The qwen
+match only holds **after fixing the fp8 text-encoder offload** — `load_quant_text_encoder` must
+`comfy_ize` the non-Linear leaves too, else the ~1 GB input `Embedding` stays pinned resident and
+starves the 41 GB DiT's VBAR budget (free VRAM 3.2 → 2.1 GB), ~2.5× slower per step. **These rows
+quote per-step, not total wall-clock, on purpose:** the A1000 thermal-throttles across a long qwen
+run (a hot back-to-back gen measured 62 s/it vs 34 s/it cool), so per-step at a cool start is the
+stable number; the qwen 41 GB DiT also exceeds the 32 GB page cache, so it disk-streams (unlike the
+≤20 GB models). **CPU** per-step *climbs within a run* as the laptop throttles the i7-12800H from
+~3.6 → ~1.05 GHz over ~5 min (flux2 1024×768: 61 → 90 s/step). Forcing `comfy` CPU mode (fp32
+full-load) is slower at high res and OOM-thrashes z-image (fp32 working set ~48 GB > 32 GB RAM), so
+the auto-picker correctly stays on `stream`.
 
 **Machine:** Apple M1 (Mac mini, 8-core) · 8 GB unified RAM · MPS · macOS 15.5 · torch 2.12 ·
 Python 3.14.
