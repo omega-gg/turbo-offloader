@@ -293,7 +293,14 @@ counterparts per-step** (same weights + offloader path): `comfy-z-image-turbo` �
 fp8 text-encoder offload** — `load_quant_single_file` must `comfy_ize` the non-Linear leaves too,
 else the ~1 GB input `Embedding` stays pinned resident and starves the 41 GB DiT's VBAR budget
 (free VRAM 3.2 → 2.1 GB), ~2.5× slower per step. The qwen speed-up over stock is because its DiT
-**exceeds the 32 GB RAM** (disk-stream-bound), where comfy has two edges: the fp8 TE is 9 GB vs
+**comfy-krea2-turbo has no stock counterpart** (krea2 is comfy-reuse only), so it is quoted against
+**ComfyUI itself**: ~3.5 vs ~3.6 s/it @512², i.e. per-step parity, and marginally ahead. That was
+5.17 s/it until `install_unpadded_encode` stopped feeding the DiT 500 padding tokens. It is quoted
+from two independent thermal states rather than one reading — cool 3.50 vs 3.62, mid-session
+throttled 13.33 vs 13.46 — because on this laptop a single number says more about temperature than
+about code (z-image measured 13.4 against its ~4.5 row in that same window). The qwen speed-up over
+stock is because its DiT **exceeds the 32 GB RAM** (disk-stream-bound), where comfy has two edges:
+the fp8 TE is 9 GB vs
 stock's 16.6 GB bf16, leaving ~7 GB more page cache for the DiT; and it streams from one contiguous
 40 GB file vs stock's scattered shards (better readahead). z-image (12 GB DiT, fits RAM) shows
 parity because neither edge matters when it isn't disk-bound. **These rows quote per-step, not
@@ -362,8 +369,15 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   host buffers, so per-forward streaming is **pinned** (fast async HtoD); the slices come from the
   page cache when the model fits
   RAM, or straight from disk when it doesn't (qwen-image-edit ~55GB). VBAR also sizes partial GPU
-  residency from live free VRAM, so a model larger than VRAM runs on any card. The residual gap vs
-  ComfyUI on some engines is diffusers' unfused-qkv compute, not the offloader.
+  residency from live free VRAM, so a model larger than VRAM runs on any card. A residual gap vs
+  ComfyUI on some engines is diffusers' unfused-qkv compute, not the offloader -- but **do not
+  reach for that explanation before counting tokens.** comfy-krea2-turbo was 32% off ComfyUI and
+  "diffusers compute" was the assumed cause; it was wrong. diffusers pipelines may pad the text
+  sequence to a fixed width where ComfyUI never pads, and the DiT then chews the padding in every
+  block (krea2: 1536 tokens vs ~1054, the whole gap -- see `install_unpadded_encode`). Check
+  `prompt_embeds.shape[1]` against the mask's `.sum()` first; it costs a print, and per-step time
+  is linear in the sequence length. The attention mask such padding forces is a symptom, not a
+  cause.
 - **Single-file streaming (ComfyUI-reuse engines).** `load_pipe_comfy` streams the same way from a
   ComfyUI install's split single files rather than a diffusers component dir:
   `adapter.stream_single_file` meta-loads each big model, mmaps the one safetensors via
