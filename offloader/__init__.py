@@ -361,6 +361,11 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
 
         p.encode_prompt = _encode_on_te
 
+    # Drop padded text tokens (ComfyUI never pads, and drops an all-ones mask): a pipeline padding
+    # to a fixed width would otherwise run those dead tokens through every block. Wrapped BEFORE
+    # install_encode_cache so the cache stores the unpadded result.
+    adapter.install_unpadded_encode(p)
+
     # Cache the text-encoder output by prompt (ComfyUI's node cache): a repeated prompt then skips
     # the encoder's forward, so the streamed encoder is never loaded and the transformer keeps the
     # VRAM.

@@ -107,6 +107,26 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
 - **`add_lora`** — on-cast LoRA: build the `{lora_key → model_weight_key}` map, hand it to
   `comfy.lora.load_lora` (vendored `weight_adapter`), register via `ModelPatcher.add_patches`. The
   deltas apply while each weight streams in — no fuse, no resident copy.
+- **`install_unpadded_encode`** — drop padded text tokens from the conditioning before the
+  transformer sees them. ComfyUI never pads the modern LLM text encoders
+  (`pad_to_max_length=False`: qwen3vl/qwen_image/flux-t5; only CLIP keeps `SDTokenizer`'s default
+  `True`, since its 77-token pad is required) and drops an all-ones mask outright
+  (`text_encoders/krea2.py:69-70`); diffusers' own qwen pipeline agrees (`if
+  prompt_embeds_mask.all(): prompt_embeds_mask = None`). Its **krea2** pipeline is the outlier --
+  `padding="max_length"` pads every prompt to a fixed 512 -- so the DiT dragged ~500 dead tokens
+  through all 28 blocks: **1536 tokens at 512² where ComfyUI runs ~1054**, which was the entire
+  per-step gap (**5.17 → 3.50 s/it**). Model-agnostic: keyed only off the mask the pipeline itself
+  returns. Sound because a key-padding mask *means* those tokens are excluded as attention keys,
+  so removing them is a no-op for any model that honours it. Gathers (krea2 pads mid-template),
+  re-pads ragged batches, and falls through untouched for a pipeline returning a second embeds
+  tensor instead of a mask (z-image's `prompt_embeds, negative_prompt_embeds`).
+- **`keep_declared_fp32`** — honour a model's own `_keep_in_fp32_modules` after a meta-build +
+  `assign=True` load (diffusers only applies it via `from_pretrained`). Without it diffusers'
+  `Krea2RMSNorm` runs `F.rms_norm(x.float(), ..., weight=self.weight + 1.0)` with a **bf16**
+  weight, so torch refuses the fused kernel ("Cannot dispatch to fused implementation") -- measured
+  **2.4× slower per call**. ComfyUI casts its scale to fp32 for the same reason
+  (`ldm/krea2/model.py:33`); this also restores exact numeric parity with it (a bf16 `+ 1.0` rounds
+  a zero-centered scale), taking the cross-framework cosine 0.99997 → **1.0**.
 - **`load_quant_single_file` / `mixed_precision_operations`** — `stream_single_file`'s fp8
   sibling, for any ComfyUI **scaled-fp8** single file — a text encoder (qwen-image-edit's
   `qwen_2.5_vl_7b_fp8_scaled`, ~8.7GB) **or a transformer** (comfy-krea2-turbo's
@@ -259,7 +279,7 @@ Windows 11 · torch 2.12 + cu130.
 | flux2-4b | CUDA | 1024×768 | 4 | ~60 s warm (~22 s gen) | VBAR stream |
 | comfy-z-image-turbo (20 GB) | CUDA | 1024×768 | 8 | ~4.5 s/it (≈ z-image-turbo) | VBAR stream |
 | comfy-qwen-image-edit-2511-lightning (41 GB DiT + 9 GB fp8 TE) | CUDA | 512×512 | 4 | ~22 s/it (vs stock ~31) | VBAR stream |
-| comfy-krea2-turbo (13 GB fp8 DiT + 9 GB fp8 TE) | CUDA | 512×512 | 8 | ~4.9 s/it (ComfyUI ~3.6) | VBAR stream, both fp8 |
+| comfy-krea2-turbo (13 GB fp8 DiT + 9 GB fp8 TE) | CUDA | 512×512 | 8 | ~3.5 s/it (ComfyUI ~3.6) | VBAR stream, both fp8 |
 | flux2-4b | CPU | 512×512 | 4 | ~220 s | stream |
 | flux2-4b | CPU | 1024×768 | 4 | ~325 s | stream |
 | z-image-turbo (20 GB) | CPU | 512×512 | 8 | ~315 s | stream |
@@ -352,8 +372,8 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   survive; a `model.`-prefix strip for the Qwen3 text encoder, a flat→nested rename for the
   Qwen2.5-VL one), then rebinds by name (`_assign_sd`). A scaled-fp8 model -- transformer or text
   encoder -- takes the quant sibling `load_quant_single_file` (spec `{"quant": True}`) instead. Its
-  `convert` runs on the fp8 state dict too (comfy-krea2-turbo remaps the whole ComfyUI-native DiT to
-  the diffusers `Krea2Transformer2DModel` layout). The VAE + scheduler +
+  `convert` runs on the fp8 state dict too (comfy-krea2-turbo remaps the whole ComfyUI-native DiT
+  to the diffusers `Krea2Transformer2DModel` layout). The VAE + scheduler +
   tokenizer come straight from the scaffold, or a reused ComfyUI VAE is rebuilt engine-side (qwen's
   WAN-keyed VAE → `convert_wan_vae_to_diffusers`) and handed in as a prebuilt `component`. It
   shares both ends with `load_pipe`: the `_prepare_offload` setup (device / CPU comfy-vs-stream

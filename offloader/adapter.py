@@ -205,6 +205,37 @@ def comfy_ize(model, operations=None):
     return count
 
 
+def keep_declared_fp32(model):
+    """Honour a model's own `_keep_in_fp32_modules` after a meta-build + assign load.
+
+    diffusers keeps those submodules in fp32 (modeling_utils.py:493) -- but only through
+    from_pretrained. Our meta-build (`from_config(...).to(dtype)`) and
+    `load_state_dict(assign=True)` both bypass it, so they land in the checkpoint dtype instead.
+    That silently costs the fused
+    kernel wherever the module upcasts its input: diffusers' Krea2RMSNorm runs
+    `F.rms_norm(hidden_states.float(), ..., weight=self.weight + 1.0)`, so a bf16 weight makes
+    torch refuse to fuse ("Mismatch dtype between input and weight ... Cannot dispatch to fused
+    implementation") -- measured 1.653 vs 0.679 ms/call on the A1000. ComfyUI casts the scale to
+    fp32 for exactly this reason (comfy/ldm/krea2/model.py:33), so this is also what restores
+    numeric parity with it (a bf16 `+ 1.0` rounds a zero-centered scale).
+
+    Model-agnostic: reads the model's own declaration and matches names diffusers' own way
+    (`any(m in name for m in _keep_in_fp32_modules)`, modeling_utils.py:178). No-op when the model
+    declares none. Returns the number of parameters promoted."""
+    names = getattr(model, "_keep_in_fp32_modules", None)
+
+    if not names:
+        return 0
+
+    count = 0
+    for name, param in model.named_parameters():
+        if param.is_floating_point() and param.dtype != torch.float32 \
+                and any(m in name for m in names):
+            param.data = param.data.float()
+            count += 1
+    return count
+
+
 def make_patchable(model):
     """ComfyUI's ModelPatcher assigns `self.model.device = ...`, but diffusers ModelMixin and HF
     PreTrainedModel expose `device` as a READ-ONLY property. Shadow it with a plain, settable class
@@ -525,7 +556,11 @@ def stream_single_file(build_meta, weight_file, operations=None, convert=None):
     if convert is not None:
         sd = convert(sd)
 
-    return model, _assign_sd(model, sd)
+    missing = _assign_sd(model, sd)
+    # The slices carry the file's dtype, so honour _keep_in_fp32_modules afterwards.
+    keep_declared_fp32(model)
+
+    return model, missing
 
 
 def mixed_precision_operations(compute_dtype, load_device, quant_config):
@@ -605,6 +640,8 @@ def load_quant_single_file(build_meta, weight_file, load_device, compute_dtype, 
     comfy_ize(model, operations)
 
     _missing, unexpected = model.load_state_dict(sd, assign=True, strict=False)
+    # assign=True installs the checkpoint's own dtype, so honour _keep_in_fp32_modules afterwards.
+    keep_declared_fp32(model)
 
     return model, unexpected
 
@@ -900,6 +937,65 @@ def build_dynamic_patcher(model, load_device=None, offload_device=None, size=0):
     make_patchable(model)
     return model_patcher.ModelPatcherDynamic(model, load_device=load_device,
                                              offload_device=offload_device, size=size)
+
+
+def install_unpadded_encode(pipe):
+    """Drop padded text tokens from the conditioning before it ever reaches the transformer.
+
+    ComfyUI never pads: its Qwen3-VL tokenizer runs `pad_to_max_length=False`
+    (comfy/text_encoders/qwen3vl.py:129), and its krea2 text encoder drops an all-ones mask
+    outright (comfy/text_encoders/krea2.py:69-70), so every attention call gets mask=None.
+    diffusers' own qwen pipeline already agrees (`padding=True`, then `if prompt_embeds_mask.all():
+    prompt_embeds_mask = None` -- pipeline_qwenimage_edit_plus.py:327). Its krea2 pipeline is the
+    outlier: it pads every prompt to a fixed 512 tokens (`padding="max_length"`,
+    pipeline_krea2.py:229-235) and keeps the mask, so the DiT drags ~500 dead tokens through all 28
+    blocks -- 1536 tokens at 512x512 where ComfyUI runs ~1054, which is the whole per-step gap.
+
+    Model-agnostic: keyed only off the mask the pipeline itself returns, it names nothing. Compacts
+    each sequence to its valid tokens -- krea2 pads mid-template (`[prefix | prompt | PAD |
+    suffix]`, see pipeline_krea2.py:243-247), so this GATHERS rather than truncates -- re-pads to
+    the longest in the batch, and returns mask=None once nothing is masked, which is the comfy/qwen
+    idiom. A pipeline that already emits unpadded conditioning is untouched: its mask is all-ones,
+    the gather is an identity, and the mask was already dropped. No-op without encode_prompt, or if
+    already installed."""
+    real = getattr(pipe, "encode_prompt", None)
+
+    if real is None or getattr(pipe, "_unpadded_encode_installed", False):
+        return
+
+    def encode_prompt(*args, **kwargs):
+        out = real(*args, **kwargs)
+
+        if not (isinstance(out, tuple) and len(out) == 2):
+            return out
+        prompt_embeds, prompt_embeds_mask = out
+        if not (isinstance(prompt_embeds, torch.Tensor)
+                and isinstance(prompt_embeds_mask, torch.Tensor)):
+            return out
+        # Only touch a real key-padding mask: (batch, seq) of bool/int over the embeds' leading
+        # dims. A pipeline whose encode_prompt returns a second EMBEDS tensor instead (z-image's
+        # `return prompt_embeds, negative_prompt_embeds`) must fall straight through.
+        if (prompt_embeds_mask.dtype.is_floating_point or prompt_embeds_mask.ndim != 2
+                or prompt_embeds_mask.shape != prompt_embeds.shape[:2]):
+            return out
+        if bool(prompt_embeds_mask.all()):
+            return prompt_embeds, None
+
+        kept = [e[m.bool()] for e, m in zip(prompt_embeds, prompt_embeds_mask)]
+        seq_len = max(k.shape[0] for k in kept)
+        if all(k.shape[0] == seq_len for k in kept):
+            return torch.stack(kept), None
+
+        # Ragged batch: re-pad to the longest and keep a mask for what is still padding.
+        padded = prompt_embeds.new_zeros((len(kept), seq_len) + tuple(prompt_embeds.shape[2:]))
+        padded_mask = prompt_embeds_mask.new_zeros((len(kept), seq_len))
+        for i, k in enumerate(kept):
+            padded[i, :k.shape[0]] = k
+            padded_mask[i, :k.shape[0]] = True
+        return padded, padded_mask
+
+    pipe.encode_prompt = encode_prompt
+    pipe._unpadded_encode_installed = True
 
 
 def install_encode_cache(pipe):
