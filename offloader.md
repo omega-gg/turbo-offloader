@@ -88,7 +88,15 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
 - **`comfy_ize(model)`** — re-class each offloadable leaf (`Linear`/`Conv`/`LayerNorm`/`GroupNorm`/
   `Embedding`/`RMSNorm`, incl. custom `*RMSNorm`) to its `comfy.ops.disable_weight_init.*`
   counterpart, so its forward routes through ComfyUI's cast path with 1:1 parity. Injects the
-  `comfy_cast_weights`/`weight_function`/`bias_function` attrs ModelPatcher reads.
+  `comfy_cast_weights`/`weight_function`/`bias_function` attrs ModelPatcher reads. A custom
+  `*RMSNorm` is only re-classed when the fused op **provably** reproduces its forward
+  (`_rmsnorm_matches_fused` probes it structurally: real random weight in, module forward vs the
+  exact `F.rms_norm` call the re-class would make — which also guards the eps/`normalized_shape`
+  `_prep_rmsnorm` inferred). comfy's `RMSNorm` applies the weight verbatim, so a norm with its own
+  weight convention (diffusers' `Krea2RMSNorm` normalizes by `1 + weight`, scale stored
+  zero-centered) keeps its own forward — as ComfyUI runs it: comfy hands a model `operations` for
+  its `Linear`/`Conv` leaves, it never swaps out the model's norm. `keep_uncastable_resident` then
+  places it (a norm's weight is tiny). The re-class can only ever be a no-op speedup.
 - **`build_patcher` / `build_dynamic_patcher`** — wrap in `ModelPatcher` / `ModelPatcherDynamic`.
   `make_patchable` shadows diffusers/HF's read-only `.device` property (which ComfyUI assigns to)
   while keeping `str(cls)` identical so transformers' output-capture registry still fires.
@@ -99,9 +107,12 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
 - **`add_lora`** — on-cast LoRA: build the `{lora_key → model_weight_key}` map, hand it to
   `comfy.lora.load_lora` (vendored `weight_adapter`), register via `ModelPatcher.add_patches`. The
   deltas apply while each weight streams in — no fuse, no resident copy.
-- **`load_quant_text_encoder` / `mixed_precision_operations`** — `stream_single_file`'s fp8
-  sibling, for a ComfyUI **scaled-fp8** text encoder (qwen-image-edit's
-  `qwen_2.5_vl_7b_fp8_scaled`, ~8.7GB). Meta-build → `convert_old_quants` →
+- **`load_quant_single_file` / `mixed_precision_operations`** — `stream_single_file`'s fp8
+  sibling, for any ComfyUI **scaled-fp8** single file — a text encoder (qwen-image-edit's
+  `qwen_2.5_vl_7b_fp8_scaled`, ~8.7GB) **or a transformer** (comfy-krea2-turbo's
+  `krea2_turbo_fp8_scaled`). `convert_old_quants` reads the fp8 markers from either the classic
+  `scaled_fp8` + `scale_weight` keys or the file's `_quantization_metadata`. Meta-build →
+  `convert_old_quants` →
   `detect_layer_quantization` → re-class each `Linear` to `comfy.ops.mixed_precision_ops`
   (injecting the `__init__` attrs `_load_quantized_module` reads) → `comfy_ize` the **non-Linear**
   leaves (Embedding/Conv/norms) into the same namespace so they stream too → `load_state_dict`
@@ -185,7 +196,9 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   `apply_rope1` (the kernel ComfyUI's `comfy/ldm/flux/math.py` uses), via a `(cos,sin)→freqs_cis`
   shim + a module-scoped patch of `diffusers.models.embeddings.apply_rotary_emb`. Lazy:
   comfy-kitchen is imported only on a matching call, so engines with their own rope (z-image) never
-  touch it.
+  touch it. It engages for comfy-krea2-turbo but buys no measurable per-step there (rope is a small
+  slice of a 12B DiT); `OFFLOADER_KITCHEN_ROPE=0` leaves the per-step unchanged (4.96 vs 4.93 s/it)
+  and only drops comfy-kitchen's ~16 s init off the load.
 - **fused RMSNorm** — routing custom norms through `disable_weight_init.RMSNorm` gives ComfyUI's
   fused `F.rms_norm` (≈ 3.5× the eager `mul`/`rsqrt` diffusers/transformers use).
 
@@ -208,10 +221,11 @@ change here.
   doesn't — and run where they wouldn't fit VRAM. (The transformer is meta-loaded so it never sits
   in RAM; the text encoder is loaded by `from_pretrained` then swapped for slices, a transient ~1×
   peak.) A `comfy-qwen-image-edit-2511` variant reuses a ComfyUI install via `load_pipe_comfy`:
-  bf16 transformer streamed, **scaled-fp8** TE through the quant path (`load_quant_text_encoder`),
+  bf16 transformer streamed, **scaled-fp8** TE through the quant path (`load_quant_single_file`),
   VAE reused (WAN→diffusers convert). It is offloader-only (the fp8 quant path needs comfy ops) and
-  has a `-lightning` sibling that also reuses ComfyUI's Lightning LoRA. All model-specifics live
-  engine-side.
+  has a `-lightning` sibling that also reuses ComfyUI's Lightning LoRA. `comfy-krea2-turbo` reuses
+  the same seam with **both** big models scaled-fp8 (transformer + Qwen3-VL TE), each spec carrying
+  `{"quant": True}`. All model-specifics live engine-side.
 
 ## Benchmarks
 
@@ -245,6 +259,7 @@ Windows 11 · torch 2.12 + cu130.
 | flux2-4b | CUDA | 1024×768 | 4 | ~60 s warm (~22 s gen) | VBAR stream |
 | comfy-z-image-turbo (20 GB) | CUDA | 1024×768 | 8 | ~4.5 s/it (≈ z-image-turbo) | VBAR stream |
 | comfy-qwen-image-edit-2511-lightning (41 GB DiT + 9 GB fp8 TE) | CUDA | 512×512 | 4 | ~22 s/it (vs stock ~31) | VBAR stream |
+| comfy-krea2-turbo (13 GB fp8 DiT + 9 GB fp8 TE) | CUDA | 512×512 | 8 | ~4.9 s/it (ComfyUI ~3.6) | VBAR stream, both fp8 |
 | flux2-4b | CPU | 512×512 | 4 | ~220 s | stream |
 | flux2-4b | CPU | 1024×768 | 4 | ~325 s | stream |
 | z-image-turbo (20 GB) | CPU | 512×512 | 8 | ~315 s | stream |
@@ -255,7 +270,7 @@ the page cache, so VBAR streaming is RAM-fed. **The ComfyUI-reuse engines match 
 counterparts per-step** (same weights + offloader path): `comfy-z-image-turbo` ≈ `z-image-turbo`
 (~4.5 s/it), and `comfy-qwen-image-edit-2511(-lightning)` is actually **~30% faster** than stock
 (rigorous cool back-to-back, 2 reps each: ~21.6 vs ~31.1 s/it @512²). Both only **after fixing the
-fp8 text-encoder offload** — `load_quant_text_encoder` must `comfy_ize` the non-Linear leaves too,
+fp8 text-encoder offload** — `load_quant_single_file` must `comfy_ize` the non-Linear leaves too,
 else the ~1 GB input `Embedding` stays pinned resident and starves the 41 GB DiT's VBAR budget
 (free VRAM 3.2 → 2.1 GB), ~2.5× slower per step. The qwen speed-up over stock is because its DiT
 **exceeds the 32 GB RAM** (disk-stream-bound), where comfy has two edges: the fp8 TE is 9 GB vs
@@ -335,8 +350,10 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   `load_torch_file`, applies an optional key `convert` (the diffusers single-file remap for the
   transformer -- renames + a fused-qkv `torch.chunk` that returns views, so the mmap slices
   survive; a `model.`-prefix strip for the Qwen3 text encoder, a flat→nested rename for the
-  Qwen2.5-VL one), then rebinds by name (`_assign_sd`). A scaled-fp8 text encoder takes the quant
-  sibling `load_quant_text_encoder` (spec `{"quant": True}`) instead. The VAE + scheduler +
+  Qwen2.5-VL one), then rebinds by name (`_assign_sd`). A scaled-fp8 model -- transformer or text
+  encoder -- takes the quant sibling `load_quant_single_file` (spec `{"quant": True}`) instead. Its
+  `convert` runs on the fp8 state dict too (comfy-krea2-turbo remaps the whole ComfyUI-native DiT to
+  the diffusers `Krea2Transformer2DModel` layout). The VAE + scheduler +
   tokenizer come straight from the scaffold, or a reused ComfyUI VAE is rebuilt engine-side (qwen's
   WAN-keyed VAE → `convert_wan_vae_to_diffusers`) and handed in as a prebuilt `component`. It
   shares both ends with `load_pipe`: the `_prepare_offload` setup (device / CPU comfy-vs-stream

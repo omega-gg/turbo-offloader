@@ -397,11 +397,11 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
                     lora_files=None):
     """Model-agnostic assembly of a ComfyUI-reuse pipeline on the disk-stream offloader. The engine
     (engine/<id>.py) supplies every model-specific piece as data:
-        transformer  = {"meta": fn(dtype)->module, "file": path, "convert": fn(sd)->sd | None}
+        transformer  = {"meta": fn(dtype)->module, "file": path, "convert": ..., "quant": bool}
         text_encoder = {"meta": fn(dtype)->module, "file": path, "convert": ..., "quant": bool}
         components   = {<pipeline __init__ arg>: prebuilt module, ...}  # vae/tokenizer/scheduler
-    The offloader streams the two big models from their ComfyUI single files (stream_single_file,
-    or the fp8 quant path load_quant_text_encoder when text_encoder["quant"]), wires them
+    The offloader streams the two big models from their ComfyUI single files (stream_single_file
+    for a plain bf16 file, or the fp8 quant path load_quant_single_file when ["quant"]), wires them
     (wire_streamed), assembles pipeline_cls(transformer=, text_encoder=, **components), and runs
     the shared _finalize_pipe tail. No model classes or names appear here -- see the comfy_* engine
     modules for the specs."""
@@ -421,22 +421,32 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
 
     stream = use_vbar or cpu_stream
 
-    # Transformer: always meta-load + stream from the single file (mmap; the engine's `convert`
-    # applies any single-file key remap).
-    tf, missing = adapter.stream_single_file(
-        lambda: transformer["meta"](dtype), transformer["file"], operations,
-        convert=transformer.get("convert"))
-    if missing:
-        print("offloader: %d transformer weights had no matching module (skipped)" % len(missing),
-              flush=True)
-    tf_patcher = wire_streamed(tf, load_device, dtype, manual_cast, build,
-                               prefetch=(stream and use_vbar), lora_files=lora_files)
+    # Transformer: meta-load + stream from the single file (mmap; the engine's `convert` applies
+    # any single-file key remap). A scaled-fp8 file goes through the comfy quant path (like the TE,
+    # which owns its compute dtype -> manual_cast=None); a plain bf16 file streams via cast ops.
+    if transformer.get("quant"):
+        tf, unexpected = adapter.load_quant_single_file(
+            lambda: transformer["meta"](dtype), transformer["file"], load_device, dtype,
+            convert=transformer.get("convert"))
+        if unexpected:
+            print("offloader: %d transformer quant keys unexpected" % len(unexpected), flush=True)
+        tf_patcher = wire_streamed(tf, load_device, dtype, None, build,
+                                   prefetch=(stream and use_vbar), lora_files=lora_files)
+    else:
+        tf, missing = adapter.stream_single_file(
+            lambda: transformer["meta"](dtype), transformer["file"], operations,
+            convert=transformer.get("convert"))
+        if missing:
+            print("offloader: %d transformer weights had no module (skipped)" % len(missing),
+                  flush=True)
+        tf_patcher = wire_streamed(tf, load_device, dtype, manual_cast, build,
+                                   prefetch=(stream and use_vbar), lora_files=lora_files)
 
     # Text encoder: the fp8 quant path owns its own compute dtype (no manual_cast); a plain
     # streamed encoder goes on comfy's text_encoder_device (CPU under vram_state SHARED, e.g. MPS)
     # and is wired like the transformer, so only the conditioning crosses to the compute device.
     if text_encoder.get("quant"):
-        te, unexpected = adapter.load_quant_text_encoder(
+        te, unexpected = adapter.load_quant_single_file(
             lambda: text_encoder["meta"](dtype), text_encoder["file"], load_device, dtype,
             convert=text_encoder.get("convert"))
         if unexpected:

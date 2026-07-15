@@ -113,6 +113,36 @@ def _prep_rmsnorm(module):
         module.elementwise_affine = True
 
 
+def _rmsnorm_matches_fused(module):
+    """True when re-classing this custom RMSNorm to comfy's fused RMSNorm would preserve its math.
+
+    comfy's RMSNorm runs `F.rms_norm(input, normalized_shape, weight, eps)` -- the weight applied
+    verbatim. A module whose forward transforms the weight first (diffusers' Krea2RMSNorm
+    normalizes by `1 + weight`, its scale stored zero-centered) would silently lose that, so it has
+    to keep its OWN forward -- which is what ComfyUI runs anyway: comfy hands a model `operations`
+    for its Linear/Conv leaves, it never swaps out the model's norm.
+
+    Probed structurally rather than by class name: hand the module a real random weight (its own is
+    still meta here) and compare its forward against the exact fused call the re-class would make.
+    That also guards the eps/normalized_shape _prep_rmsnorm just inferred. Anything that does not
+    match -- unknown convention, wrong eps, a probe that raises -- returns False and keeps the
+    module's forward, so the re-class can only ever be a no-op speedup."""
+    import torch.nn.functional as F
+    saved = module.weight
+    try:
+        weight = torch.randn(tuple(module.weight.shape))
+        module.weight = torch.nn.Parameter(weight, requires_grad=False)
+        probe = torch.randn(2, weight.shape[-1])
+        with torch.no_grad():
+            own = module(probe).float()
+        fused = F.rms_norm(probe, module.normalized_shape, weight, module.eps)
+        return bool(torch.allclose(own, fused, atol=1e-4))
+    except Exception:
+        return False
+    finally:
+        module.weight = saved
+
+
 def pick_operations(weight_dtype, compute_dtype, load_device=None):
     """ComfyUI's own op-namespace selector (comfy.ops.pick_operations): returns `manual_cast` when
     the compute dtype differs from the weight dtype (every leaf casts, comfy_cast_weights=True at
@@ -143,8 +173,13 @@ def comfy_ize(model, operations=None):
             continue
 
         # Custom RMSNorm needs normalized_shape/eps before re-classing so F.rms_norm can read them.
+        # Only re-class when the fused op provably reproduces the module's own forward: a norm with
+        # its own weight convention (Krea2RMSNorm's `1 + weight`) keeps its forward, exactly as
+        # ComfyUI runs it -- keep_uncastable_resident then places it (a norm's weight is tiny).
         if target is rms_cls and not isinstance(m, torch.nn.RMSNorm):
             _prep_rmsnorm(m)
+            if not _rmsnorm_matches_fused(m):
+                continue
 
         # Re-class the live instance. torch.nn.X subclasses share a compatible object layout, so
         # __class__ assignment is valid; diffusers custom subclasses that add only config (no
@@ -499,7 +534,7 @@ def mixed_precision_operations(compute_dtype, load_device, quant_config):
     carries quant_config, which adapter.pick_operations never reaches. Formats the compute device
     can't run natively are `disabled` -> emulated dequant, exactly as ComfyUI: on Ampere (no fp8
     tensor cores) float8 runs emulated (dequant to compute_dtype per forward). Reused by
-    load_quant_text_encoder."""
+    load_quant_single_file."""
     disabled = set()
 
     if not mm.supports_fp8_compute(load_device):
@@ -539,21 +574,22 @@ def _quant_ize(model, operations, compute_dtype):
     return count
 
 
-def load_quant_text_encoder(build_meta, weight_file, load_device, compute_dtype, convert=None):
-    """stream_single_file's fp8 sibling: build a diffusers/transformers module whose Linear weights
-    are loaded as comfy QuantizedTensors from a ComfyUI scaled-fp8 single file, kept fp8 (mmap
-    ~8.7GB, dequantized per forward -- "what comfy does"). Meta-build via build_meta() (no weight
-    RAM), mmap the file (load_torch_file), run comfy's convert_old_quants (classic
-    scale_weight/scale_input -> weight_scale/input_scale + .comfy_quant markers), detect the quant,
+def load_quant_single_file(build_meta, weight_file, load_device, compute_dtype, convert=None):
+    """stream_single_file's fp8 sibling for a ComfyUI scaled-fp8 single file (transformer OR text
+    encoder), kept fp8 (mmap, dequantized per forward -- "what comfy does"). Meta-build via
+    build_meta() (no weight RAM), mmap the file (load_torch_file, with metadata), run comfy's
+    convert_old_quants -- which injects the .comfy_quant markers from either the classic
+    scaled_fp8 + scale_weight keys OR the file's `_quantization_metadata` -- detect the quant,
     re-class Linears to the mixed-precision namespace (+ comfy_ize the rest), optionally `convert`
-    the state-dict keys (e.g. a flat->nested rename), then load_state_dict(assign=True) so each quant
-    Linear builds its QuantizedTensor. Returns (model, unexpected_keys)."""
+    the state-dict keys (e.g. a flat->nested rename), then load_state_dict(assign=True) so each
+    quant Linear builds its QuantizedTensor. Returns (model, unexpected_keys)."""
     import comfy.utils as cu
 
     model = build_meta()
 
-    sd = cu.load_torch_file(weight_file, device=torch.device("cpu"))
-    sd, _meta = cu.convert_old_quants(sd, "", {})
+    sd, metadata = cu.load_torch_file(weight_file, device=torch.device("cpu"),
+                                      return_metadata=True)
+    sd, metadata = cu.convert_old_quants(sd, model_prefix="", metadata=metadata)
     quant_config = cu.detect_layer_quantization(sd, "")
 
     if convert is not None:
