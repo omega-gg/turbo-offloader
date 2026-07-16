@@ -2,8 +2,11 @@
 
 turbo-offloader is a [turboCLI](https://omega.gg/turboCLI) high performance offloader based on [ComfyUI](https://github.com/comfy-org/comfyui).
 It improves generate times substantially through optimal memory allocations when the model does not
-fit into RAN / VRAM, even on a low end GPU. It's particularly efficient for CUDA GPU(s) but also
+fit into RAM / VRAM, even on a low end GPU. It's particularly efficient for CUDA GPU(s) but also
 works on CPU and Apple MPS.
+
+- [Dummy](dummy.md) - plain-English introduction, no diffusion background required
+- [Implementation](implementation.md) - architecture and implementation choices, kept up to date
 
 ## ComfyUI
 
