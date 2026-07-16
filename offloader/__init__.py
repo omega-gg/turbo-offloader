@@ -361,6 +361,10 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
 
         p.encode_prompt = _encode_on_te
 
+    # ComfyUI's sampler->VAE node boundary (DiT VBAR residency becomes evictable before the VAE
+    # needs VRAM) + its OOM fallback: regular decode/encode, retry tiled (comfy/sd.py:1080).
+    adapter.install_tiled_vae_fallback(p, node_boundary=node_teardown)
+
     # The TE->transformer node boundary ComfyUI has and a diffusers pipeline doesn't: run comfy's
     # per-node teardown once the encoder is done, before the denoise loop, exactly as
     # comfy/execution.py:543-549 does between CLIPTextEncode and KSampler. Installed BEFORE the
@@ -554,10 +558,15 @@ def reclaim(pipe):
 
     node_teardown()
 
-    dev = getattr(pipe, "_offloader_device", None)
-    if dev is not None:
-        mm.free_memory(mm.minimum_inference_memory(), dev)
-    mm.soft_empty_cache()
+    # After a hard CUDA OOM even mem_get_info raises; reclaim runs on the error path too, so a
+    # failure here must not bury the real exception under a cleanup cascade.
+    try:
+        dev = getattr(pipe, "_offloader_device", None)
+        if dev is not None:
+            mm.free_memory(mm.minimum_inference_memory(), dev)
+        mm.soft_empty_cache()
+    except Exception:
+        print(traceback.format_exc(), flush=True)
 
 
 def release(pipe):

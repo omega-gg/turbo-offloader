@@ -360,6 +360,25 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   across runs), `_rmsnorm_matches_fused`, stochastic rounding, `cudnn.benchmark`, and the
   cast/uncast pairing (measured: 2460/2460 Linear, 1785/1785 RMSNorm).
 
+- **The sampler→VAE boundary (`install_tiled_vae_fallback`) — krea2 1600×1200 OOM'd + aborted.**
+  Same bug class at the pipeline's other seam: ComfyUI's KSampler node ENDS before VAEDecode, so
+  the teardown has run and `VAE.decode` then hands its working-memory estimate to
+  `load_models_gpu(memory_required=memory_used_decode(...))` (comfy/sd.py:1057-1058), whose guts
+  are `free_memory(max(inference_memory, memory_required + extra_reserved_memory()))`
+  (model_management.py:854,911) — the DiT is evicted through free_memory's CONTROLLED path before
+  the VAE's first kernel. A diffusers pipeline calls `vae.decode` inside the same `__call__`: the
+  DiT stayed pinned (measured: 2.66 GB held, 0 free) and a 1600×1200 decode died after all 8 steps
+  — and both halfway fixes crash: without the pre-free, the OOM poisons the context and even the
+  tiled retry / tensor deallocs abort (C++ throw in a destructor → terminate); with only the
+  watermark reset, the first cudnn workspace request evicts on demand INSIDE the allocator and
+  aborts on the VAE's first conv3d. Fix, comfy verbatim: at `vae.decode`/`encode`,
+  `node_teardown()` + the `memory_used` estimate (comfy's own Wan-2.1 / AutoencoderKL constants,
+  sd.py:757-758 / :481-482, keyed only off tensor rank) + `free_memory`, then comfy's OOM fallback
+  (sd.py:1080-1087: `raise_non_oom`, warn, flag-retry OUTSIDE the except so the exception's tensor
+  refs can gc, tiled via diffusers' `enable_tiling` — same 256px/64px tiles as comfy's
+  `decode_tiled_3d` defaults). Result: krea2 1600×1200 decodes clean — untiled, the fallback never
+  even fires — and z-image stays bit-identical.
+
 ## Notes
 
 - **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` reads the transformer straight

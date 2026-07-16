@@ -939,6 +939,88 @@ def build_dynamic_patcher(model, load_device=None, offload_device=None, size=0):
                                              offload_device=offload_device, size=size)
 
 
+def _vae_memory_used(kind, shape, dtype):
+    """ComfyUI's VAE working-memory estimates, copied verbatim from comfy/sd.py: the Wan 2.1 VAE
+    pair for video-style (B,C,T,H,W) tensors (:757-758 -- the Qwen-Image / Krea 2 VAE) and the
+    AutoencoderKL pair for classic (B,C,H,W) tensors (:481-482, VAE_KL_MEM_RATIO=1.0). The
+    constants embed comfy's empirical safety margins; an under-estimate only means the OOM
+    fallback fires, an over-estimate only evicts more of the streamed models."""
+    if len(shape) >= 5:
+        if kind == "decoding":
+            return (2200 if shape[2] <= 4 else 7000) * shape[3] * shape[4] * (8 * 8) \
+                * mm.dtype_size(dtype)
+        return (1500 if shape[2] <= 4 else 6000) * shape[3] * shape[4] * mm.dtype_size(dtype)
+    if kind == "decoding":
+        return (2178 * shape[2] * shape[3] * 64) * mm.dtype_size(dtype)
+    return (1767 * shape[2] * shape[3]) * mm.dtype_size(dtype)
+
+
+def install_tiled_vae_fallback(pipe, node_boundary=None):
+    """ComfyUI's sampler->VAE node boundary + its VAE out-of-memory fallback.
+
+    `node_boundary` (the seam's node_teardown) runs first: in ComfyUI the KSampler node ENDS before
+    VAEDecode begins, so the teardown has already reset the VBAR watermarks and the DiT's residency
+    is evictable when the VAE needs VRAM. A diffusers pipeline calls vae.decode inside the same
+    __call__, so without this boundary the DiT still pins its VRAM (measured: 2.66GB held, 0 free)
+    and a 1600x1200 decode dies on one ~1.4GB fp32 upsample after all 8 steps succeeded.
+
+    Then comfy/sd.py:1057-1058: estimate the call's working memory (`memory_used_decode`) and hand
+    it to load_models_gpu as memory_required BEFORE the first kernel. For an already-resident VAE
+    load_models_gpu's guts are free_memory(max(inference_memory, memory_required +
+    extra_reserved_memory())) (model_management.py:854,911) -- the CONTROLLED eviction of the
+    streamed models. Skipping this and letting the first big cudnn workspace request evict on
+    demand inside the allocator dies with an uncatchable C++ abort instead of a catchable OOM
+    (measured: the abort fires on the VAE's first conv3d).
+
+    Then the fallback itself (comfy/sd.py:1080-1087 decode, :1165-1168 encode): try the regular
+    call; on OOM, `raise_non_oom` anything else, warn with comfy's own wording, and only set a
+    flag -- comfy deliberately retries OUTSIDE the except block because "the exception itself refs
+    them all until we get out of this except block", so the tensors can gc first -- then retry
+    tiled. Comfy retries with its own tiler; a diffusers VAE ships the equivalent (`enable_tiling`,
+    seam-blended; the qwen VAE's 256px tile / 64px overlap equal comfy's decode_tiled_3d defaults,
+    sd.py:1097-1098), and the regular path is restored after, matching comfy's per-call semantics.
+    Model-agnostic: keyed only off the vae exposing enable_tiling. No-op without a vae, or if
+    already installed."""
+    vae = getattr(pipe, "vae", None)
+
+    if vae is None or not hasattr(vae, "enable_tiling") \
+            or getattr(vae, "_tiled_fallback_installed", False):
+        return
+
+    def wrap(real, kind):
+        def call(*args, **kwargs):
+            if node_boundary is not None:
+                node_boundary()
+            samples_in = args[0] if args else next(iter(kwargs.values()), None)
+            if hasattr(samples_in, "shape") and samples_in.device.type != "cpu":
+                memory_used = _vae_memory_used(
+                    kind, samples_in.shape, getattr(vae, "dtype", samples_in.dtype))
+                extra_mem = max(mm.minimum_inference_memory(),
+                                memory_used + mm.extra_reserved_memory())
+                mm.free_memory(extra_mem, samples_in.device)
+            do_tile = False
+            try:
+                return real(*args, **kwargs)
+            except Exception as e:
+                mm.raise_non_oom(e)
+                print("Warning: Ran out of memory when regular VAE %s, retrying with tiled VAE "
+                      "%s." % (kind, kind), flush=True)
+                do_tile = True
+            if do_tile:
+                mm.soft_empty_cache()
+                vae.enable_tiling()
+                try:
+                    return real(*args, **kwargs)
+                finally:
+                    vae.disable_tiling()
+        return call
+
+    vae.decode = wrap(vae.decode, "decoding")
+    if hasattr(vae, "encode"):
+        vae.encode = wrap(vae.encode, "encoding")
+    vae._tiled_fallback_installed = True
+
+
 def install_unpadded_encode(pipe):
     """Drop padded text tokens from the conditioning before it ever reaches the transformer.
 
