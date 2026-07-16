@@ -194,7 +194,13 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   s/step, matching ComfyUI; output seed-valid.
 - **`install_prefetch`** — drives ComfyUI's `comfy.model_prefetch` (`prefetch_queue_pop`) via
   forward hooks on the transformer's block lists, so block N+1's weights stream while block N
-  computes (overlap; helps when streaming-bound).
+  computes (overlap; helps when streaming-bound). This is comfy's own mechanism applied to models
+  ComfyUI doesn't enable it for: in their codebase only Lightricks/LTXV calls
+  `prefetch_queue_pop`; their krea2 forward stalls each block on its weights. It is why we beat
+  ComfyUI per-step under memory pressure — parity at 512² (3.50 vs 3.62 s/it, streaming mostly
+  hidden either way) growing to ~25% ahead at 1024×768 (6.97 vs ~8.5–9.8 s/it, same-seed
+  same-image runs, both cool-started): bigger activations leave less VRAM for weight residency,
+  more re-streaming per step, and we hide it behind compute while ComfyUI pays it serially.
 - **`use_comfy_attention`** — a verbatim copy of `comfy.ops.scaled_dot_product_attention`
   (`comfy/ops.py:39-64`): on Windows+CUDA it forces the SDPA priority
   `[CUDNN, FLASH, EFFICIENT, MATH]` **per call**, but only for large inputs
