@@ -2,7 +2,7 @@ TEMPLATE = subdirs
 
 OTHER_FILES += README.md  \
                LICENSE.md \
-               offloader.md   \
+               implementation.md \
                doc/aimdo_v1.md      \
                doc/AIMDO_V2_PLAN.md \
                doc/BENCHMARKING.md  \

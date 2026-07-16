@@ -1,9 +1,9 @@
 # turbo-offloader, explained simply
 
-This is the plain-English companion to `offloader.md`. It explains what turbo-offloader does and
-why, step by step, starting from zero — no image-diffusion background required. Each section is a
-little more technical than the one before. For the full design, mechanisms and benchmarks, read
-`offloader.md`; this document is kept up to date with it at every turbo-offloader iteration.
+This is the plain-English companion to `implementation.md`. It explains what turbo-offloader does
+and why, step by step, starting from zero — no image-diffusion background required. Each section
+is a little more technical than the one before. For the full design, mechanisms and benchmarks,
+read `implementation.md`; this document is kept up to date with it at every iteration.
 
 ## What is this?
 
@@ -128,7 +128,7 @@ forces a choice.
 
 ## A few technical details worth knowing
 
-Each of these is one sentence here and a full section in `offloader.md`:
+Each of these is one sentence here and a full section in `implementation.md`:
 
 - **Precision juggling** — weights are stored compact (bf16/fp16) and computed in whatever the
   hardware does best (`manual_cast`), with an fp16 overflow clamp that prevents black images.
@@ -148,7 +148,7 @@ Each of these is one sentence here and a full section in `offloader.md`:
 
 ## Where to go next
 
-- `offloader.md` — the full design document: every mechanism, rationale, and benchmark tables.
+- `implementation.md` — the full design document: every mechanism, rationale, and benchmark tables.
 - `doc/COMFYUI_OFFLOAD_MAP.md` — a map of ComfyUI's offloading internals with line references.
 - `doc/BENCHMARKING.md` — how turbo and ComfyUI are compared head-to-head.
 - `offloader/comfy/resync.md` — how the vendored ComfyUI snapshot is kept in sync.
@@ -156,5 +156,6 @@ Each of these is one sentence here and a full section in `offloader.md`:
 ## Keeping this document up to date
 
 This file describes the current architecture and is revised with each turbo-offloader iteration:
-whenever behaviour documented in `offloader.md` changes, the matching plain-English section here
-changes with it. If the two ever disagree, `offloader.md` is right and this file has a bug.
+whenever behaviour documented in `implementation.md` changes, the matching plain-English section
+here changes with it. If the two ever disagree, `implementation.md` is right and this file has
+a bug.
