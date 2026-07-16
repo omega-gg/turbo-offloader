@@ -361,6 +361,21 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
 
         p.encode_prompt = _encode_on_te
 
+    # The TE->transformer node boundary ComfyUI has and a diffusers pipeline doesn't: run comfy's
+    # per-node teardown once the encoder is done, before the denoise loop, exactly as
+    # comfy/execution.py:543-549 does between CLIPTextEncode and KSampler. Installed BEFORE the
+    # cache so it is the encoder's own boundary -- a cache hit never runs the encoder, so (like a
+    # cached comfy node) it needs no teardown.
+    if getattr(p, "encode_prompt", None) is not None:
+        _encode = p.encode_prompt
+
+        def _encode_then_teardown(*args, **kwargs):
+            out = _encode(*args, **kwargs)
+            node_teardown()
+            return out
+
+        p.encode_prompt = _encode_then_teardown
+
     # Drop padded text tokens (ComfyUI never pads, and drops an all-ones mask): a pipeline padding
     # to a fixed width would otherwise run those dead tokens through every block. Wrapped BEFORE
     # install_encode_cache so the cache stores the unpadded result.
@@ -496,35 +511,48 @@ def prepare(pipe):
     mm.load_models_gpu(patchers)
 
 
-def reclaim(pipe):
-    """Per-generation housekeeping: run ComfyUI's per-execution offloader teardown, then free
-    non-resident models + return the allocator pool.
+def node_teardown():
+    """ComfyUI's per-NODE offloader teardown, verbatim: reset_cast_buffers +
+    cleanup_prefetch_queues + vbars_reset_watermark_limits -- what comfy runs in the `finally`
+    after EVERY node execution when the offloader is on (comfy/execution.py:543-549). It resets the
+    globally-cached per-stream cast buffers, the block prefetch queues and the VBAR watermarks.
 
-    The teardown copies what ComfyUI runs in the `finally` after EVERY node execution when
-    offloader is on (comfy/execution.py:544-549): reset_cast_buffers + cleanup_prefetch_queues +
-    vbars_reset_watermark_limits. It resets the VBAR streaming state (the globally-cached cast
-    buffers, the block prefetch queues, the VBAR watermarks) between generations. reclaim() is our
-    analog of that per-execution boundary, so we do the same thing ComfyUI does. (This is faithful
-    teardown / hygiene; it is NOT what fixed the flux2->z-image first-gen nondeterminism -- that
-    was copying
-    ComfyUI's exact SDPA size gate in adapter.use_comfy_attention.)"""
+    ComfyUI gets these boundaries for free because its graph is nodes: CLIPTextEncode ends, the
+    teardown runs, THEN KSampler starts. A diffusers pipeline has no such boundary -- encode_prompt
+    flows straight into the denoise loop -- so without calling this ourselves the text encoder's
+    cast buffers and stream state leak into the transformer's first forwards. That is not just
+    untidy: with 2 async offload streams it made z-image NON-DETERMINISTIC at a fixed seed (the
+    drift appears at forward 3, the first VBAR eviction) and left the DiT starved of the VRAM the
+    encoder still held (z-image 512^2: 1.83 -> 1.00 s/it once the boundary is honoured).
+    No-op unless comfy-aimdo is active."""
+    import comfy.model_management as mm
+    import comfy.memory_management as memm
+
+    if not getattr(memm, "aimdo_enabled", False):
+        return
+
+    try:
+        mm.reset_cast_buffers()
+
+        import comfy.model_prefetch as mp
+        mp.cleanup_prefetch_queues()
+
+        import comfy_aimdo.model_vbar as mv
+        mv.vbars_reset_watermark_limits()
+    except Exception:
+        print(traceback.format_exc(), flush=True)
+
+
+def reclaim(pipe):
+    """Per-generation housekeeping: run ComfyUI's per-node offloader teardown (node_teardown --
+    the same one we run at the encode boundary), then free non-resident models + return the
+    allocator pool."""
     if not getattr(pipe, "_offloader_patchers", None):
         return
 
     import comfy.model_management as mm
-    import comfy.memory_management as memm
 
-    if getattr(memm, "aimdo_enabled", False):
-        try:
-            mm.reset_cast_buffers()
-
-            import comfy.model_prefetch as mp
-            mp.cleanup_prefetch_queues()
-
-            import comfy_aimdo.model_vbar as mv
-            mv.vbars_reset_watermark_limits()
-        except Exception:
-            print(traceback.format_exc(), flush=True)
+    node_teardown()
 
     dev = getattr(pipe, "_offloader_device", None)
     if dev is not None:

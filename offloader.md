@@ -333,6 +333,33 @@ bit-deterministic across runs at a fixed seed (verified: two seed-42 runs, ident
 z-image-turbo (20 GB) is not benchmarked here — its working set exceeds this 8 GB box's usable
 RAM+swap headroom, so it belongs on a larger-RAM Mac.
 
+## The node boundary (`node_teardown`)
+
+- **z-image was non-deterministic at a fixed seed — fixed by honouring ComfyUI's node boundary.**
+  Two runs, same seed, differed (meandiff ~6–14/255: chaotic amplification of a small drift over 8
+  steps, not different noise). Both `z-image-turbo` and `comfy-z-image-turbo`, never krea2 (fp8
+  quant route), only at 512²+ (needs VBAR eviction pressure), diverging at **forward 3** — the
+  first eviction. Pre-dates the krea2 work (present at `82508b2`).
+
+  Root cause: **ComfyUI tears down the offload state after every node**
+  (`comfy/execution.py:543-549`: `reset_cast_buffers` + `cleanup_prefetch_queues` +
+  `vbars_reset_watermark_limits`), so CLIPTextEncode's per-stream cast buffers, prefetch queues and
+  VBAR watermarks are gone before KSampler starts. A diffusers pipeline has **no node boundary** --
+  `encode_prompt` flows straight into the denoise loop -- so the text encoder's stream/buffer state
+  leaked into the transformer's forwards: with 2 async offload streams that raced (non-determinism)
+  **and** starved the DiT of VRAM the encoder still held.
+
+  Fix: `node_teardown()` -- the same three comfy calls, verbatim -- runs after `encode_prompt`
+  (installed in `_finalize_pipe`, under the encode cache so a cache hit, like a cached comfy node,
+  skips it) and in `reclaim()`. Result at 512²: both z-image engines **bit-identical across runs**
+  (3/3, same md5) and **faster** -- 1.83 → ~1.4 s/it -- with the default 2 streams kept. Clamping
+  `--async-offload` to 1/0 also cured it (+37/46% cost), which is how the race was pinned before
+  the real boundary was found. Ruled out on the way, each by test: `install_prefetch`,
+  `use_comfy_attention`, cuDNN attention, `_assign_sd` vs `load_state_dict(assign=True)`, VBAR
+  itself (comfy is deterministic on it), seeding, the text encoder (conditioning hash identical
+  across runs), `_rmsnorm_matches_fused`, stochastic rounding, `cudnn.benchmark`, and the
+  cast/uncast pairing (measured: 2460/2460 Linear, 1785/1785 RMSNorm).
+
 ## Notes
 
 - **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` reads the transformer straight
