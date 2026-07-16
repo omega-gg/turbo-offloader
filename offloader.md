@@ -294,6 +294,7 @@ Windows 11 · torch 2.12 + cu130.
 | comfy-z-image-turbo (20 GB) | CUDA | 1024×768 | 8 | ~4.5 s/it (≈ z-image-turbo) | VBAR stream |
 | comfy-qwen-image-edit-2511-lightning (41 GB DiT + 9 GB fp8 TE) | CUDA | 512×512 | 4 | ~22 s/it (vs stock ~31) | VBAR stream |
 | comfy-krea2-turbo (13 GB fp8 DiT + 9 GB fp8 TE) | CUDA | 512×512 | 8 | ~3.5 s/it (ComfyUI ~3.6) | VBAR stream, both fp8 |
+| comfy-krea2-turbo | CUDA | 1024×768 | 8 | ~7.0 s/it (ComfyUI ~8.5–9.8) | VBAR stream, both fp8 |
 | flux2-4b | CPU | 512×512 | 4 | ~220 s | stream |
 | flux2-4b | CPU | 1024×768 | 4 | ~325 s | stream |
 | z-image-turbo (20 GB) | CPU | 512×512 | 8 | ~315 s | stream |
@@ -312,7 +313,9 @@ else the ~1 GB input `Embedding` stays pinned resident and starves the 41 GB DiT
 5.17 s/it until `install_unpadded_encode` stopped feeding the DiT 500 padding tokens. It is quoted
 from two independent thermal states rather than one reading — cool 3.50 vs 3.62, mid-session
 throttled 13.33 vs 13.46 — because on this laptop a single number says more about temperature than
-about code (z-image measured 13.4 against its ~4.5 row in that same window). The qwen speed-up over
+about code (z-image measured 13.4 against its ~4.5 row in that same window). At 1024×768 (both
+cool-started, 58/61 °C, same-seed same-image) the parity becomes a ~25% lead — the prefetch
+advantage above grows with memory pressure. The qwen speed-up over
 stock is because its DiT **exceeds the 32 GB RAM** (disk-stream-bound), where comfy has two edges:
 the fp8 TE is 9 GB vs
 stock's 16.6 GB bf16, leaving ~7 GB more page cache for the DiT; and it streams from one contiguous
