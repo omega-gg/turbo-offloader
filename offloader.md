@@ -217,8 +217,16 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   shim + a module-scoped patch of `diffusers.models.embeddings.apply_rotary_emb`. Lazy:
   comfy-kitchen is imported only on a matching call, so engines with their own rope (z-image) never
   touch it. It engages for comfy-krea2-turbo but buys no measurable per-step there (rope is a small
-  slice of a 12B DiT); `OFFLOADER_KITCHEN_ROPE=0` leaves the per-step unchanged (4.96 vs 4.93 s/it)
-  and only drops comfy-kitchen's ~16 s init off the load.
+  slice of a 12B DiT; `OFFLOADER_KITCHEN_ROPE=0` leaves the per-step unchanged, 4.96 vs 4.93 s/it).
+  Its init is ~0.3 s marginal per process (torch is already imported; an earlier ~16 s reading was
+  a cold-cache/thermal artifact -- order-reversed A/B totals are equal, 55 s vs 55 s). Worth
+  keeping on regardless of speed: comfy's `apply_rope1` is NOT bit-equivalent to diffusers' native
+  rope (measured: different image md5, each path individually deterministic), so it is what keeps
+  the output on ComfyUI's exact numerics. The packed freqs_cis is cached by
+  (cos, sin) tensor identity — ComfyUI builds `freqs` once per forward and hands it to every block
+  (`ldm/krea2/model.py:267`), and diffusers passes one (cos, sin) tuple to all blocks, so the
+  pack is loop-invariant: 56 rebuilds/step on krea2 (~9 ms, ~90 MB fp32 churn) collapse to one
+  per generation. Verified bit-identical.
 - **fused RMSNorm** — routing custom norms through `disable_weight_init.RMSNorm` gives ComfyUI's
   fused `F.rms_norm` (≈ 3.5× the eager `mul`/`rsqrt` diffusers/transformers use).
 

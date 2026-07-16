@@ -748,8 +748,15 @@ def _build_freqs_cis(cos, sin):
 def _make_kitchen_rope(orig):
     """Build the replacement for a diffusers `apply_rotary_emb`. `orig` is the module's own binding
     (the fall-through target). comfy_kitchen is resolved LAZILY on the first *matching* call, so a
-    module whose calls never match (or a model we patch but never run) imports nothing."""
+    module whose calls never match (or a model we patch but never run) imports nothing.
+
+    The packed freqs_cis is cached by (cos, sin) tensor identity: ComfyUI builds `freqs` ONCE per
+    forward and hands it to every block (comfy/ldm/krea2/model.py:267), and diffusers likewise
+    passes one (cos, sin) tuple to every block's apply_rotary_emb -- so the pack is loop-invariant.
+    Rebuilding it per call was 2 x 28 = 56 builds/step on krea2, each allocating a ~1.6 MB fp32
+    tensor (~9 ms/step, ~90 MB of allocator churn). The cache's strong refs keep the ids valid."""
     ck_state = {"ck": None, "resolved": False}
+    cache = {"cos": None, "sin": None, "dim": None, "fc": None}
 
     def _ck():
         if not ck_state["resolved"]:
@@ -776,14 +783,17 @@ def _make_kitchen_rope(orig):
             return orig(x, freqs_cis, use_real, use_real_unbind_dim, sequence_dim)
 
         cos, sin = freqs_cis  # [S, D]
-        # Same broadcast diffusers applies (embeddings.py), so freqs_cis lands on the right axis.
-        if sequence_dim == 2:
-            cos, sin = cos[None, None, :, :], sin[None, None, :, :]
-        else:
-            cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-
-        fc = _build_freqs_cis(cos.to(x.device), sin.to(x.device))
-        return ck.apply_rope1(x, fc)
+        if (cache["cos"] is not cos or cache["sin"] is not sin or cache["dim"] != sequence_dim
+                or cache["fc"].device != x.device):
+            # Same broadcast diffusers applies (embeddings.py), so freqs_cis lands on the right
+            # axis.
+            if sequence_dim == 2:
+                cos_b, sin_b = cos[None, None, :, :], sin[None, None, :, :]
+            else:
+                cos_b, sin_b = cos[None, :, None, :], sin[None, :, None, :]
+            cache.update(cos=cos, sin=sin, dim=sequence_dim,
+                         fc=_build_freqs_cis(cos_b.to(x.device), sin_b.to(x.device)))
+        return ck.apply_rope1(x, cache["fc"])
 
     apply_rotary_emb._offloader_kitchen = True
     return apply_rotary_emb
