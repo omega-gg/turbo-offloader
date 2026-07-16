@@ -9,6 +9,9 @@ disk→VRAM via comfy-aimdo file-slices for a model larger than RAM.
 
 **Style:** code and comments wrap at 99 columns.
 
+**New here?** `dummy.md` is the plain-English introduction — what the offloader does and why, step
+by step, no diffusion background required. It is kept up to date with each iteration of this doc.
+
 ## Layout
 
 ```
