@@ -756,7 +756,7 @@ def _make_kitchen_rope(orig):
     Rebuilding it per call was 2 x 28 = 56 builds/step on krea2, each allocating a ~1.6 MB fp32
     tensor (~9 ms/step, ~90 MB of allocator churn). The cache's strong refs keep the ids valid."""
     ck_state = {"ck": None, "resolved": False}
-    cache = {"cos": None, "sin": None, "dim": None, "fc": None}
+    cache = {"cos": None, "sin": None, "dim": None, "freqs_cis": None}
 
     def _ck():
         if not ck_state["resolved"]:
@@ -784,7 +784,7 @@ def _make_kitchen_rope(orig):
 
         cos, sin = freqs_cis  # [S, D]
         if (cache["cos"] is not cos or cache["sin"] is not sin or cache["dim"] != sequence_dim
-                or cache["fc"].device != x.device):
+                or cache["freqs_cis"].device != x.device):
             # Same broadcast diffusers applies (embeddings.py), so freqs_cis lands on the right
             # axis.
             if sequence_dim == 2:
@@ -792,8 +792,9 @@ def _make_kitchen_rope(orig):
             else:
                 cos_b, sin_b = cos[None, :, None, :], sin[None, :, None, :]
             cache.update(cos=cos, sin=sin, dim=sequence_dim,
-                         fc=_build_freqs_cis(cos_b.to(x.device), sin_b.to(x.device)))
-        return ck.apply_rope1(x, cache["fc"])
+                         freqs_cis=_build_freqs_cis(cos_b.to(x.device),
+                                                    sin_b.to(x.device)))
+        return ck.apply_rope1(x, cache["freqs_cis"])
 
     apply_rotary_emb._offloader_kitchen = True
     return apply_rotary_emb
