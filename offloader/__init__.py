@@ -393,11 +393,14 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
     return p
 
 
-def wire_streamed(model, load_device, dtype, manual_cast, build, prefetch=False, lora_files=None):
+def wire_streamed(model, load_device, dtype, manual_cast, build, prefetch=False, lora_files=None,
+                  lora_key_map=None):
     """Shared post-load wiring for a streamed big model: keep stragglers resident, ComfyUI
     attention + fused rope (both no-op unless the module matches), optional VBAR prefetch +
     manual_cast + LoRA, then wrap in the (dynamic) patcher. Model-agnostic -- keyed off module
-    structure, names nothing. Returns the patcher."""
+    structure, names nothing. Returns the patcher. lora_key_map: engine-supplied
+    {lora_key -> model key} entries (comfy's model_lora_keys_unet vocabulary, see
+    adapter.add_lora) for published namings that differ from the model's own."""
     from . import adapter
 
     adapter.keep_uncastable_resident(model, load_device, manual_cast)
@@ -411,7 +414,7 @@ def wire_streamed(model, load_device, dtype, manual_cast, build, prefetch=False,
     patcher = build(model)
 
     if lora_files:
-        n = adapter.add_lora(patcher, lora_files)
+        n = adapter.add_lora(patcher, lora_files, key_map=lora_key_map)
         print("offloader: applied %d LoRA patches" % n, flush=True)
 
     return patcher
@@ -421,7 +424,8 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
                     lora_files=None):
     """Model-agnostic assembly of a ComfyUI-reuse pipeline on the disk-stream offloader. The engine
     (engine/<id>.py) supplies every model-specific piece as data:
-        transformer  = {"meta": fn(dtype)->module, "file": path, "convert": ..., "quant": bool}
+        transformer  = {"meta": fn(dtype)->module, "file": path, "convert": ..., "quant": bool,
+                        "lora_keys": fn()->dict}  # optional; comfy model_lora_keys_unet entries
         text_encoder = {"meta": fn(dtype)->module, "file": path, "convert": ..., "quant": bool}
         components   = {<pipeline __init__ arg>: prebuilt module, ...}  # vae/tokenizer/scheduler
     The offloader streams the two big models from their ComfyUI single files (stream_single_file
@@ -455,7 +459,8 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
         if unexpected:
             print("offloader: %d transformer quant keys unexpected" % len(unexpected), flush=True)
         tf_patcher = wire_streamed(tf, load_device, dtype, None, build,
-                                   prefetch=(stream and use_vbar), lora_files=lora_files)
+                                   prefetch=(stream and use_vbar), lora_files=lora_files,
+                                   lora_key_map=transformer.get("lora_keys", dict)())
     else:
         tf, missing = adapter.stream_single_file(
             lambda: transformer["meta"](dtype), transformer["file"], operations,
@@ -464,7 +469,8 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
             print("offloader: %d transformer weights had no module (skipped)" % len(missing),
                   flush=True)
         tf_patcher = wire_streamed(tf, load_device, dtype, manual_cast, build,
-                                   prefetch=(stream and use_vbar), lora_files=lora_files)
+                                   prefetch=(stream and use_vbar), lora_files=lora_files,
+                                   lora_key_map=transformer.get("lora_keys", dict)())
 
     # Text encoder: the fp8 quant path owns its own compute dtype (no manual_cast); a plain
     # streamed encoder goes on comfy's text_encoder_device (CPU under vram_state SHARED, e.g. MPS)

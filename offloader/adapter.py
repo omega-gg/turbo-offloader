@@ -897,41 +897,33 @@ def install_prefetch(model):
     return len(sequences)
 
 
-_LORA_SUFFIXES = (".lora_down.weight", ".lora_up.weight", ".lora_A.weight", ".lora_B.weight",
-                  ".alpha", ".dora_scale", ".diff", ".diff_b")
-
-
-def add_lora(patcher, lora_specs):
-    """Apply LoRAs on-cast, ComfyUI-style: build the {lora_base_key -> model_weight_key} map, hand
-    it to comfy.lora.load_lora (which uses the vendored weight_adapter classes to read lora_up/down
-    or lora_A/B + alpha), and register the result via ModelPatcher.add_patches. The patches become
-    LowVramPatch weight_functions that comfy.lora.calculate_weight applies while each weight
-    streams
-    in -- no fusing, no extra resident copy. lora_specs is [(path, strength), ...]."""
+def add_lora(patcher, lora_specs, key_map=None):
+    """Apply LoRAs on-cast, ComfyUI-style: build the {lora_key -> model_weight_key} map exactly as
+    comfy.lora.model_lora_keys_unet does, hand it whole to comfy.lora.load_lora (which uses the
+    vendored weight_adapter classes to read lora_up/down, lora_A/B, lokr/loha, diff + alpha --
+    only bases whose tensors exist in the file are picked), and register the result via
+    ModelPatcher.add_patches. The patches become LowVramPatch weight_functions that
+    comfy.lora.calculate_weight applies while each weight streams in -- no fusing, no extra
+    resident copy. lora_specs is [(path, strength), ...]. key_map: engine-supplied entries for
+    published namings that differ from the model's own (e.g. ComfyUI-native Krea2 keys on our
+    diffusers module tree); the generic entries below are comfy's model_lora_keys_unet generic
+    branch applied to the model's named_parameters (our model IS the target layout)."""
     import comfy.utils as cu
     import comfy.lora as clora
 
-    model_keys = set(n for n, _ in patcher.model.named_parameters())
+    key_map = dict(key_map) if key_map else {}
+    for k, _ in patcher.model.named_parameters():
+        if k.endswith(".weight"):
+            key_lora = k[:-len(".weight")]
+            key_map.setdefault(key_lora, k)  # generic lora format without any weird key names
+            key_map.setdefault("transformer.{}".format(key_lora), k)
+            key_map.setdefault("diffusion_model.{}".format(key_lora), k)
+            key_map.setdefault("lora_unet_{}".format(key_lora.replace(".", "_")), k)
+
     applied = 0
     for path, strength in lora_specs:
         sd = cu.load_torch_file(path, safe_load=True)
-        bases = set()
-        for k in sd:
-            for suf in _LORA_SUFFIXES:
-                if k.endswith(suf):
-                    bases.add(k[:-len(suf)])
-                    break
-        to_load = {}
-        for base in bases:
-            mk = base
-            for pre in ("transformer.", "diffusion_model.", "lora_unet_"):
-                if mk.startswith(pre):
-                    mk = mk[len(pre):]
-                    break
-            mk = mk + ".weight"
-            if mk in model_keys:
-                to_load[base] = mk
-        patch_dict = clora.load_lora(sd, to_load, log_missing=False)
+        patch_dict = clora.load_lora(sd, key_map, log_missing=False)
         patcher.add_patches(patch_dict, strength)
         applied += len(patch_dict)
     return applied

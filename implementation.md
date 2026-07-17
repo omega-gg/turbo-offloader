@@ -107,9 +107,14 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
   rotary caches) to the compute device so nothing is stranded on the offload device mid-forward.
   Under manual_cast (below) it also casts float stragglers to the compute dtype, matching ComfyUI's
   params being built in that dtype.
-- **`add_lora`** — on-cast LoRA: build the `{lora_key → model_weight_key}` map, hand it to
-  `comfy.lora.load_lora` (vendored `weight_adapter`), register via `ModelPatcher.add_patches`. The
-  deltas apply while each weight streams in — no fuse, no resident copy.
+- **`add_lora`** — on-cast LoRA: build the `{lora_key → model_weight_key}` map the way ComfyUI's
+  `model_lora_keys_unet` does (same generic aliases: bare / `transformer.` / `diffusion_model.` /
+  `lora_unet_`), hand it whole to `comfy.lora.load_lora` (vendored `weight_adapter`), register via
+  `ModelPatcher.add_patches`. `load_lora` picks only the bases present in the file, so every
+  published naming and format loads — lora_up/down, lora_A/B, `diff`, **LoKr/LoHa** — from one
+  path. The engine may supply extra namings via the `lora_keys` spec (below); Krea2 uses it to map
+  ComfyUI-native keys onto the diffusers module tree. Deltas apply while each weight streams in —
+  no fuse, no resident copy.
 - **`install_unpadded_encode`** — drop padded text tokens from the conditioning before the
   transformer sees them. ComfyUI never pads the modern LLM text encoders
   (`pad_to_max_length=False`: qwen3vl/qwen_image/flux-t5; only CLIP keeps `SDTokenizer`'s default
@@ -461,7 +466,8 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   placement, execution device, encode bridge/cache) — only the weight source differs, plus the CPU
   full-load fit is sized from the single files rather than `cpu_fits_full_load`'s component-dir
   shards. Model-agnostic: every model-specific piece (meta-builders, key remaps, quant flag, the
-  reused-VAE rebuild) is data the engine passes in; no names here. Verified on the A1000:
+  optional `lora_keys` builder for LoRA naming, the reused-VAE rebuild) is data the engine passes
+  in; no names here. Verified on the A1000:
   z-image-turbo 1024×768 (VBAR, 0 unmatched) and comfy-qwen-image-edit-2511 image-to-image (fp8 TE
   emulated), both seed-valid.
 - **Pinning matches ComfyUI (measured).** comfy-aimdo pins the streamed working set lazily per
