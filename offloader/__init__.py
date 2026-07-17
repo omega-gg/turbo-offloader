@@ -164,6 +164,9 @@ def _prepare_offload(device, dtype, fits_full_load):
     # ModelPatcherDynamic engages (partial GPU residency sized from live free VRAM, streaming the
     # rest per forward). Off CUDA / without comfy-aimdo -> plain ModelPatcher native cast path.
     use_vbar = _vbar_ready and adapter.enable_vbar(device)
+    if use_vbar:
+        # transient HostBuffer.truncate under RAM pressure -> pageable, not a crash
+        adapter.install_pin_rollback_guard()
     build = adapter.build_dynamic_patcher if use_vbar else adapter.build_patcher
 
     return load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build

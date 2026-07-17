@@ -422,6 +422,57 @@ def enable_vbar(device):
     return True
 
 
+def install_pin_rollback_guard():
+    """Survive a transient `HostBuffer.truncate failed` inside comfy.pinned_memory.pin_memory,
+    preserving ComfyUI's own recovery (steal a lower-priority pin).
+
+    When the host cudaHostRegister for a weight's pin fails, pin_memory rolls the hostbuf back
+    with truncate() and returns `_steal_pin(...)` -- reusing a lower-priority registered pin.
+    Under host-RAM pressure that rollback truncate can ITSELF fail; the RuntimeError escapes and
+    aborts the whole diffusion run mid-step (seen on a 4GB card at 1080p+).
+
+    We catch ONLY that truncate RuntimeError and finish exactly what pin_memory was about to do:
+    call `_steal_pin` with the same args it computes (pinned_memory.py). The rollback truncate is
+    the only truncate that can escape pin_memory -- the pin-budget path evicts via
+    unregister_inactive_pins, not truncate -- so the message match is unambiguous. The module then
+    still gets a real stolen pin (or, if no victim, _steal_pin returns False and the weight
+    transfers pageable via comfy/ops.py handle_pin) -- identical to the in-file rollback. Anything
+    other than the truncate failure re-raises unchanged.
+
+    Idempotent, and leaves the vendored pinned_memory.py byte-for-byte (see comfy/resync.md).
+    Installed on the CUDA/VBAR path where comfy-aimdo pins host memory; unused elsewhere."""
+    import comfy.pinned_memory as pm
+    import comfy.memory_management as memm
+    import comfy.utils as cu
+
+    if getattr(pm, "_turbo_pin_rollback_guard", False):
+        return
+
+    _orig_pin_memory = pm.pin_memory
+
+    def pin_memory(module, subset="weights", size=None):
+        try:
+            return _orig_pin_memory(module, subset=subset, size=size)
+        except RuntimeError as exc:
+            if "HostBuffer.truncate failed" not in str(exc):
+                raise
+            # Mirror pin_memory's own tail (pinned_memory.py): recompute the _steal_pin args it
+            # uses and steal a pin instead of aborting. priority was already set before the crash.
+            pin_state = module._pin_state
+            _hostbuf, stack, _stack_split, _pinned_size, counter, buckets = pin_state[subset]
+            if size is None:
+                size = memm.vram_aligned_size([ module.weight, module.bias ])
+            priority = getattr(module, "_pin_balancer_priority", None)
+            if priority is None:
+                priority = cu.bit_reverse_range(counter[0], 16)
+                counter[0] += 1
+                module._pin_balancer_priority = priority
+            return pm._steal_pin(module, stack, buckets, size, priority)
+
+    pm.pin_memory = pin_memory
+    pm._turbo_pin_rollback_guard = True
+
+
 def _shards(model_dir):
     """The .safetensors shard paths for a diffusers component dir, honouring a .index.json
     if present (mirrors v1's _offsets shard discovery)."""
