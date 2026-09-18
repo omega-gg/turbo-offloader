@@ -590,22 +590,33 @@ def load_streamed(model_cls, model_dir, dtype, operations=None):
     return model, missing
 
 
-def stream_single_file(build_meta, weight_file, operations=None, convert=None):
+def stream_single_file(build_meta, weight_file, operations=None, convert=None, device=None):
     """load_streamed's single-file sibling (ComfyUI-reuse engines): meta-load the module via
     build_meta() (accelerate init_empty_weights, so no weight RAM), comfy-ize it, mmap the ONE
     ComfyUI safetensors via load_torch_file, optionally run `convert` on the state dict -- the
     diffusers single-file key remap (renames + a fused-qkv chunk that returns views, so mmap file-
-    slices survive) -- then rebind by name. Returns (model, missing)."""
+    slices survive) -- then rebind by name. `device` (MPS direct load, see load_pipe_comfy) reads
+    the file straight onto that device instead of CPU mmap, in the model's dtype. Returns
+    (model, missing)."""
     import comfy.utils as cu
 
     model = build_meta()
 
     comfy_ize(model, operations)
 
-    sd = cu.load_torch_file(weight_file, device=torch.device("cpu"))
+    sd = cu.load_torch_file(weight_file, device=device or torch.device("cpu"))
 
     if convert is not None:
         sd = convert(sd)
+
+    # Direct load: cast to the model's own dtype, as ComfyUI's load_state_dict copy into a model
+    # built on the device does -- the resident weights never go through a per-forward cast.
+    if device is not None:
+        own = {n: p.dtype for n, p in model.named_parameters()}
+        own.update({n: b.dtype for n, b in model.named_buffers()})
+        for k, v in sd.items():
+            if k in own and v.is_floating_point() and v.dtype != own[k]:
+                sd[k] = v.to(own[k])
 
     missing = _assign_sd(model, sd)
     # The slices carry the file's dtype, so honour _keep_in_fp32_modules afterwards.

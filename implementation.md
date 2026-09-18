@@ -344,6 +344,7 @@ Python 3.14.
 |---|---|---|---|---|---|
 | flux2-4b (15 GB) | MPS | 512×512 | 4 | ~185 s (~106 s gen) | direct-load, TE-CPU |
 | flux2-4b | MPS | 1024×768 | 4 | ~249 s | direct-load, TE-CPU |
+| comfy-flux2-4b (single files) | MPS | 512×512 | 4 | ~233 s (`sequential_cpu` ~458 s) | direct-load, TE-CPU |
 
 Notes: MPS runs **fp16-resident** (no `manual_cast`) — the transformer is direct-loaded straight
 onto the device (`safe_open(device="mps")`) and stays resident; there is no VBAR/stream path (MPS
@@ -419,14 +420,22 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   bit-identical); gated off `manual_cast`; any mismatch falls back to normal placement.
   `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after — on MPS the Qwen3
   text encoder now lands on CPU (next note), so only the transformer takes this direct-load path.
+  `load_pipe_comfy` does the same for a plain (non-fp8) single-file transformer:
+  `stream_single_file(device=)` reads it onto MPS and casts each weight to the model's dtype, as
+  ComfyUI's `load_state_dict` copy into a model built on the device does. Left mmap-backed on CPU
+  instead, `load_models_gpu` re-paged it from disk every forward (comfy-flux2-4b, 8 GB M1: ~562
+  s/step at 1024×768, swap full).
 - **Text encoder on CPU on MPS (ComfyUI's `text_encoder_device()`).** ComfyUI runs the text encoder
   on `text_encoder_device()` — CPU under `vram_state` SHARED (Apple Silicon), the compute device
   otherwise — keeping only the transformer resident on the compute device and moving just the
   conditioning across. `load_pipe` honors that selector for the resident (non-streamed) path:
   `te_dev = text_encoder_device()`. When it lands the TE off the compute device (MPS → CPU) the TE
   patcher is built on `te_dev`, `encode_prompt` runs there (native forward) and only the small
-  embeddings move to the compute device, and the pipeline's `_execution_device` is pinned to the
-  compute device (per-instance subclass) so timesteps/latents are built to match the transformer.
+  embeddings move to the compute device — cast to the transformer's dtype, as ComfyUI's
+  `_apply_model` casts the conditioning (a streamed TE keeps its file's bf16, and flux2 takes its
+  latent dtype from `prompt_embeds`, which then mismatched the fp16 VAE) — and the pipeline's
+  `_execution_device` is pinned to the compute device (per-instance subclass) so
+  timesteps/latents are built to match the transformer.
   Gated on `te_dev != load_device`, so the streamed paths (VBAR / CPU-stream, TE placed their own
   way) and plain CPU (`text_encoder_device()` → CPU == `load_device`) are unchanged; the effect is
   MPS-only. Was materialising both transformer + TE on MPS (~15GB); now the TE is CPU-resident.

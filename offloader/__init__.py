@@ -354,13 +354,25 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
     if te_dev != load_device and getattr(p, "encode_prompt", None) is not None:
         _real_encode = p.encode_prompt
 
+        # ComfyUI casts the conditioning to the diffusion model's dtype on the way in
+        # (model_base._apply_model; its manual_cast half is install_manual_cast's per-leaf input
+        # cast) -- a TE kept in its file dtype (bf16) would otherwise set the latent dtype (flux2:
+        # prompt_embeds.dtype) against an fp16 VAE.
+        cond_dtype = getattr(getattr(p, "transformer", None), "dtype", None)
+
+        def _to_compute(o):
+            if not isinstance(o, torch.Tensor):
+                return o
+            if cond_dtype is not None and o.is_floating_point():
+                return o.to(load_device, dtype=cond_dtype)
+            return o.to(load_device)
+
         def _encode_on_te(*args, **kwargs):
             kwargs["device"] = te_dev
             out = _real_encode(*args, **kwargs)
             if isinstance(out, (list, tuple)):
-                return type(out)(
-                    o.to(load_device) if isinstance(o, torch.Tensor) else o for o in out)
-            return out.to(load_device) if isinstance(out, torch.Tensor) else out
+                return type(out)(_to_compute(o) for o in out)
+            return _to_compute(out)
 
         p.encode_prompt = _encode_on_te
 
@@ -452,6 +464,11 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
 
     stream = use_vbar or cpu_stream
 
+    # MPS direct load, as load_pipe: ComfyUI builds the diffusion model on MPS under vram_state
+    # SHARED (unet_inital_load_device), so the transformer is read straight onto the device and
+    # stays resident -- left mmap-backed on CPU, load_models_gpu re-pages it from disk per forward.
+    direct_load = mm.is_device_mps(load_device) and manual_cast is None
+
     # Transformer: meta-load + stream from the single file (mmap; the engine's `convert` applies
     # any single-file key remap). A scaled-fp8 file goes through the comfy quant path (like the TE,
     # which owns its compute dtype -> manual_cast=None); a plain bf16 file streams via cast ops.
@@ -467,7 +484,7 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
     else:
         tf, missing = adapter.stream_single_file(
             lambda: transformer["meta"](dtype), transformer["file"], operations,
-            convert=transformer.get("convert"))
+            convert=transformer.get("convert"), device=load_device if direct_load else None)
         if missing:
             print("offloader: %d transformer weights had no module (skipped)" % len(missing),
                   flush=True)
