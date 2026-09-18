@@ -284,10 +284,10 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
         p._offloader_encoder = encoder_patcher
         p._offloader_te_device = te_dev
 
-    return _finalize_pipe(p, patchers, load_device, cpu_stream)
+    return _finalize_pipe(p, patchers, load_device, cpu_stream, manual_cast or dtype)
 
 
-def _finalize_pipe(p, patchers, load_device, cpu_stream):
+def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
     """Shared tail for the offloader pipes (dir-based load_pipe and single-file
     load_pipe_single_file). Places the small VAE, records the patchers, pins the execution device,
     wires the ComfyUI-faithful encode bridge, and installs the prompt-encode cache. The heavy
@@ -354,17 +354,16 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream):
     if te_dev != load_device and getattr(p, "encode_prompt", None) is not None:
         _real_encode = p.encode_prompt
 
-        # ComfyUI casts the conditioning to the diffusion model's dtype on the way in
-        # (model_base._apply_model; its manual_cast half is install_manual_cast's per-leaf input
-        # cast) -- a TE kept in its file dtype (bf16) would otherwise set the latent dtype (flux2:
-        # prompt_embeds.dtype) against an fp16 VAE.
-        cond_dtype = getattr(getattr(p, "transformer", None), "dtype", None)
-
+        # ComfyUI casts the conditioning to the diffusion model's compute dtype on the way in
+        # (model_base._apply_model: manual_cast_dtype, else the model dtype) -- a TE kept in its
+        # file dtype (bf16) would otherwise set the latent dtype (flux2: prompt_embeds.dtype)
+        # against an fp16 VAE. The compute dtype, not the storage one: fp8 / manual_cast weights
+        # store another dtype than they compute in.
         def _to_compute(o):
             if not isinstance(o, torch.Tensor):
                 return o
-            if cond_dtype is not None and o.is_floating_point():
-                return o.to(load_device, dtype=cond_dtype)
+            if o.is_floating_point():
+                return o.to(load_device, dtype=compute_dtype)
             return o.to(load_device)
 
         def _encode_on_te(*args, **kwargs):
@@ -523,7 +522,8 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
     p._offloader_te_device = te_dev
     p._offloader_encoder = te_patcher
 
-    return _finalize_pipe(p, [tf_patcher, te_patcher], load_device, cpu_stream)
+    return _finalize_pipe(p, [tf_patcher, te_patcher], load_device, cpu_stream,
+                          manual_cast or dtype)
 
 
 def prepare(pipe):

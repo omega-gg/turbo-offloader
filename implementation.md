@@ -431,14 +431,16 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   conditioning across. `load_pipe` honors that selector for the resident (non-streamed) path:
   `te_dev = text_encoder_device()`. When it lands the TE off the compute device (MPS → CPU) the TE
   patcher is built on `te_dev`, `encode_prompt` runs there (native forward) and only the small
-  embeddings move to the compute device — cast to the transformer's dtype, as ComfyUI's
-  `_apply_model` casts the conditioning (a streamed TE keeps its file's bf16, and flux2 takes its
+  embeddings move to the compute device — cast to the compute dtype (`manual_cast`, else the
+  model dtype, never the storage one fp8 weights keep), as ComfyUI's `_apply_model` casts the
+  conditioning (a streamed TE keeps its file's bf16, and flux2 takes its
   latent dtype from `prompt_embeds`, which then mismatched the fp16 VAE) — and the pipeline's
   `_execution_device` is pinned to the compute device (per-instance subclass) so
   timesteps/latents are built to match the transformer.
   Gated on `te_dev != load_device`, so the streamed paths (VBAR / CPU-stream, TE placed their own
   way) and plain CPU (`text_encoder_device()` → CPU == `load_device`) are unchanged; the effect is
-  MPS-only. Was materialising both transformer + TE on MPS (~15GB); now the TE is CPU-resident.
+  MPS, plus a low-VRAM CUDA card for `load_pipe_comfy`'s plain TE, which it lands on CPU.
+  Was materialising both transformer + TE on MPS (~15GB); now the TE is CPU-resident.
   Measured on an 8GB M1 (512×512): MPS residency ~15 → 7GB, peak swap 12.8 → 5.3GB, diffusion
   2:26 → 1:46, total 247 → 188s.
 - **Streaming is mmap file-sliced + pinned (comfy-aimdo VBAR).** Every big model has its weights
