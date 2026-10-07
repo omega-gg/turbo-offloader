@@ -39,8 +39,8 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
 | `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir. **Model-agnostic**: the engine passes each big model as a data spec (`{meta, file, convert, quant}`) plus prebuilt small `components` (vae/tokenizer/scheduler); no model classes or names appear here. `quant` routes a scaled-fp8 text encoder through the comfy quant path (below). |
-| `prepare(pipe)` | `load_models_gpu(patchers)` -- place managed models on the compute device |
-| `reclaim(pipe)` | `free_memory` + `soft_empty_cache` between generations |
+| `prepare(pipe)` | `load_models_gpu(patchers)`: place managed models on the compute device; mark them the current prompt (`PromptModelTracker`) |
+| `reclaim(pipe)` | `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
@@ -133,7 +133,7 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
   `Krea2RMSNorm` runs `F.rms_norm(x.float(), ..., weight=self.weight + 1.0)` with a **bf16**
   weight, so torch refuses the fused kernel ("Cannot dispatch to fused implementation") -- measured
   **2.4× slower per call**. ComfyUI casts its scale to fp32 for the same reason
-  (`ldm/krea2/model.py:33`); this also restores exact numeric parity with it (a bf16 `+ 1.0` rounds
+  (`ldm/krea2/model.py:34`); this also restores exact numeric parity with it (a bf16 `+ 1.0` rounds
   a zero-centered scale), taking the cross-framework cosine 0.99997 → **1.0**.
 - **`load_quant_single_file` / `mixed_precision_operations`** — `stream_single_file`'s fp8
   sibling, for any ComfyUI **scaled-fp8** single file — a text encoder (qwen-image-edit's
@@ -183,13 +183,13 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   this *inside* its native model; the diffusers model doesn't, so we reproduce the same dtype
   discipline from outside via forward hooks, each mirroring a specific comfy cast:
     - input cast ← `model_base.py:207` (`xc = xc.to(dtype)`);
-    - **per-leaf input cast** ← `lumina/model.py:826` (`t_embedder(..., dtype=x.dtype)`) — the
+    - **per-leaf input cast** ← `lumina/model.py:859` (`t_embedder(..., dtype=x.dtype)`) — the
       crux: diffusers computes the time-embed/adaLN in fp32, so `norm(x) * scale` promotes to fp32
       and `cast_bias_weight` then casts weights to fp32, dropping every matmul onto the fp32
       `volta_sgemm` path; casting each comfy-ized leaf's input back to the compute dtype forces
       fp16 tensor cores (`s1688gemm`);
     - straggler cast (in `keep_uncastable_resident`) ← lumina params built `dtype=x.dtype`;
-    - `clamp_fp16` ← `lumina/model.py:68-71` — guards fp16 overflow (→ NaN → black image) after
+    - `clamp_fp16` ← `lumina/model.py:71-74` — guards fp16 overflow (→ NaN → black image) after
       each block; without it the output is all-zero;
     - output cast back to the storage dtype (diffusers pipeline latent-dtype contract).
   The per-layer weight cast itself is comfy's own `cast_bias_weight`, unchanged. Which leaves take
@@ -210,18 +210,20 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   same-image runs, both cool-started): bigger activations leave less VRAM for weight residency,
   more re-streaming per step, and we hide it behind compute while ComfyUI pays it serially.
 - **`use_comfy_attention`** — a verbatim copy of `comfy.ops.scaled_dot_product_attention`
-  (`comfy/ops.py:39-64`): on Windows+CUDA it forces the SDPA priority
-  `[CUDNN, FLASH, EFFICIENT, MATH]` **per call**, but only for large inputs
-  (`q.nelement() >= 1024*128`); small attentions use torch's default backend. We reproduce it
+  (`comfy/ops.py:58-101`): on CUDA it forces ComfyUI's SDPA priority (`ops.SDPA_BACKEND_PRIORITY`,
+  `[FLASH, CUDNN, EFFICIENT, MATH]` since v0.39, read from the vendored ops so a re-sync carries
+  it) **per call**, but only for large inputs (`q.nelement() >= 1024*128`); small attentions use
+  torch's default backend, and a masked GQA call repeats K/V when no backend runs GQA natively
+  (`ops.repeat_kv_for_gqa`, as comfy does). We reproduce it
   (rather than import it) because it calls `F.sdpa` internally, so pointing torch's `F.sdpa` at it
   self-recurses; instead we patch `torch.nn.functional.scaled_dot_product_attention` once
   (diffusers calls it by attribute) and delegate to the saved original. **The per-call size gate
   matters:** forcing cuDNN on *every* attention (incl. small inputs, which comfy skips) makes the
   first z-image forward after a flux2→z-image switch pick a nondeterministic cuDNN plan and
-  diverge; copying comfy's gate verbatim is deterministic. **Dtype-mismatch coercion
-  (`adapter.py:471-490`):** under manual_cast (fp16 compute on a bf16 checkpoint) some native HF
-  models leave the attention inputs mismatched -- transformers' qwen3 RoPE (flux2's text encoder)
-  promotes q,k to fp32 while v stays fp16 -- and torch's SDPA requires one dtype. We coerce
+  diverge; copying comfy's gate verbatim is deterministic. **Dtype-mismatch coercion:** under
+  manual_cast (fp16 compute on a bf16 checkpoint) some native HF models leave the attention inputs
+  mismatched (transformers' qwen3 RoPE, in flux2's text encoder, promotes q,k to fp32 while v
+  stays fp16), and torch's SDPA requires one dtype. We coerce
   mismatched q/k/v to the lowest-precision float present (the compute dtype); ComfyUI never hits
   this because it runs its OWN qwen3, but its attention does the same class of thing (upcasts
   q/k/v, `comfy/ldm/modules/attention.py:244-287`). Model/GPU- agnostic: fires only on a real
@@ -238,7 +240,7 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   rope (measured: different image md5, each path individually deterministic), so it is what keeps
   the output on ComfyUI's exact numerics. The packed freqs_cis is cached by
   (cos, sin) tensor identity — ComfyUI builds `freqs` once per forward and hands it to every block
-  (`ldm/krea2/model.py:267`), and diffusers passes one (cos, sin) tuple to all blocks, so the
+  (`ldm/krea2/model.py:364`), and diffusers passes one (cos, sin) tuple to all blocks, so the
   pack is loop-invariant: 56 rebuilds/step on krea2 (~9 ms, ~90 MB fp32 churn) collapse to one
   per generation. Verified bit-identical.
 - **fused RMSNorm** — routing custom norms through `disable_weight_init.RMSNorm` gives ComfyUI's
@@ -368,12 +370,12 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   first eviction. Pre-dates the krea2 work (present at `82508b2`).
 
   Root cause: **ComfyUI tears down the offload state after every node**
-  (`comfy/execution.py:543-549`: `reset_cast_buffers` + `cleanup_prefetch_queues` +
-  `vbars_reset_watermark_limits`), so CLIPTextEncode's per-stream cast buffers, prefetch queues and
-  VBAR watermarks are gone before KSampler starts. A diffusers pipeline has **no node boundary** --
-  `encode_prompt` flows straight into the denoise loop -- so the text encoder's stream/buffer state
-  leaked into the transformer's forwards: with 2 async offload streams that raced (non-determinism)
-  **and** starved the DiT of VRAM the encoder still held.
+  (`comfy/execution.py:550-554`: `cleanup_prefetch_queues` + `reset_cast_buffers` +
+  `vbars_reset_watermark_limits`, in that order), so CLIPTextEncode's per-stream cast buffers,
+  prefetch queues and VBAR watermarks are gone before KSampler starts. A diffusers pipeline has
+  **no node boundary**: `encode_prompt` flows straight into the denoise loop, so the text encoder's
+  stream/buffer state leaked into the transformer's forwards: with 2 async offload streams that
+  raced (non-determinism) **and** starved the DiT of VRAM the encoder still held.
 
   Fix: `node_teardown()` -- the same three comfy calls, verbatim -- runs after `encode_prompt`
   (installed in `_finalize_pipe`, under the encode cache so a cache hit, like a cached comfy node,
@@ -389,9 +391,9 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
 - **The sampler→VAE boundary (`install_tiled_vae_fallback`) — krea2 1600×1200 OOM'd + aborted.**
   Same bug class at the pipeline's other seam: ComfyUI's KSampler node ENDS before VAEDecode, so
   the teardown has run and `VAE.decode` then hands its working-memory estimate to
-  `load_models_gpu(memory_required=memory_used_decode(...))` (comfy/sd.py:1057-1058), whose guts
+  `load_models_gpu(memory_required=memory_used_decode(...))` (comfy/sd.py:1267-1269), whose guts
   are `free_memory(max(inference_memory, memory_required + extra_reserved_memory()))`
-  (model_management.py:854,911) — the DiT is evicted through free_memory's CONTROLLED path before
+  (model_management.py:944,1001) — the DiT is evicted through free_memory's CONTROLLED path before
   the VAE's first kernel. A diffusers pipeline calls `vae.decode` inside the same `__call__`: the
   DiT stayed pinned (measured: 2.66 GB held, 0 free) and a 1600×1200 decode died after all 8 steps
   — and both halfway fixes crash: without the pre-free, the OOM poisons the context and even the
@@ -399,11 +401,12 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   watermark reset, the first cudnn workspace request evicts on demand INSIDE the allocator and
   aborts on the VAE's first conv3d. Fix, comfy verbatim: at `vae.decode`/`encode`,
   `node_teardown()` + the `memory_used` estimate (comfy's own Wan-2.1 / AutoencoderKL constants,
-  sd.py:757-758 / :481-482, keyed only off tensor rank) + `free_memory`, then comfy's OOM fallback
-  (sd.py:1080-1087: `raise_non_oom`, warn, flag-retry OUTSIDE the except so the exception's tensor
-  refs can gc, tiled via diffusers' `enable_tiling` — same 256px/64px tiles as comfy's
-  `decode_tiled_3d` defaults). Result: krea2 1600×1200 decodes clean — untiled, the fallback never
-  even fires — and z-image stays bit-identical.
+  sd.py:877-878 / :505-506, keyed only off tensor rank) + `free_memory`, then comfy's OOM fallback
+  (sd.py:1301-1308: `raise_non_oom`, warn, flag-retry OUTSIDE the except so the exception's tensor
+  refs can gc, tiled via diffusers' `enable_tiling`: the same 256px/64px tile comfy starts from,
+  sd.py:1324-1325, though since v0.39 comfy then resizes a 3D tile to its VRAM budget). Result:
+  krea2 1600×1200 decodes clean — untiled, the fallback never even fires — and z-image stays
+  bit-identical.
 
 ## Notes
 
@@ -488,7 +491,9 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   pins 5.49GB (flux2) / 4.94GB (z-image) with gen2/gen3 first-step == steady step (no re-fault).
   turbo drives the same vendored path ComfyUI does — see
   [`doc/COMFYUI_OFFLOAD_MAP.md`](doc/COMFYUI_OFFLOAD_MAP.md). (An older note claimed turbo
-  under-pinned ~4.7/6.4GB with a ~30s re-fault; stale — that was the materialized era.)
+  under-pinned ~4.7/6.4GB with a ~30s re-fault; stale — that was the materialized era.) These
+  figures predate the v0.39 re-sync: since v0.39, off a fast disk (`fast_disk` False, as on the
+  A1000) comfy also pins VBAR-backed weights, so re-measure before quoting them.
 - **Why not the static ModelPatcher.** The static lowvram path pins the full model up front
   (`model_management`: `total_pins_required += model_memory()`, gated on `not is_dynamic()`) and is
   a touch faster per step, but its per-layer peak OOMs a small card on a big model — e.g. z-image's
@@ -498,7 +503,31 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   `from_pretrained` instead of mmap; materialized host tensors stream **pageable** (~2x slower per
   step). Reverting to always-mmap restores pinned streaming. Measured on an RTX A1000 (4GB VRAM /
   33GB RAM): flux2 1024×768 ~4 → ~2.3 s/step; z-image ~5.6 → ~5 s/step, both fit.
-- **comfy-kitchen** is a quantization-kernel library, unrelated to offloading — not a dependency.
+- **comfy-kitchen** is ComfyUI's kernel library (fused RoPE, fp8/fp4 quant), unrelated to
+  offloading itself. It is pip-installed, not vendored, at the version the ComfyUI tag pins: an
+  older one makes v0.39's `quant_ops.py` import block fail as a whole, which silently drops fp8
+  and the kitchen RoPE.
 - **Re-syncing** a newer ComfyUI: re-copy the files and re-apply the short edit set in
   `comfy/resync.md`; bump the commit pins there, in `comfy/__init__.py`, and in `README.md`.
+- **v0.39 re-sync (v0.27.0 → v0.39.1, comfy-aimdo 0.4.10 → 0.5.5, comfy-kitchen 0.2.16 →
+  0.2.37).** Besides the re-copy, upstream behavior that reaches the adapter was mirrored:
+  `pinned_memory`'s per-subset pin state (`install_pin_rollback_guard`); the quant formats a
+  device can't run now come from `ops.get_disabled_quant_formats`; the SDPA wrapper reads
+  `ops.SDPA_BACKEND_PRIORITY` (flash first, any OS) and does comfy's GQA repeat; `node_teardown`
+  runs `cleanup_prefetch_queues` first, as `execution.py` now does; aimdo inits with
+  `nvml_pressure=True` (ComfyUI's default); `ModelPatcherDynamic` gets comfy's per-model
+  `fast_disk` (`comfy.storage.model_fast_disk` over the files each loader streams; False on the
+  A1000 laptop, as ComfyUI decides there); and `prepare`/`reclaim` drive comfy's
+  `PromptModelTracker`, so pin eviction spares the running generation's models. Measured on the
+  A1000 at 512² (seed 42, interleaved old/new runs, cool-ish starts): flux2-4b CUDA and CPU and
+  comfy-krea2-turbo CUDA give **bit-identical images** across the two stacks, and per-step time is
+  at parity (krea2 ~2.2 s/it both, flux2 ~12 s generation both, flux2 CPU ~25 s/step both).
+  z-image stays bit-identical across runs. Against ComfyUI v0.39.1 itself (same files and graph
+  from its templates, fresh process each, interleaved, ms phase logs): end to end turbo is on par
+  or faster (comfy-flux2-4b 31.5/36.0 vs 34.6/38.8 s; comfy-krea2-turbo ~60-64 vs ~61-71 s),
+  winning startup/load and VAE decode while its sampling trails by 1-3 s, all in step 1 (the
+  first weight stream; steady steps match). flux2-4b from the diffusers repo is the exception,
+  ~2-4 s behind ComfyUI: its encode and first step are slower than comfy-flux2-4b's on the same
+  weights (a turbo loading-path cost, present before the re-sync). Not taken yet: upstream's
+  malloc graph for prefetch (`malloc_graph_begin`/`malloc_scope="block"`), a measured follow-up.
 - **License.** ComfyUI is GPLv3; the vendored copies live in this already-GPLv3 package.

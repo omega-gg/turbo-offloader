@@ -42,7 +42,7 @@ import torch
 # ComfyUI's model_management runs get_torch_device() at IMPORT (module level); with cpu_state's
 # default of GPU that calls torch.cuda.current_device(), which asserts "Torch not compiled with
 # CUDA enabled" on a CPU-only build. ComfyUI avoids this because a CPU user passes `--cpu` (->
-# args.cpu -> cpu_state=CPU, model_management.py:156). We parse no argv, so set args.cpu ourselves
+# args.cpu -> cpu_state=CPU, model_management.py:158). We parse no argv, so set args.cpu ourselves
 # when there is no GPU at all, BEFORE model_management imports -- then it initialises cpu_state=CPU
 # and never touches torch.cuda.
 _mps = getattr(torch.backends, "mps", None)
@@ -216,7 +216,7 @@ def keep_declared_fp32(model):
     `F.rms_norm(hidden_states.float(), ..., weight=self.weight + 1.0)`, so a bf16 weight makes
     torch refuse to fuse ("Mismatch dtype between input and weight ... Cannot dispatch to fused
     implementation") -- measured 1.653 vs 0.679 ms/call on the A1000. ComfyUI casts the scale to
-    fp32 for exactly this reason (comfy/ldm/krea2/model.py:33), so this is also what restores
+    fp32 for exactly this reason (comfy/ldm/krea2/model.py:34), so this is also what restores
     numeric parity with it (a bf16 `+ 1.0` rounds a zero-centered scale).
 
     Model-agnostic: reads the model's own declaration and matches names diffusers' own way
@@ -358,7 +358,7 @@ def install_manual_cast(model, compute_dtype, storage_dtype):
             _leaf.register_forward_pre_hook(_leaf_cast)
 
     # ComfyUI clamps activations to the fp16 range after each transformer block (clamp_fp16,
-    # comfy/ldm/lumina/model.py:68-71): without it fp16 overflow -> inf -> NaN -> black image. The
+    # comfy/ldm/lumina/model.py:71-74): without it fp16 overflow -> inf -> NaN -> black image. The
     # diffusers model has no such guard, so replicate it when computing in fp16. Model-agnostic:
     # hook the output of every nn.ModuleList child (the block stacks) rather than a named class.
     # nan_to_num is a near-no-op on in-range values, so over-applying it (e.g. to a norm list) is
@@ -433,8 +433,9 @@ def install_pin_rollback_guard():
 
     We catch ONLY that truncate RuntimeError and finish exactly what pin_memory was about to do:
     call `_steal_pin` with the same args it computes (pinned_memory.py). The rollback truncate is
-    the only truncate that can escape pin_memory -- the pin-budget path evicts via
-    unregister_inactive_pins, not truncate -- so the message match is unambiguous. The module then
+    the only truncate that can escape pin_memory (its `except RuntimeError` rollback truncates
+    again, unguarded; the budget/registration paths evict without truncating), so the message
+    match is unambiguous. The module then
     still gets a real stolen pin (or, if no victim, _steal_pin returns False and the weight
     transfers pageable via comfy/ops.py handle_pin) -- identical to the in-file rollback. Anything
     other than the truncate failure re-raises unchanged.
@@ -462,12 +463,13 @@ def install_pin_rollback_guard():
             _hostbuf, stack, _stack_split, _pinned_size, counter, buckets = pin_state[subset]
             if size is None:
                 size = memm.vram_aligned_size([ module.weight, module.bias ])
-            priority = getattr(module, "_pin_balancer_priority", None)
+            module_pin = module.__dict__.setdefault("_pins", {}).setdefault(subset, {})
+            priority = module_pin.get("balancer_priority")
             if priority is None:
                 priority = cu.bit_reverse_range(counter[0], 16)
                 counter[0] += 1
-                module._pin_balancer_priority = priority
-            return pm._steal_pin(module, stack, buckets, size, priority)
+                module_pin["balancer_priority"] = priority
+            return pm._steal_pin(module, stack, buckets, size, priority, subset)
 
     pm.pin_memory = pin_memory
     pm._turbo_pin_rollback_guard = True
@@ -550,8 +552,8 @@ def cpu_fits_full_load(model):
     caller can use that faster path instead of streaming. The fp32 model is ~2x the on-disk bf16
     size; require it under 85% of total RAM (headroom for activations + the OS). Compared against
     ComfyUI's own get_total_memory(cpu). This is ComfyUI's full-load-when-it-fits call, which
-    ComfyUI applies on GPU (via free VRAM) but not on CPU -- here we apply it to CPU. Model-agnostic:
-    sums the on-disk bytes of each big component (single-file or index+shards)."""
+    ComfyUI applies on GPU (via free VRAM) but not on CPU; here we apply it to CPU.
+    Model-agnostic: sums the on-disk bytes of each big component (single-file or index+shards)."""
     total = 0
     for comp in ("transformer", "text_encoder"):
         comp_dir = os.path.join(model, comp)
@@ -569,8 +571,10 @@ def assign_streamed_weights(model, model_dir):
     import comfy.utils as cu
 
     sd = {}
-    for shard in _shards(model_dir):
+    shards = _shards(model_dir)
+    for shard in shards:
         sd.update(cu.load_torch_file(shard, device=torch.device("cpu")))
+    model._offloader_files = shards  # build_dynamic_patcher's fast_disk
     return _assign_sd(model, sd)
 
 
@@ -605,6 +609,7 @@ def stream_single_file(build_meta, weight_file, operations=None, convert=None, d
     comfy_ize(model, operations)
 
     sd = cu.load_torch_file(weight_file, device=device or torch.device("cpu"))
+    model._offloader_files = [weight_file]  # build_dynamic_patcher's fast_disk
 
     if convert is not None:
         sd = convert(sd)
@@ -630,16 +635,10 @@ def mixed_precision_operations(compute_dtype, load_device, quant_config):
     other quantized) checkpoint -- the branch ops.pick_operations takes only when a model_config
     carries quant_config, which adapter.pick_operations never reaches. Formats the compute device
     can't run natively are `disabled` -> emulated dequant, exactly as ComfyUI: on Ampere (no fp8
-    tensor cores) float8 runs emulated (dequant to compute_dtype per forward). Reused by
+    tensor cores) float8 runs emulated (dequant to compute_dtype per forward). The disabled set is
+    comfy's own (ops.get_disabled_quant_formats, as pick_operations computes it). Reused by
     load_quant_single_file."""
-    disabled = set()
-
-    if not mm.supports_fp8_compute(load_device):
-        disabled |= {"float8_e4m3fn", "float8_e5m2"}
-    if not mm.supports_nvfp4_compute(load_device):
-        disabled.add("nvfp4")
-    if not mm.supports_mxfp8_compute(load_device):
-        disabled.add("mxfp8")
+    disabled = ops.get_disabled_quant_formats(load_device)
 
     return ops.mixed_precision_ops(quant_config, compute_dtype, disabled=disabled)
 
@@ -686,6 +685,7 @@ def load_quant_single_file(build_meta, weight_file, load_device, compute_dtype, 
 
     sd, metadata = cu.load_torch_file(weight_file, device=torch.device("cpu"),
                                       return_metadata=True)
+    model._offloader_files = [weight_file]  # build_dynamic_patcher's fast_disk
     sd, metadata = cu.convert_old_quants(sd, model_prefix="", metadata=metadata)
     quant_config = cu.detect_layer_quantization(sd, "")
 
@@ -713,18 +713,21 @@ _sdpa_patched = False
 
 def use_comfy_attention(model=None):
     """Route diffusers' attention through a copy of ComfyUI's own
-    `comfy.ops.scaled_dot_product_attention` (comfy/ops.py:39-64), so our SDPA behaves EXACTLY like
-    ComfyUI's -- not an approximation.
+    `comfy.ops.scaled_dot_product_attention` (comfy/ops.py:58-101), so our SDPA behaves EXACTLY
+    like ComfyUI's, not an approximation.
 
-    ComfyUI, on Windows+CUDA with a recent torch, forces the SDPA backend priority
-    [CUDNN, FLASH, EFFICIENT, MATH] -- but ONLY per call and ONLY for large inputs
-    (`q.nelement() >= 1024*128`); small attentions fall through to torch's default backend (cuDNN
-    is slower there). We reproduce that verbatim. diffusers calls
-    `torch.nn.functional.scaled_dot_product_attention` by attribute
-    (diffusers/models/attention_dispatch.py), so we patch that one name, once and process-global
-    (idempotent), delegating to the saved original -- no self-recursion. `model` is accepted only
-    for signature parity with the other patchers; the patch is global, as ComfyUI's is.
-    No-op off Windows/CUDA or on a torch without set_priority (exactly ComfyUI's own guard)."""
+    ComfyUI, on CUDA with a torch that has `sdpa_kernel(set_priority=)`, forces its SDPA backend
+    priority (`ops.SDPA_BACKEND_PRIORITY`: [FLASH, CUDNN, EFFICIENT, MATH] since v0.39), but
+    ONLY per call and ONLY for large inputs (`q.nelement() >= 1024*128`); small attentions fall
+    through to torch's default backend. It also repeats K/V for a masked GQA call when the backend
+    can't do GQA natively. We reproduce that body verbatim, reading the priority list and the GQA
+    helper from the vendored ops (so a re-sync carries them over). We can't call the vendored
+    function itself: it calls `torch.nn.functional.scaled_dot_product_attention`, the very name we
+    patch. diffusers calls that name by attribute (diffusers/models/attention_dispatch.py), so we
+    patch it once, process-global (idempotent), delegating to the saved original. `model` is
+    accepted only for signature parity with the other patchers; the patch is global, as
+    ComfyUI's is. No-op wherever ComfyUI doesn't define the priority (no CUDA, or a torch without
+    set_priority), exactly ComfyUI's own guard."""
     global _sdpa_patched
     if _sdpa_patched:
         return True
@@ -732,51 +735,54 @@ def use_comfy_attention(model=None):
     import torch.nn.functional as F
     import comfy.model_management as mm
 
-    try:
-        if not (torch.cuda.is_available() and getattr(mm, "WINDOWS", False)):
-            return False
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-        import inspect
-        if "set_priority" not in inspect.signature(sdpa_kernel).parameters:
-            return False
-    except Exception:
+    priority = getattr(ops, "SDPA_BACKEND_PRIORITY", None)
+    if priority is None:
         return False
 
-    # comfy/ops.py builds [FLASH, EFFICIENT, MATH] then inserts CUDNN at the front (ops.py:48-54).
-    priority = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+    from torch.nn.attention import sdpa_kernel
+
     orig = F.scaled_dot_product_attention
 
     def scaled_dot_product_attention(*args, **kwargs):
-        # comfy/ops.py:56-60 verbatim (the branch + sdpa_kernel), only the arg handling differs:
         # ComfyUI's models call comfy.ops.scaled_dot_product_attention(q, k, v, ...) POSITIONALLY,
         # but diffusers calls torch's F.sdpa by KEYWORD (query=/key=/value=,
-        # attention_dispatch.py), so we take the query tensor from args[0] or kwargs["query"] and
-        # forward the call untouched.
-        q = args[0] if args else kwargs.get("query")
+        # attention_dispatch.py), so we pull q, k, v out of either form, then run comfy's body.
+        q, k, v = args[:3] + tuple(kwargs.pop(n) for n in ("query", "key", "value")[len(args):])
+        args = args[3:]
         # manual_cast (fp16 compute on a bf16 checkpoint) can leave the attention inputs
         # mismatched: transformers' qwen3 RoPE promotes q,k to fp32 (fp16 * fp32 cos/sin) while v
         # stays fp16, and torch's SDPA requires one dtype. Coerce to the lowest-precision float
-        # present -- the compute dtype -- exactly what a uniform native fp16 model would run. Only
+        # present (the compute dtype), exactly what a uniform native fp16 model would run. Only
         # fires on an actual mismatch.
-        k = args[1] if len(args) > 1 else kwargs.get("key")
-        v = args[2] if len(args) > 2 else kwargs.get("value")
-        if (q is not None and k is not None and v is not None
-                and not (q.dtype == k.dtype == v.dtype)):
+        if not (q.dtype == k.dtype == v.dtype):
             floats = [t.dtype for t in (q, k, v) if t.dtype.is_floating_point]
             if floats:
                 tgt = min(floats, key=lambda d: torch.finfo(d).bits)
-                args = list(args)
-                for i, name in ((0, "query"), (1, "key"), (2, "value")):
-                    if i < len(args) and args[i] is not None:
-                        args[i] = args[i].to(tgt)
-                    elif name in kwargs and kwargs[name] is not None:
-                        kwargs[name] = kwargs[name].to(tgt)
-                q = args[0] if args else kwargs.get("query")
-        if q is None or q.nelement() < 1024 * 128:  # comfy: small inputs -> default backend
-            return orig(*args, **kwargs)
+                q, k, v = (t.to(tgt) for t in (q, k, v))
+        # comfy/ops.py:77-98 verbatim from here.
+        if q.nelement() < 1024 * 128:  # comfy: small inputs -> default backend
+            return orig(q, k, v, *args, **kwargs)
+        attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
+        if kwargs.get("enable_gqa", False) and attn_mask is not None and not mm.is_nvidia():
+            k, v = ops.repeat_kv_for_gqa(k, v, q.shape[-3], -3)
+            kwargs["enable_gqa"] = False
         with sdpa_kernel(priority, set_priority=True):
-            return orig(*args, **kwargs)
+            if (kwargs.get("enable_gqa", False)
+                    and attn_mask is not None
+                    and q.shape[-3] != k.shape[-3]):
+                dropout_p = args[1] if len(args) > 1 else kwargs.get("dropout_p", 0.0)
+                is_causal = args[2] if len(args) > 2 else kwargs.get("is_causal", False)
+                params = torch.backends.cuda.SDPAParams(q, k, v, attn_mask, dropout_p, is_causal,
+                                                        True)
+                supports_native_gqa = (
+                    torch.backends.cuda.can_use_flash_attention(params)
+                    or torch.backends.cuda.can_use_cudnn_attention(params)
+                    or torch.backends.cuda.can_use_efficient_attention(params)
+                )
+                if not supports_native_gqa:
+                    k, v = ops.repeat_kv_for_gqa(k, v, q.shape[-3], -3)
+                    kwargs["enable_gqa"] = False
+            return orig(q, k, v, *args, **kwargs)
 
     F.scaled_dot_product_attention = scaled_dot_product_attention
     _sdpa_patched = True
@@ -813,7 +819,7 @@ def _make_kitchen_rope(orig):
     module whose calls never match (or a model we patch but never run) imports nothing.
 
     The packed freqs_cis is cached by (cos, sin) tensor identity: ComfyUI builds `freqs` ONCE per
-    forward and hands it to every block (comfy/ldm/krea2/model.py:267), and diffusers likewise
+    forward and hands it to every block (comfy/ldm/krea2/model.py:364), and diffusers likewise
     passes one (cos, sin) tuple to every block's apply_rotary_emb -- so the pack is loop-invariant.
     Rebuilding it per call was 2 x 28 = 56 builds/step on krea2, each allocating a ~1.6 MB fp32
     tensor (~9 ms/step, ~90 MB of allocator churn). The cache's strong refs keep the ids valid."""
@@ -899,7 +905,7 @@ def install_prefetch(model):
     """Overlap weight streaming with compute by copying ComfyUI's model_prefetch mechanism onto a
     diffusers transformer. ComfyUI's own models call prefetch_queue_pop() between transformer
     blocks so block N+1's weights stream on the offload stream while block N computes
-    (av_model.py:913). A diffusers forward doesn't, so every layer stalls waiting for its weights
+    (av_model.py:935). A diffusers forward doesn't, so every layer stalls waiting for its weights
     (~30% of a VBAR step).
 
     We reproduce it with forward hooks: for each ModuleList of repeated blocks, build a prefetch
@@ -993,15 +999,23 @@ def add_lora(patcher, lora_specs, key_map=None):
 
 def build_dynamic_patcher(model, load_device=None, offload_device=None, size=0):
     """Wrap a streamed model in ModelPatcherDynamic (the VBAR-aware patcher). On a CPU load_device
-    it transparently reroutes to a plain ModelPatcher (VBAR is GPU-only)."""
+    it transparently reroutes to a plain ModelPatcher (VBAR is GPU-only).
+
+    fast_disk is ComfyUI's per-model storage policy: it passes
+    `comfy.storage.state_dict_fast_disk(sd)` (sd.py:2277), i.e. model_fast_disk over the files the
+    weights come from. True (a fast NVMe) streams VBAR weights from the file instead of pinning
+    them in host RAM. Our loaders record those files as `_offloader_files`."""
     import comfy.model_patcher as model_patcher
+    import comfy.storage as storage
     if load_device is None:
         load_device = mm.get_torch_device()
     if offload_device is None:
         offload_device = mm.unet_offload_device()
     make_patchable(model)
+    fast_disk = storage.model_fast_disk(getattr(model, "_offloader_files", []))
     return model_patcher.ModelPatcherDynamic(model, load_device=load_device,
-                                             offload_device=offload_device, size=size)
+                                             offload_device=offload_device, size=size,
+                                             fast_disk=fast_disk)
 
 
 def _vae_memory_used(kind, shape, dtype):
@@ -1029,21 +1043,22 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
     __call__, so without this boundary the DiT still pins its VRAM (measured: 2.66GB held, 0 free)
     and a 1600x1200 decode dies on one ~1.4GB fp32 upsample after all 8 steps succeeded.
 
-    Then comfy/sd.py:1057-1058: estimate the call's working memory (`memory_used_decode`) and hand
+    Then comfy/sd.py:1267-1269: estimate the call's working memory (`memory_used_decode`) and hand
     it to load_models_gpu as memory_required BEFORE the first kernel. For an already-resident VAE
     load_models_gpu's guts are free_memory(max(inference_memory, memory_required +
-    extra_reserved_memory())) (model_management.py:854,911) -- the CONTROLLED eviction of the
+    extra_reserved_memory())) (model_management.py:944,1001): the CONTROLLED eviction of the
     streamed models. Skipping this and letting the first big cudnn workspace request evict on
     demand inside the allocator dies with an uncatchable C++ abort instead of a catchable OOM
     (measured: the abort fires on the VAE's first conv3d).
 
-    Then the fallback itself (comfy/sd.py:1080-1087 decode, :1165-1168 encode): try the regular
+    Then the fallback itself (comfy/sd.py:1301-1308 decode, :1442-1449 encode): try the regular
     call; on OOM, `raise_non_oom` anything else, warn with comfy's own wording, and only set a
     flag -- comfy deliberately retries OUTSIDE the except block because "the exception itself refs
     them all until we get out of this except block", so the tensors can gc first -- then retry
     tiled. Comfy retries with its own tiler; a diffusers VAE ships the equivalent (`enable_tiling`,
-    seam-blended; the qwen VAE's 256px tile / 64px overlap equal comfy's decode_tiled_3d defaults,
-    sd.py:1097-1098), and the regular path is restored after, matching comfy's per-call semantics.
+    seam-blended; the qwen VAE's 256px tile / 64px overlap equal the tile comfy starts from,
+    sd.py:1324-1325; since v0.39 comfy then resizes a 3D tile to its VRAM budget, sd.py:1335-1346),
+    and the regular path is restored after, matching comfy's per-call semantics.
     Model-agnostic: keyed only off the vae exposing enable_tiling. No-op without a vae, or if
     already installed."""
     vae = getattr(pipe, "vae", None)

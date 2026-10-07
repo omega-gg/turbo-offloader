@@ -24,8 +24,9 @@
 #   turboCLI:` comment-outs. Re-sync = re-copy the files then re-apply that short list.
 #
 #   Source snapshots (bump together with the files):
-#       ComfyUI     bb131be9e83d2f773c90f1d6f1e4b248a498c8c5  (v0.27.0)
-#       comfy-aimdo afa70d91ec9f6e1ab6758089d1b551f0269b6457
+#       ComfyUI       de0125d9aefc225ec1a6f787a3a806730b772678  (v0.39.1)
+#       comfy-aimdo   3b8e8c162efeb9470d912609a7a6e7a2b1c693ec  (v0.5.5)
+#       comfy-kitchen be003b7c23c5b01328657955b8bc5d3f073d868e  (v0.2.37, pip-installed)
 #
 #==================================================================================================
 
@@ -52,7 +53,8 @@ except ImportError:
     _stub = _types.ModuleType("comfy_aimdo")
     _stub.__path__ = []  # mark as a package so `import comfy_aimdo.X` is well-formed
     _sys.modules["comfy_aimdo"] = _stub
-    for _sub in ("host_buffer", "vram_buffer", "model_vbar", "torch", "model_mmap", "control"):
+    for _sub in ("host_buffer", "vram_buffer", "model_vbar", "torch", "model_mmap", "control",
+                 "storage", "malloc_graph"):
         _m = _types.ModuleType("comfy_aimdo." + _sub)
         _sys.modules["comfy_aimdo." + _sub] = _m
         setattr(_stub, _sub, _m)

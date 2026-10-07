@@ -10,6 +10,7 @@ OTHER_FILES += README.md  \
                doc/BENCHMARKING.md  \
                doc/COMFYUI_OFFLOAD_MAP.md \
                doc/DUMMY_PLAN.md \
+               doc/COMFYUI_039_RESYNC_PLAN.md \
 
 # Backend seam + the thin diffusers <-> ComfyUI bridge (the only real logic).
 OTHER_FILES += offloader/__init__.py \
@@ -32,6 +33,10 @@ OTHER_FILES += offloader/comfy/__init__.py          \
                offloader/comfy/hooks.py             \
                offloader/comfy/patcher_extension.py \
                offloader/comfy/pinned_memory.py     \
+               offloader/comfy/system_memory.py     \
+               offloader/comfy/internal_logging.py  \
+               offloader/comfy/rmsnorm.py           \
+               offloader/comfy/storage.py           \
 
 # Vendored comfy sub-packages.
 OTHER_FILES += offloader/comfy/comfy_types/README.md      \

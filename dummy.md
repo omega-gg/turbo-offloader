@@ -95,7 +95,7 @@ When you run `text-to-image.sh`, the turboCLI runner drives the offloader throug
                 │
   ┌─────────────▼─────────────┐
   │  offloader/comfy/  (GPL)  │   ComfyUI's memory-management subsystem, vendored
-  └───────────────────────────┘   byte-for-byte (pinned to ComfyUI v0.27.0)
+  └───────────────────────────┘   byte-for-byte (pinned to ComfyUI v0.39.1)
 ```
 
 The design philosophy (v2): **don't reimplement offloading — borrow it whole.** ComfyUI's memory
@@ -142,7 +142,9 @@ Each of these is one sentence here and a full section in `implementation.md`:
   pipeline has no nodes, so the adapter replays that teardown between encode, denoise and decode —
   skipping it broke fixed-seed determinism and starved the transformer of VRAM.
 - **Pinned memory** — host RAM staging buffers are page-locked so GPU copies run asynchronously at
-  full PCIe speed, which is what lets prefetch actually hide the transfers.
+  full PCIe speed, which is what lets prefetch actually hide the transfers. As in ComfyUI, a model
+  on a fast NVMe skips most pinning and streams straight from its file, and the models of the
+  running generation keep their pins first when RAM runs short.
 - **Determinism** — a fixed seed produces bit-identical images across runs; several of the
   mechanisms above exist precisely to preserve that.
 
@@ -156,6 +158,6 @@ Each of these is one sentence here and a full section in `implementation.md`:
 ## Keeping this document up to date
 
 This file describes the current architecture and is revised with each turbo-offloader iteration:
-whenever behaviour documented in `implementation.md` changes, the matching plain-English section
+whenever behavior documented in `implementation.md` changes, the matching plain-English section
 here changes with it. If the two ever disagree, `implementation.md` is right and this file has
 a bug.

@@ -17,9 +17,9 @@ short edit list in [`offloader/comfy/resync.md`](offloader/comfy/resync.md):
 
 | dependency    | commit                                     | version                 |
 |---------------|--------------------------------------------|-------------------------|
-| ComfyUI       | `bb131be9e83d2f773c90f1d6f1e4b248a498c8c5` | `v0.27.0`               |
-| comfy-aimdo   | `afa70d91ec9f6e1ab6758089d1b551f0269b6457` | `0.4.10`                |
-| comfy-kitchen | `43b413e402c93b21b14f437758bcac0cd5130bd4` | `0.2.16`                |
+| ComfyUI       | `de0125d9aefc225ec1a6f787a3a806730b772678` | `v0.39.1`               |
+| comfy-aimdo   | `3b8e8c162efeb9470d912609a7a6e7a2b1c693ec` | `0.5.5`                 |
+| comfy-kitchen | `be003b7c23c5b01328657955b8bc5d3f073d868e` | `0.2.37`                |
 
 ## Credits
 

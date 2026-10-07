@@ -67,7 +67,8 @@ def pre_torch_init():
 
     try:
         import comfy_aimdo.control as ctl  # must not import torch at module load
-        _vbar_ready = bool(ctl.init())
+        # NVML memory pressure: ComfyUI's default (main.py:77, disable-nvml-pressure off).
+        _vbar_ready = bool(ctl.init(nvml_pressure=True))
         if _vbar_ready:
             ctl.set_log_warning()
     except Exception:
@@ -234,7 +235,7 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
     adapter.keep_uncastable_resident(p.transformer, load_device, manual_cast)
     if stream_transformer and use_vbar:
         adapter.install_prefetch(p.transformer)  # overlap disk->VRAM streaming with compute (VBAR)
-    # ComfyUI's exact SDPA (comfy.ops, cuDNN-first + size gate)
+    # ComfyUI's exact SDPA (comfy.ops, its backend priority + size gate)
     adapter.use_comfy_attention(p.transformer)
     adapter.use_kitchen_rope(p.transformer)  # ComfyUI's comfy_kitchen fused RoPE
     if manual_cast is not None:
@@ -376,12 +377,12 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
         p.encode_prompt = _encode_on_te
 
     # ComfyUI's sampler->VAE node boundary (DiT VBAR residency becomes evictable before the VAE
-    # needs VRAM) + its OOM fallback: regular decode/encode, retry tiled (comfy/sd.py:1080).
+    # needs VRAM) + its OOM fallback: regular decode/encode, retry tiled (comfy/sd.py:1301).
     adapter.install_tiled_vae_fallback(p, node_boundary=node_teardown)
 
     # The TE->transformer node boundary ComfyUI has and a diffusers pipeline doesn't: run comfy's
     # per-node teardown once the encoder is done, before the denoise loop, exactly as
-    # comfy/execution.py:543-549 does between CLIPTextEncode and KSampler. Installed BEFORE the
+    # comfy/execution.py:550-554 does between CLIPTextEncode and KSampler. Installed BEFORE the
     # cache so it is the encoder's own boundary -- a cache hit never runs the encoder, so (like a
     # cached comfy node) it needs no teardown.
     if getattr(p, "encode_prompt", None) is not None:
@@ -532,20 +533,30 @@ def prepare(pipe):
     per-forward, so this marks them loaded without pinning the whole set). When
     install_encode_cache serves a repeated prompt the text encoder's forward never runs, so its
     weights never stream and the transformer keeps
-    the throughput."""
+    the throughput.
+
+    A generation is ComfyUI's prompt: mark its models in use by the current prompt
+    (PromptModelTracker, as comfy/execution.py does per node output), so pin eviction under host
+    RAM pressure takes other models' pins before the running ones'. reclaim() ends it."""
     patchers = getattr(pipe, "_offloader_patchers", None)
     if not patchers:
         return
 
     import comfy.model_management as mm
+    from comfy.model_patcher import PromptModelTracker
+
+    pipe._offloader_prompt = PromptModelTracker()
+    pipe._offloader_prompt.add(patchers)
+
     mm.load_models_gpu(patchers)
 
 
 def node_teardown():
-    """ComfyUI's per-NODE offloader teardown, verbatim: reset_cast_buffers +
-    cleanup_prefetch_queues + vbars_reset_watermark_limits -- what comfy runs in the `finally`
-    after EVERY node execution when the offloader is on (comfy/execution.py:543-549). It resets the
-    globally-cached per-stream cast buffers, the block prefetch queues and the VBAR watermarks.
+    """ComfyUI's per-NODE offloader teardown, verbatim: cleanup_prefetch_queues +
+    reset_cast_buffers + vbars_reset_watermark_limits, in that order: what comfy runs in the
+    `finally` after EVERY node execution when the offloader is on (comfy/execution.py:550-554). It
+    resets the block prefetch queues (and aborts a malloc graph), the globally-cached per-stream
+    cast buffers and the VBAR watermarks.
 
     ComfyUI gets these boundaries for free because its graph is nodes: CLIPTextEncode ends, the
     teardown runs, THEN KSampler starts. A diffusers pipeline has no such boundary -- encode_prompt
@@ -562,10 +573,10 @@ def node_teardown():
         return
 
     try:
-        mm.reset_cast_buffers()
-
         import comfy.model_prefetch as mp
         mp.cleanup_prefetch_queues()
+
+        mm.reset_cast_buffers()
 
         import comfy_aimdo.model_vbar as mv
         mv.vbars_reset_watermark_limits()
@@ -593,6 +604,10 @@ def reclaim(pipe):
         mm.soft_empty_cache()
     except Exception:
         print(traceback.format_exc(), flush=True)
+
+    prompt = getattr(pipe, "_offloader_prompt", None)
+    if prompt is not None:
+        prompt.end()
 
 
 def release(pipe):
