@@ -309,6 +309,10 @@ Windows 11 · torch 2.12 + cu130.
 | flux2-4b | CPU | 1024×768 | 4 | ~325 s | stream |
 | z-image-turbo (20 GB) | CPU | 512×512 | 8 | ~315 s | stream |
 
+These rows predate the v0.39 re-sync (ComfyUI v0.27, torch 2.12). The current head-to-head against
+ComfyUI v0.39.1 on torch 2.14.1 (same files and graphs, interleaved) is in the v0.39 re-sync note
+under Notes: turbo on par or faster end to end, comfy-flux2-4b sampling faster than ComfyUI.
+
 Notes: the A1000 is **Ampere** (sm_86, bf16 tensor cores), so CUDA compute stays bf16 -- no
 `manual_cast` (unlike the Turing box above, which runs fp16); with 32 GB RAM the ≤20 GB models fit
 the page cache, so VBAR streaming is RAM-fed. **The ComfyUI-reuse engines match or beat their stock
