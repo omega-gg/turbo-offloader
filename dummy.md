@@ -112,7 +112,9 @@ release a mechanical copy (`offloader/comfy/resync.md`). The runner only ever ca
   model to fit in RAM.
 - **VBAR** (CUDA, when the optional `comfy-aimdo` package is present). A `ModelPatcherDynamic`
   keeps as much of the model *permanently on the GPU* as free VRAM allows and streams only the
-  remainder — directly from the model file, through the OS page cache. Because nothing is ever
+  remainder — directly from the model file, through the OS page cache. (Even a weight the loader
+  splits apart, like ComfyUI's fused attention weights, is read straight from the file to the
+  GPU, as ComfyUI does.) Because nothing is ever
   fully materialised in RAM, models bigger than RAM work (e.g. qwen's 41 GB transformer on a
   32 GB machine). Picked automatically when available.
 

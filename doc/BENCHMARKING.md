@@ -18,6 +18,13 @@ where turbo went from ~5× slower to per-step parity.
   OS page cache, so the next cold load is disk-bound and slow. That's a cache artifact, not the engine.
 - **Same prompt twice within an engine** exercises turbo's encode cache (2nd gen skips the text
   encoder). Use a *fresh* prompt when you specifically want to measure a cold text-encode.
+- **Same runtime:** turbo pins the torch ComfyUI's install runs (see `offloader/comfy/resync.md`);
+  compare on that same torch, and use ComfyUI's own template graphs for the engine.
+- **Interleave, small canvas:** the A1000 laptop throttles and its page cache swings a streaming
+  phase by ±5 s run to run, so alternate the two sides (A, B, A, B) at 512² and trust a delta only
+  once a second pair reproduces it.
+- **Step-1 gaps:** profile the *first* forward too (no skip). That is the weight-streaming one, and
+  diffing it against ComfyUI's is what exposed weights missing comfy's direct file→device read.
 
 ## Level 1 — wall-clock (per-step + end-to-end)
 
@@ -25,8 +32,7 @@ where turbo went from ~5× slower to per-step parity.
 
 ```sh
 cd turboCLI/bash/turbo && SKY_PATH_BIN=D:/omega/sky/bin sh server.sh start   # backgrounded
-cd ../z-image
-sh run.sh "PROMPT" out.png 1024 768 cuda SEED 8 offloader none none 8080
+sh text-to-image.sh z-image-turbo cuda "PROMPT" out.png 1024 768 SEED 8 offloader none none 8080
 ```
 
 Per-step comes from the runner's tqdm (`… N/8 (mm:ss, X.XXs/it)`); the `s/it` at step 8 is the

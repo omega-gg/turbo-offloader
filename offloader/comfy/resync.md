@@ -17,6 +17,10 @@ comfy-kitchen at the versions that tag's `requirements.txt` pins.
 | comfy-aimdo   | `3b8e8c162efeb9470d912609a7a6e7a2b1c693ec` | v0.5.5 (pip)           |
 | comfy-kitchen | `be003b7c23c5b01328657955b8bc5d3f073d868e` | v0.2.37 (pip)          |
 
+The runtime matches the reference ComfyUI install too, so turbo and ComfyUI are compared on the
+same kernels: torch 2.14.1+cu130, torchvision 0.29.1, torchaudio 2.11.0 (pinned in turboCLI
+`bash/turbo/build.sh`).
+
 ## Files copied verbatim from `ComfyUI/comfy/`
 
 Flat modules: `model_management.py`, `model_patcher.py`, `ops.py`, `memory_management.py`,
@@ -80,7 +84,8 @@ not). Grep `# [turbo-offloader] disabled for turboCLI:` to find them all.
    (`git show <tag>:comfy/<file>`, `git archive <tag> comfy/<pkg>` for the packages), then check
    `git diff --stat` matches upstream's own diff between the two tags.
 2. Update the commits in this file, in `offloader/comfy/__init__.py` and in `README.md`, and the
-   comfy-aimdo / comfy-kitchen versions in turboCLI `bash/turbo/build.sh`.
+   comfy-aimdo / comfy-kitchen versions in turboCLI `bash/turbo/build.sh`, along with the torch /
+   torchvision / torchaudio the reference ComfyUI install runs.
 3. Re-apply the 3 comment-outs in category (3) (grep the marker in the OLD tree first to relocate
    them if line numbers moved).
 4. Smoke test — must print `import OK` and `aimdo_enabled= False`, both as is and with the
@@ -98,7 +103,9 @@ not). Grep `# [turbo-offloader] disabled for turboCLI:` to find them all.
    verbatim copy: `pinned_memory` internals (`install_pin_rollback_guard`), the SDPA body in
    `comfy/ops.py` (`use_comfy_attention`), the per-node teardown in `execution.py`
    (`node_teardown`), aimdo's `control.init` arguments in `main.py` (`pre_torch_init`), the
-   `ModelPatcher` constructor (`fast_disk`) and `PromptModelTracker` (`prepare`/`reclaim`), plus
+   `ModelPatcher` constructor (`fast_disk`), `PromptModelTracker` (`prepare`/`reclaim`), and the
+   `load_safetensors` storage tags `_comfy_tensor_file_slice` / `_comfy_tensor_mmap_refs` that
+   `_own_file_slice` rebuilds, plus
    the upstream line numbers cited in comments and `implementation.md`.
 7. Verify on CUDA at 512² (seed 42), keeping runs short: flux2-4b, comfy-krea2-turbo and (CPU)
    flux2-4b give the same md5 before and after, unless upstream changed numerics on purpose;

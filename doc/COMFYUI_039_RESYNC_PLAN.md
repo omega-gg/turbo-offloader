@@ -17,6 +17,11 @@ User decisions: keep torch at 2.12.1+cu130 (a bump would be a separate measured 
 graph prefetch is a measured follow-up, not part of the re-sync; the turbo runtime may be modified
 after a backup.
 
+Revised after the re-sync: the runtime adopted ComfyUI's torch 2.14.1+cu130 (torchvision 0.29.1)
+so turbo is compared against ComfyUI on the same kernels, and the malloc graph (Step 7) was
+dropped: ComfyUI never enables it for flux2/krea2, and in a diffusers forward it aborts on a CUDA
+sync during recording. Outcomes are in `implementation.md` (v0.39 re-sync note).
+
 ## Target pins: tagged releases only (resolved 2026-10-07 via `git ls-remote`)
 
 | repo | tag | commit | note |

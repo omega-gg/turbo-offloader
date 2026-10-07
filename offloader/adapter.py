@@ -575,7 +575,13 @@ def assign_streamed_weights(model, model_dir):
     for shard in shards:
         sd.update(cu.load_torch_file(shard, device=torch.device("cpu")))
     model._offloader_files = shards  # build_dynamic_patcher's fast_disk
-    return _assign_sd(model, sd)
+    missing = _assign_sd(model, sd)
+    # Rebinding by name skips a tied weight (Qwen3's lm_head, absent from the file): it would keep
+    # from_pretrained's tensor, and that one view holds the whole ~8GB load buffer alive. Re-tie,
+    # as _direct_load does, so the head shares the file slice.
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
+    return missing
 
 
 def load_streamed(model_cls, model_dir, dtype, operations=None):
@@ -594,14 +600,45 @@ def load_streamed(model_cls, model_dir, dtype, operations=None):
     return model, missing
 
 
+def _own_file_slice(t):
+    """A view a key `convert` cut out of a file-sliced weight (diffusers chunking ComfyUI's fused
+    qkv) is not a whole slice, so comfy's cast skips its direct file->device read for it
+    (read_tensor_file_slice_into) and pages it through the mmap. Rebuild it the way comfy's
+    load_safetensors builds every tensor (utils.py:150-155): own buffer over the same mmap, own
+    TensorFileSlice. Anything else is returned as-is."""
+    import warnings
+
+    import comfy.memory_management as memm
+
+    storage = t.untyped_storage()
+    info = getattr(storage, "_comfy_tensor_file_slice", None)
+    refs = getattr(storage, "_comfy_tensor_mmap_refs", None)
+    size = t.numel() * t.element_size()
+    if info is None or refs is None or not t.is_contiguous() or size == info.size:
+        return t
+
+    skip = t.data_ptr() - storage.data_ptr()  # byte offset of the view inside its slice
+    mv = refs[1]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="The given buffer is not writable")
+        base = torch.frombuffer(mv, dtype=torch.uint8, count=1).data_ptr()  # mmap start
+        start = t.data_ptr() - base
+        view = torch.frombuffer(mv[start:start + size], dtype=t.dtype).view(t.shape)
+    own = view.untyped_storage()
+    own._comfy_tensor_file_slice = memm.TensorFileSlice(info.file_ref, info.lock,
+                                                        info.offset + skip, size)
+    own._comfy_tensor_mmap_refs = refs
+    return view
+
+
 def stream_single_file(build_meta, weight_file, operations=None, convert=None, device=None):
     """load_streamed's single-file sibling (ComfyUI-reuse engines): meta-load the module via
     build_meta() (accelerate init_empty_weights, so no weight RAM), comfy-ize it, mmap the ONE
     ComfyUI safetensors via load_torch_file, optionally run `convert` on the state dict -- the
-    diffusers single-file key remap (renames + a fused-qkv chunk that returns views, so mmap file-
-    slices survive) -- then rebind by name. `device` (MPS direct load, see load_pipe_comfy) reads
-    the file straight onto that device instead of CPU mmap, in the model's dtype. Returns
-    (model, missing)."""
+    diffusers single-file key remap (renames + a fused-qkv chunk that returns views, re-wrapped by
+    _own_file_slice so they stream as file slices), then rebind by name. `device` (MPS direct
+    load, see load_pipe_comfy) reads the file straight onto that device instead of CPU mmap, in
+    the model's dtype. Returns (model, missing)."""
     import comfy.utils as cu
 
     model = build_meta()
@@ -612,7 +649,7 @@ def stream_single_file(build_meta, weight_file, operations=None, convert=None, d
     model._offloader_files = [weight_file]  # build_dynamic_patcher's fast_disk
 
     if convert is not None:
-        sd = convert(sd)
+        sd = {k: _own_file_slice(v) for k, v in convert(sd).items()}
 
     # Direct load: cast to the model's own dtype, as ComfyUI's load_state_dict copy into a model
     # built on the device does -- the resident weights never go through a per-forward cast.
@@ -690,7 +727,7 @@ def load_quant_single_file(build_meta, weight_file, load_device, compute_dtype, 
     quant_config = cu.detect_layer_quantization(sd, "")
 
     if convert is not None:
-        sd = convert(sd)
+        sd = {k: _own_file_slice(v) for k, v in convert(sd).items()}
 
     operations = mixed_precision_operations(compute_dtype, load_device, quant_config)
     _quant_ize(model, operations, compute_dtype)

@@ -467,21 +467,21 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   ComfyUI install's split single files rather than a diffusers component dir:
   `adapter.stream_single_file` meta-loads each big model, mmaps the one safetensors via
   `load_torch_file`, applies an optional key `convert` (the diffusers single-file remap for the
-  transformer -- renames + a fused-qkv `torch.chunk` that returns views, so the mmap slices
-  survive; a `model.`-prefix strip for the Qwen3 text encoder, a flat→nested rename for the
-  Qwen2.5-VL one), then rebinds by name (`_assign_sd`). A scaled-fp8 model -- transformer or text
-  encoder -- takes the quant sibling `load_quant_single_file` (spec `{"quant": True}`) instead. Its
-  `convert` runs on the fp8 state dict too (comfy-krea2-turbo remaps the whole ComfyUI-native DiT
-  to the diffusers `Krea2Transformer2DModel` layout). The VAE + scheduler +
-  tokenizer come straight from the scaffold, or a reused ComfyUI VAE is rebuilt engine-side (qwen's
-  WAN-keyed VAE → `convert_wan_vae_to_diffusers`) and handed in as a prebuilt `component`. It
-  shares both ends with `load_pipe`: the `_prepare_offload` setup (device / CPU comfy-vs-stream
-  mode / dtype / manual_cast / operations / VBAR / builder) and the `_finalize_pipe` tail (VAE
-  placement, execution device, encode bridge/cache) — only the weight source differs, plus the CPU
-  full-load fit is sized from the single files rather than `cpu_fits_full_load`'s component-dir
-  shards. Model-agnostic: every model-specific piece (meta-builders, key remaps, quant flag, the
-  optional `lora_keys` builder for LoRA naming, the reused-VAE rebuild) is data the engine passes
-  in; no names here. Verified on the A1000:
+  transformer: renames + a fused-qkv `torch.chunk` that returns views, which `_own_file_slice`
+  re-wraps as file slices of their own, see the v0.39 note; a `model.`-prefix strip for the Qwen3
+  text encoder, a flat→nested rename for the Qwen2.5-VL one), then rebinds by name (`_assign_sd`).
+  A scaled-fp8 model (transformer or text encoder) takes the quant sibling `load_quant_single_file`
+  (spec `{"quant": True}`) instead. Its `convert` runs on the fp8 state dict too (comfy-krea2-turbo
+  remaps the whole ComfyUI-native DiT to the diffusers `Krea2Transformer2DModel` layout). The VAE +
+  scheduler + tokenizer come straight from the scaffold, or a reused ComfyUI VAE is rebuilt
+  engine-side (qwen's WAN-keyed VAE → `convert_wan_vae_to_diffusers`) and handed in as a prebuilt
+  `component`. It shares both ends with `load_pipe`: the `_prepare_offload` setup (device / CPU
+  comfy-vs-stream mode / dtype / manual_cast / operations / VBAR / builder) and the
+  `_finalize_pipe` tail (VAE placement, execution device, encode bridge/cache) — only the weight
+  source differs, plus the CPU full-load fit is sized from the single files rather than
+  `cpu_fits_full_load`'s component-dir shards. Model-agnostic: every model-specific piece
+  (meta-builders, key remaps, quant flag, the optional `lora_keys` builder for LoRA naming, the
+  reused-VAE rebuild) is data the engine passes in; no names here. Verified on the A1000:
   z-image-turbo 1024×768 (VBAR, 0 unmatched) and comfy-qwen-image-edit-2511 image-to-image (fp8 TE
   emulated), both seed-valid.
 - **Pinning matches ComfyUI (measured).** comfy-aimdo pins the streamed working set lazily per
@@ -522,12 +522,25 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   A1000 at 512² (seed 42, interleaved old/new runs, cool-ish starts): flux2-4b CUDA and CPU and
   comfy-krea2-turbo CUDA give **bit-identical images** across the two stacks, and per-step time is
   at parity (krea2 ~2.2 s/it both, flux2 ~12 s generation both, flux2 CPU ~25 s/step both).
-  z-image stays bit-identical across runs. Against ComfyUI v0.39.1 itself (same files and graph
-  from its templates, fresh process each, interleaved, ms phase logs): end to end turbo is on par
-  or faster (comfy-flux2-4b 31.5/36.0 vs 34.6/38.8 s; comfy-krea2-turbo ~60-64 vs ~61-71 s),
-  winning startup/load and VAE decode while its sampling trails by 1-3 s, all in step 1 (the
-  first weight stream; steady steps match). flux2-4b from the diffusers repo is the exception,
-  ~2-4 s behind ComfyUI: its encode and first step are slower than comfy-flux2-4b's on the same
-  weights (a turbo loading-path cost, present before the re-sync). Not taken yet: upstream's
-  malloc graph for prefetch (`malloc_graph_begin`/`malloc_scope="block"`), a measured follow-up.
+  z-image stays bit-identical across runs. The runtime then moved to ComfyUI's own torch
+  (2.12.1 → **2.14.1**+cu130, torchvision 0.29.1; new kernels, so new reference images) so the
+  comparison below runs on the same torch. Against ComfyUI v0.39.1 (same files and graph from
+  its templates, fresh process each, interleaved, ms phase logs) turbo is on par or faster end to
+  end, images matching visually. comfy-flux2-4b's sampling first trailed by ~2 s, all in step 1:
+  profiling ComfyUI's and turbo's first forward side by side showed 60 extra weight copies on
+  turbo's side, the q/k/v weights diffusers' converter cuts out of ComfyUI's fused qkv with
+  `torch.chunk`. Those views are not whole file slices, so comfy's cast rejected its direct
+  file→device read (`read_tensor_file_slice_into`) and paged them through the mmap instead.
+  `_own_file_slice` rebuilds each such view the way comfy's `load_safetensors` builds every
+  tensor (own buffer over the mmap + own `TensorFileSlice`), so they take comfy's own fast path:
+  same bytes (image md5 unchanged), and turbo now samples faster than ComfyUI (7.0/10.1 vs
+  8.8/11.3 s; end to end 33.9/38.2 vs 35.7/39.8 s). comfy-krea2-turbo's convert only renames, so
+  it was unaffected and stays at parity (57.8 vs 58.6 s). flux2-4b from the diffusers repo trails
+  by a further ~2-4 s for the same reason: a plain sequential read of its text-encoder file is ~2 s
+  slower than ComfyUI's byte-identical copy here (disk/page cache, not code). Profiling it found
+  a real leak, fixed: `assign_streamed_weights` now re-ties tied weights (Qwen3's `lm_head`),
+  which otherwise kept `from_pretrained`'s ~8 GB load buffer alive (flux2-4b peak private memory
+  29.9 → 22.4 GB, image unchanged). Upstream's malloc graph for prefetch was tried and dropped:
+  ComfyUI only enables it for forwards it owns (never flux2/krea2), and inside a diffusers block
+  it aborts on a CUDA sync during recording.
 - **License.** ComfyUI is GPLv3; the vendored copies live in this already-GPLv3 package.
