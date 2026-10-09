@@ -42,7 +42,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `prepare(pipe)` | `load_models_gpu(patchers)`: place managed models on the compute device; mark them the current prompt (`PromptModelTracker`) |
 | `reclaim(pipe)` | `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
-| `kitchen_ops()` | ComfyUI's fused building blocks for an engine that runs its diffusers model the way the matching ComfyUI model does: `ck` (comfy_kitchen as ComfyUI configures it, `None` without its kernels) and `linear_input_act` (an activation folded into an int8 linear's input quantizer). Names no model; used by `comfy-qwen-image-2-1`. |
+| `comfy_api()` | ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI model does: `ck` (comfy_kitchen as ComfyUI configures it, `None` without its kernels), `ops` and `mm` (the vendored comfy.ops / comfy.model_management), called by their ComfyUI names (`ops.linear_input_act`, `mm.pin_memory`, `mm.cast_to`, ...). Names no model; used by `comfy-qwen-image-2-1` (fused forward, host K/V cache with comfy's prefetch). |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
 
@@ -170,7 +170,10 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
   full-input-signature key, embeddings held on CPU, eviction under host-RAM pressure via
   `comfy.model_management.get_free_memory` (below `min(10GB, max(2GB, 10% RAM))`, worst
   `1.3**age × bytes` first). Validated against ComfyUI's own `generate.sh`: identical cold time,
-  encode skipped on a repeat prompt in both.
+  encode skipped on a repeat prompt in both. An image or tensor argument is keyed by its content
+  hash, as ComfyUI's `LoadImage` keys its output by the file's, and the VAE encode of an edit's
+  references goes through the same store (vae.encode takes no generator), so a repeated edit with
+  a new seed skips both encodes as ComfyUI's cached edit node does.
 
 ### Compute parity with ComfyUI
 
@@ -411,7 +414,11 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   refs can gc, tiled via diffusers' `enable_tiling`: the same 256px/64px tile comfy starts from,
   sd.py:1324-1325, though since v0.39 comfy then resizes a 3D tile to its VRAM budget). Result:
   krea2 1600×1200 decodes clean — untiled, the fallback never even fires — and z-image stays
-  bit-identical.
+  bit-identical. A VAE may carry its own estimates, as comfy's VAE class does
+  (`memory_used_decode` / `memory_used_encode(shape, dtype)`; comfy-qwen-image-2-1's diffusers
+  decoder needs 7 GB at 1024², four times comfy's). When even that cannot be freed, the call tiles
+  up front: the one deviation from comfy, which only tiles after an OOM, because running a
+  diffusers VAE into a sure OOM can end in the uncatchable abort above (measured on a 4 GB card).
 
 ## Notes
 

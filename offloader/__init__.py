@@ -527,20 +527,20 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
                           manual_cast or dtype)
 
 
-def kitchen_ops():
-    """ComfyUI's fused building blocks, for an engine that runs its diffusers model the way the
-    matching ComfyUI model does: comfy_kitchen as ComfyUI configures it (comfy.quant_ops.ck, None
-    without its kernels) and comfy.ops.linear_input_act (an activation folded into an int8
-    linear's input quantizer, with ComfyUI's own weight cast). Names no model; the engine decides
-    what to fuse."""
+def comfy_api():
+    """ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI
+    model does: comfy_kitchen as ComfyUI configures it (`ck`, None without its kernels) and the
+    vendored comfy.ops / comfy.model_management (`ops`, `mm`), called by their ComfyUI names
+    (ops.linear_input_act, mm.pin_memory, mm.cast_to, ...). Names no model."""
     from types import SimpleNamespace
 
     from . import adapter  # noqa: F401  (brings up the vendored comfy package)
+    import comfy.model_management as mm
     import comfy.ops as ops
     import comfy.quant_ops as qo
 
-    return SimpleNamespace(ck=qo.ck if getattr(qo, "_CK_AVAILABLE", False) else None,
-                           linear_input_act=ops.linear_input_act)
+    return SimpleNamespace(ck=qo.ck if getattr(qo, "_CK_AVAILABLE", False) else None, ops=ops,
+                           mm=mm)
 
 
 def prepare(pipe):

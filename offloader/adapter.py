@@ -1109,20 +1109,31 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
             if node_boundary is not None:
                 node_boundary()
             samples_in = args[0] if args else next(iter(kwargs.values()), None)
+            do_tile = False
             if hasattr(samples_in, "shape") and samples_in.device.type != "cpu":
-                memory_used = _vae_memory_used(
-                    kind, samples_in.shape, getattr(vae, "dtype", samples_in.dtype))
+                # A VAE may carry its own estimates, as comfy's VAE class does
+                # (memory_used_decode / memory_used_encode(shape, dtype) -> bytes); else the
+                # generic pairs, which fit comfy's 8x VAEs.
+                dtype = getattr(vae, "dtype", samples_in.dtype)
+                own = getattr(vae, {"decoding": "memory_used_decode",
+                                    "encoding": "memory_used_encode"}[kind], None)
+                memory_used = (own(samples_in.shape, dtype) if own is not None
+                               else _vae_memory_used(kind, samples_in.shape, dtype))
                 extra_mem = max(mm.minimum_inference_memory(),
                                 memory_used + mm.extra_reserved_memory())
                 mm.free_memory(extra_mem, samples_in.device)
-            do_tile = False
-            try:
-                return real(*args, **kwargs)
-            except Exception as e:
-                mm.raise_non_oom(e)
-                print("Warning: Ran out of memory when regular VAE %s, retrying with tiled VAE "
-                      "%s." % (kind, kind), flush=True)
-                do_tile = True
+                # Still short after freeing: tile up front (comfy only tiles after an OOM; a
+                # diffusers VAE run into a sure OOM can end in an uncatchable CUDA abort instead,
+                # measured: a 4 GB card decoding 1024² with a 7 GB working set).
+                do_tile = mm.get_free_memory(samples_in.device) < memory_used
+            if not do_tile:
+                try:
+                    return real(*args, **kwargs)
+                except Exception as e:
+                    mm.raise_non_oom(e)
+                    print("Warning: Ran out of memory when regular VAE %s, retrying with tiled "
+                          "VAE %s." % (kind, kind), flush=True)
+                    do_tile = True
             if do_tile:
                 mm.soft_empty_cache()
                 vae.enable_tiling()
@@ -1212,17 +1223,27 @@ def install_encode_cache(pipe):
     repeated prompt skips the encoder's forward entirely -- and since load_models_gpu is idempotent
     the un-run encoder is never streamed in, leaving the diffusion model resident (why ComfyUI's
     warm runs spend ~0s on a cached encode). The key is the call's FULL (args, kwargs), like
-    ComfyUI keying a node on its whole input signature: an argument that isn't cleanly hashable --
-    a tensor/image, e.g. an image-conditioned edit encode -- makes the call uncacheable, so it
-    never gets a false hit. No-op if
-    the pipe has no encode_prompt or the cache is already installed."""
+    ComfyUI keying a node on its whole input signature; an image, array or tensor argument (an
+    edit's conditioning images) is keyed by its content, as ComfyUI's LoadImage keys its output by
+    the file's hash, so a repeated edit with a new seed reuses its encode as ComfyUI's does. Any
+    other unhashable argument makes the call uncacheable, so it never gets a false hit.
+
+    The VAE encode of an edit's reference images goes through the same cache (ComfyUI's edit
+    node caches its reference latents along with the prompt): vae.encode takes no generator, so
+    its output depends on the image alone. One store for both, as ComfyUI keeps one for all node
+    outputs. No-op if the pipe has no encode_prompt or the cache is already installed."""
     real = getattr(pipe, "encode_prompt", None)
 
     if real is None or getattr(pipe, "_encode_cache_installed", False):
         return
 
+    import copy
     import time
     import bisect
+    import hashlib
+
+    import numpy as np
+    from PIL import Image
 
     OLD_OOM_MULT = 1.3   # comfy RAM_CACHE_OLD_WORKFLOW_OOM_MULTIPLIER
     BASE_USAGE = 0.05    # comfy RAM_CACHE_DEFAULT_RAM_USAGE (keeps zero-size entries LRU-ordered)
@@ -1239,6 +1260,14 @@ def install_encode_cache(pipe):
         if isinstance(v, (list, tuple)):
             parts = tuple(norm(x) for x in v)
             return uncacheable if any(p is uncacheable for p in parts) else parts
+        if isinstance(v, Image.Image):
+            return ("image", v.mode, v.size, hashlib.sha256(v.tobytes()).hexdigest())
+        if isinstance(v, np.ndarray):
+            v = torch.from_numpy(v)
+        if isinstance(v, torch.Tensor):
+            t = v.detach().cpu().contiguous()
+            return ("tensor", str(t.dtype), tuple(t.shape),
+                    hashlib.sha256(t.view(-1).view(torch.uint8).numpy()).hexdigest())
         return uncacheable
 
     def key_of(args, kwargs):
@@ -1253,6 +1282,11 @@ def install_encode_cache(pipe):
             return obj.to(device)
         if isinstance(obj, (list, tuple)):
             return type(obj)(move(o, device) for o in obj)
+        if hasattr(obj, "__dict__"):           # an output object, e.g. a VAE's latent distribution
+            new = copy.copy(obj)
+            for k, v in vars(obj).items():
+                setattr(new, k, move(v, device))
+            return new
         return obj
 
     def nbytes(obj):
@@ -1260,6 +1294,8 @@ def install_encode_cache(pipe):
             return obj.numel() * obj.element_size()
         if isinstance(obj, (list, tuple)):
             return sum(nbytes(o) for o in obj)
+        if hasattr(obj, "__dict__"):
+            return sum(nbytes(v) for v in vars(obj).values())
         return 0
 
     cache = {}   # key -> [cpu_value, bytes, timestamp, generation]
@@ -1276,28 +1312,39 @@ def install_encode_cache(pipe):
         while scored and mm.get_free_memory(cpu) < target:
             cache.pop(scored.pop()[2], None)   # highest oom_score first
 
-    def cached_encode(*args, **kwargs):
-        key = key_of(args, kwargs)
+    def cached(name, call, device_of):
+        def wrapped(*args, **kwargs):
+            key = key_of(args, kwargs)
 
-        if key is None:                        # tensor/image arg -> not safely cacheable
-            return real(*args, **kwargs)
+            if key is None:                    # an unhashable arg -> not safely cacheable
+                return call(*args, **kwargs)
 
-        gen[0] += 1
-        hit = cache.get(key)
+            key = (name, key)
+            gen[0] += 1
+            hit = cache.get(key)
 
-        if hit is not None:
-            cpu_value, sz, _, _ = hit
-            cache[key] = [cpu_value, sz, time.time(), gen[0]]
-            device = getattr(pipe, "_execution_device", None) or pipe.device
-            return move(cpu_value, device)
+            if hit is not None:
+                cpu_value, sz, _, _ = hit
+                cache[key] = [cpu_value, sz, time.time(), gen[0]]
+                return move(cpu_value, device_of(args, kwargs))
 
-        out = real(*args, **kwargs)
-        cache[key] = [move(out, cpu), nbytes(out), time.time(), gen[0]]
-        ram_release()
+            out = call(*args, **kwargs)
+            cache[key] = [move(out, cpu), nbytes(out), time.time(), gen[0]]
+            ram_release()
 
-        return out
+            return out
+        return wrapped
 
-    pipe.encode_prompt = cached_encode
+    pipe.encode_prompt = cached(
+        "encode_prompt", real,
+        lambda args, kwargs: getattr(pipe, "_execution_device", None) or pipe.device)
+
+    vae = getattr(pipe, "vae", None)
+    if vae is not None and hasattr(vae, "encode"):
+        vae.encode = cached(
+            "vae.encode", vae.encode,
+            lambda args, kwargs: (args[0] if args else next(iter(kwargs.values()))).device)
+
     pipe._encode_cache_installed = True
 
 
