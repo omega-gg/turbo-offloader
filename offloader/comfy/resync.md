@@ -35,6 +35,11 @@ e.g. `comfy/ldm/lightricks/av_model.py`) via forward hooks on the diffusers tran
 ModuleLists.
 Packages (whole dir): `comfy_types/`, `weight_adapter/`.
 
+Model code, for an engine whose component runs as ComfyUI's own: `ldm/wan/vae2_2.py` (the Wan 2.2
+VAE, which `comfy/sd.py` builds for the Qwen-Image 2.1 file), with what it imports,
+`ldm/wan/vae.py` and `ldm/modules/diffusionmodules/model.py` (and that package's empty
+`__init__.py`). An engine imports them as `comfy.ldm.*` once `comfy_api()` brought the package up.
+
 `cli_args.py` + `options.py` are vendored as-is (not stubbed): `options.args_parsing` is `False`, so
 `cli_args` does `parser.parse_args([])` and every flag gets its upstream default. This is more
 faithful and lower-maintenance than a hand-written `args` stub (no field list to drift).

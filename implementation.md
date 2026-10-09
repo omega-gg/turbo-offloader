@@ -43,6 +43,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `reclaim(pipe)` | `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
 | `comfy_api()` | ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI model does: `ck` (comfy_kitchen as ComfyUI configures it, `None` without its kernels), `ops` and `mm` (the vendored comfy.ops / comfy.model_management), called by their ComfyUI names (`ops.linear_input_act`, `mm.pin_memory`, `mm.cast_to`, ...). Names no model; used by `comfy-qwen-image-2-1` (fused forward, host K/V cache with comfy's prefetch). |
+| `comfy_vae(model, config, memory_used_decode, memory_used_encode, latent_channels, image_channels, ratio)` | opt in to ComfyUI's own VAE: a comfy.ldm.* model (vendored, imported once `comfy_api()` ran) behind the calls a diffusers pipeline makes, run as comfy/sd.py's VAE class runs it (`adapter.ComfyVAE`: its estimates, the clamp, `decode_tiled_` / `encode_tiled_`). The engine passes sd.py's settings for that model; used by `comfy-qwen-image-2-1` (Wan 2.2 VAE). |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
 
@@ -415,10 +416,15 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   sd.py:1324-1325, though since v0.39 comfy then resizes a 3D tile to its VRAM budget). Result:
   krea2 1600×1200 decodes clean — untiled, the fallback never even fires — and z-image stays
   bit-identical. A VAE may carry its own estimates, as comfy's VAE class does
-  (`memory_used_decode` / `memory_used_encode(shape, dtype)`; comfy-qwen-image-2-1's diffusers
-  decoder needs 7 GB at 1024², four times comfy's). When even that cannot be freed, the call tiles
-  up front: the one deviation from comfy, which only tiles after an OOM, because running a
-  diffusers VAE into a sure OOM can end in the uncatchable abort above (measured on a 4 GB card).
+  (`memory_used_decode` / `memory_used_encode(shape, dtype)`). When even that cannot be freed, the
+  call tiles up front: the one deviation from comfy, which only tiles after an OOM, because
+  running a diffusers VAE into a sure OOM can end in the uncatchable abort above (measured on a
+  4 GB card). An engine can also opt in to ComfyUI's own VAE, `comfy_vae`: comfy's model
+  (`comfy/ldm/*`, vendored verbatim) run as sd.py's VAE class runs it, with sd.py's estimates and
+  its tiled fallbacks, so it decodes what ComfyUI decodes. comfy-qwen-image-2-1 does: its Wan 2.2
+  decoder runs a single image in row strips, exact and in a quarter of diffusers' memory (1.4
+  against 5.5 GB at 1024×768), where diffusers' tiles had bent the alpha along their seams, and
+  its decode matches ComfyUI's time (L4 1024²: 0.69 s against 0.71 s, from 1.0 s).
 
 ## Notes
 

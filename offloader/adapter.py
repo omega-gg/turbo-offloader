@@ -36,6 +36,7 @@
 from . import comfy  # noqa: F401
 
 import os
+from types import SimpleNamespace
 
 import torch
 
@@ -53,6 +54,7 @@ if not torch.cuda.is_available() and not (_mps is not None and _mps.is_available
 import comfy.model_management as mm
 import comfy.model_patcher as model_patcher
 import comfy.ops as ops
+import comfy.utils
 
 
 # -------------------------------------------------------------------------------------------------
@@ -1069,6 +1071,84 @@ def _vae_memory_used(kind, shape, dtype):
     if kind == "decoding":
         return (2178 * shape[2] * shape[3] * 64) * mm.dtype_size(dtype)
     return (1767 * shape[2] * shape[3]) * mm.dtype_size(dtype)
+
+
+class ComfyVAE(torch.nn.Module):
+    """A ComfyUI VAE model (comfy.ldm.*, the first_stage_model comfy/sd.py builds) behind the
+    calls a diffusers pipeline makes, run as sd.py's VAE class runs it: the model's own encode /
+    decode, the output clamped (process_output), and for a VRAM too small its tiled fallbacks
+    (decode_tiled_ / encode_tiled_, their default tiles). The engine passes what sd.py sets for
+    that model: its working-memory estimates (ComfyUI shapes), latent and image channels and
+    spatial ratio. A pipeline's frame axis (B, C, 1, H, W) is dropped going in and put back coming
+    out. install_tiled_vae_fallback reads the estimates and turns tiling on when VRAM is short."""
+
+    def __init__(self, model, config, memory_used_decode, memory_used_encode, latent_channels,
+                 image_channels, ratio):
+        super().__init__()
+        self.model = model
+        self.config = config  # what the pipeline reads (z_dim, latent statistics, ...)
+        self._memory_used_decode = memory_used_decode
+        self._memory_used_encode = memory_used_encode
+        self.latent_channels = latent_channels
+        self.image_channels = image_channels
+        self.ratio = ratio
+        self.use_tiling = False
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    def enable_tiling(self):
+        self.use_tiling = True
+
+    def disable_tiling(self):
+        self.use_tiling = False
+
+    def memory_used_decode(self, shape, dtype):
+        return self._memory_used_decode(_unframed(shape), dtype)
+
+    def memory_used_encode(self, shape, dtype):
+        return self._memory_used_encode(_unframed(shape), dtype)
+
+    def decode(self, z, return_dict=True):
+        from diffusers.models.autoencoders.vae import DecoderOutput
+
+        framed = z.dim() == 5
+        z = (z[:, :, 0] if framed else z).to(self.dtype)
+        if self.use_tiling:
+            x = _tiled(z, self.model.decode, ((32, 128), (128, 32), (64, 64)), 16, self.ratio,
+                       self.image_channels)
+        else:
+            x = self.model.decode(z)
+        x = x.clamp(-1.0, 1.0)
+        x = x.unsqueeze(2) if framed else x
+        return DecoderOutput(sample=x) if return_dict else (x,)
+
+    def encode(self, x, return_dict=True):
+        from diffusers.models.modeling_outputs import AutoencoderKLOutput
+
+        framed = x.dim() == 5
+        x = (x[:, :, 0] if framed else x).to(self.dtype)
+        if self.use_tiling:
+            mu = _tiled(x, self.model.encode, ((512, 512), (1024, 256), (256, 1024)), 64,
+                        1 / self.ratio, self.latent_channels)
+        else:
+            mu = self.model.encode(x)
+        mu = mu.unsqueeze(2) if framed else mu
+        # ComfyUI encodes to the mean, so the distribution is that mean however it is read.
+        dist = SimpleNamespace(mode=lambda: mu, sample=lambda generator=None: mu)
+        return AutoencoderKLOutput(latent_dist=dist) if return_dict else (dist,)
+
+
+def _unframed(shape):
+    return tuple(shape[:2]) + tuple(shape[3:]) if len(shape) == 5 else tuple(shape)
+
+
+def _tiled(x, fn, tilings, overlap, upscale, channels):
+    # sd.py's three tilings, averaged.
+    return sum(comfy.utils.tiled_scale(x, fn, w, h, overlap, upscale_amount=upscale,
+                                       out_channels=channels, output_device=x.device)
+               for w, h in tilings) / 3.0
 
 
 def install_tiled_vae_fallback(pipe, node_boundary=None):

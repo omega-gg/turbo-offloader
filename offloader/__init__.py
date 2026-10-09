@@ -543,6 +543,18 @@ def comfy_api():
                            mm=mm)
 
 
+
+def comfy_vae(model, config, memory_used_decode, memory_used_encode, latent_channels,
+              image_channels, ratio):
+    """Opt in to ComfyUI's VAE: a ComfyUI VAE model (comfy.ldm.*, which an engine imports once
+    comfy_api() brought the package up) behind the calls a diffusers pipeline makes, run the way
+    comfy/sd.py runs it. Pass sd.py's settings for that model; see adapter.ComfyVAE."""
+    from . import adapter
+
+    return adapter.ComfyVAE(model, config, memory_used_decode, memory_used_encode,
+                            latent_channels, image_channels, ratio)
+
+
 def prepare(pipe):
     """Per-generation load boundary: hand the managed models to ComfyUI's load_models_gpu, which
     partial-loads / streams them to the compute device (its dynamic path streams weights
