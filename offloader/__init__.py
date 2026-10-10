@@ -544,15 +544,14 @@ def comfy_api():
 
 
 
-def comfy_vae(model, config, memory_used_decode, memory_used_encode, latent_channels,
-              image_channels, ratio):
-    """Opt in to ComfyUI's VAE: a ComfyUI VAE model (comfy.ldm.*, which an engine imports once
-    comfy_api() brought the package up) behind the calls a diffusers pipeline makes, run the way
-    comfy/sd.py runs it. Pass sd.py's settings for that model; see adapter.ComfyVAE."""
+def comfy_vae(sd, config):
+    """Opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the file's state dict `sd`
+    (its code vendored under comfy/ldm/), run the way sd.py runs it, behind the calls a diffusers
+    pipeline makes. `config` is what the pipeline reads off the VAE's config (z_dim, latent
+    statistics). See adapter.ComfyVAE and adapter._comfy_vae_model."""
     from . import adapter
 
-    return adapter.ComfyVAE(model, config, memory_used_decode, memory_used_encode,
-                            latent_channels, image_channels, ratio)
+    return adapter.ComfyVAE(sd, config)
 
 
 def prepare(pipe):

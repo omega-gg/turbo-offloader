@@ -43,7 +43,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `reclaim(pipe)` | `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
 | `comfy_api()` | ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI model does: `ck` (comfy_kitchen as ComfyUI configures it, `None` without its kernels), `ops` and `mm` (the vendored comfy.ops / comfy.model_management), called by their ComfyUI names (`ops.linear_input_act`, `mm.pin_memory`, `mm.cast_to`, ...). Names no model; used by `comfy-qwen-image-2-1` (fused forward, host K/V cache with comfy's prefetch). |
-| `comfy_vae(model, config, memory_used_decode, memory_used_encode, latent_channels, image_channels, ratio)` | opt in to ComfyUI's own VAE: a comfy.ldm.* model (vendored, imported once `comfy_api()` ran) behind the calls a diffusers pipeline makes, run as comfy/sd.py's VAE class runs it (`adapter.ComfyVAE`: its estimates, the clamp, `decode_tiled_` / `encode_tiled_`). The engine passes sd.py's settings for that model; used by `comfy-qwen-image-2-1` (Wan 2.2 VAE). |
+| `comfy_vae(sd, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the file's state dict (its code vendored under `comfy/ldm/`), run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `comfy/resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1). |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
 
@@ -420,11 +420,16 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   call tiles up front: the one deviation from comfy, which only tiles after an OOM, because
   running a diffusers VAE into a sure OOM can end in the uncatchable abort above (measured on a
   4 GB card). An engine can also opt in to ComfyUI's own VAE, `comfy_vae`: comfy's model
-  (`comfy/ldm/*`, vendored verbatim) run as sd.py's VAE class runs it, with sd.py's estimates and
-  its tiled fallbacks, so it decodes what ComfyUI decodes. comfy-qwen-image-2-1 does: its Wan 2.2
-  decoder runs a single image in row strips, exact and in a quarter of diffusers' memory (1.4
-  against 5.5 GB at 1024×768), where diffusers' tiles had bent the alpha along their seams, and
-  its decode matches ComfyUI's time (L4 1024²: 0.69 s against 0.71 s, from 1.0 s).
+  (`comfy/ldm/*`, vendored verbatim) built and run as sd.py does, mirrored in `adapter.py` (see
+  `comfy/resync.md`), under ComfyUI's model management, so it decodes what ComfyUI decodes, as
+  fast. It loads through `load_models_gpu` as a dynamic patcher, staged in RAM rather than kept
+  on the GPU, so on a small card the transformer keeps that room; a resident VAE decoded 2.5x
+  slower there (Krea 2, 2.37 s against ComfyUI's 0.91 s). comfy-qwen-image-2-1's Wan 2.2 decoder
+  runs a single image in row strips, exact and in a quarter of diffusers' memory (1.4 against
+  5.5 GB at 1024×768), where diffusers' tiles had bent the alpha along their seams. On the 4 GB
+  card at 1024×768, warm: Krea 2 0.95 s (ComfyUI 0.91 s, diffusers tiled 3.4 s), the 2511 edit
+  0.72 s (diffusers 2.9 s), Qwen-Image 2.1 1.55-1.75 s (ComfyUI 1.61 s); on an L4 at 1024²,
+  Qwen-Image 2.1 0.73 s (ComfyUI 0.70 s).
 
 ## Notes
 
