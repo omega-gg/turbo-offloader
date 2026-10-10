@@ -544,14 +544,14 @@ def comfy_api():
 
 
 
-def comfy_vae(sd, config):
-    """Opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the file's state dict `sd`
-    (its code vendored under comfy/ldm/), run the way sd.py runs it, behind the calls a diffusers
-    pipeline makes. `config` is what the pipeline reads off the VAE's config (z_dim, latent
-    statistics). See adapter.ComfyVAE and adapter._comfy_vae_model."""
+def comfy_vae(path, config):
+    """Opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file at `path` (its
+    code vendored under comfy/ldm/), read and run the way ComfyUI does, behind the calls a
+    diffusers pipeline makes. `config` is what the pipeline reads off the VAE's config (z_dim,
+    latent statistics). See adapter.ComfyVAE and adapter._comfy_vae_model."""
     from . import adapter
 
-    return adapter.ComfyVAE(sd, config)
+    return adapter.ComfyVAE(path, config)
 
 
 def prepare(pipe):
@@ -564,7 +564,10 @@ def prepare(pipe):
 
     A generation is ComfyUI's prompt: mark its models in use by the current prompt
     (PromptModelTracker, as comfy/execution.py does per node output), so pin eviction under host
-    RAM pressure takes other models' pins before the running ones'. reclaim() ends it."""
+    RAM pressure takes other models' pins before the running ones'. reclaim() ends it. As a
+    sampling run does (comfy/samplers.py:1259), pre_run hands a model declaring `current_patcher`
+    (as ComfyUI's BaseModel does) its patcher, for get_free_memory. Its cleanup() is left out: from
+    reclaim(), its eject of the dynamic model trips aimdo's VBAR warnings."""
     patchers = getattr(pipe, "_offloader_patchers", None)
     if not patchers:
         return
@@ -576,6 +579,8 @@ def prepare(pipe):
     pipe._offloader_prompt.add(patchers)
 
     mm.load_models_gpu(patchers)
+    for patcher in patchers:
+        patcher.pre_run()
 
 
 def node_teardown():

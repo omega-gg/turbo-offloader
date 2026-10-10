@@ -39,11 +39,11 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
 | `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir. **Model-agnostic**: the engine passes each big model as a data spec (`{meta, file, convert, quant}`) plus prebuilt small `components` (vae/tokenizer/scheduler); no model classes or names appear here. `quant` routes a quantized model (scaled fp8, int8 ConvRot) through the comfy quant path (below). |
-| `prepare(pipe)` | `load_models_gpu(patchers)`: place managed models on the compute device; mark them the current prompt (`PromptModelTracker`) |
+| `prepare(pipe)` | `load_models_gpu(patchers)`: place managed models on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory` |
 | `reclaim(pipe)` | `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
 | `comfy_api()` | ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI model does: `ck` (comfy_kitchen as ComfyUI configures it, `None` without its kernels), `ops` and `mm` (the vendored comfy.ops / comfy.model_management), called by their ComfyUI names (`ops.linear_input_act`, `mm.pin_memory`, `mm.cast_to`, ...). Names no model; used by `comfy-qwen-image-2-1` (fused forward, host K/V cache with comfy's prefetch). |
-| `comfy_vae(sd, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the file's state dict (its code vendored under `comfy/ldm/`), run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `comfy/resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1). |
+| `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `comfy/resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1). |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
 
@@ -233,6 +233,13 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   this because it runs its OWN qwen3, but its attention does the same class of thing (upcasts
   q/k/v, `comfy/ldm/modules/attention.py:244-287`). Model/GPU- agnostic: fires only on a real
   mismatch, no-op on Ampere+ / non-manual-cast.
+- **`use_comfy_attention_config`** — a ComfyUI file can pick a module's attention with a
+  `<module>.comfy_attention.config` key (`ComfyAttention._load_from_state_dict`,
+  `attention.py:82-95`); Qwen-Image-2.1-Turbo's sets `comfy_kitchen_int8` on blocks 1-31. Both
+  single-file loaders pop those keys and, where comfy-kitchen runs it on the device, swap torch's
+  SDPA for `comfy_kitchen.int8_attention` during that module's forward, called as
+  `attention_comfy_kitchen_int8` calls it. Turbo against ComfyUI on an L4: 31-39 dB from
+  29-34 dB with bf16 attention.
 - **`use_kitchen_rope`** — routes the diffusers transformer's RoPE through comfy-kitchen's fused
   `apply_rope1` (the kernel ComfyUI's `comfy/ldm/flux/math.py` uses), via a `(cos,sin)→freqs_cis`
   shim + a module-scoped patch of `diffusers.models.embeddings.apply_rotary_emb`. Lazy:

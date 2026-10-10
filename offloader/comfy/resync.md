@@ -73,7 +73,7 @@ needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.p
 | upstream | in adapter.py | what |
 |---|---|---|
 | `VAE.__init__` branches, sd.py:837-878 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:863-878), Qwen-Image 2.1 (:840-850) |
-| end of `VAE.__init__`, sd.py:1104-1125 | `ComfyVAE._build` | device, dtype, the patcher, the weight load |
+| end of `VAE.__init__`, sd.py:1104-1125; `VAELoader.load_vae`, nodes.py:856 | `ComfyVAE._build` | the file read, device, dtype, the patcher, the weight load |
 | `VAE.decode`, sd.py:1258-1308; `VAE.encode`, sd.py:1411-1460 | `ComfyVAE.decode` / `encode` | `load_models_gpu` with the estimate, the out-of-memory fallback; unlike sd.py, `encode` returns the caller's dtype, as the pipeline feeds it to its transformer |
 | `decode_tiled_`, `decode_tiled_3d` (sized at sd.py:1323-1346), `encode_tiled_`, `encode_tiled_3d` | the same names on `ComfyVAE` | the tiled fallbacks |
 | main.py:303-304 | `enable_vbar` | `CoreModelPatcher` becomes `ModelPatcherDynamic` |
@@ -88,6 +88,8 @@ branch to `_comfy_vae_model`, then compare a decode against ComfyUI's on the sam
 | per-block `prefetch_queue_pop` loop (e.g. `comfy/ldm/lightricks/av_model.py`) | `adapter.install_prefetch` | the same loop, through forward hooks on the diffusers transformer's block ModuleLists |
 | `pinned_memory` internals | `adapter.install_pin_rollback_guard` | survive a transient `HostBuffer.truncate` failure, keeping ComfyUI's own recovery |
 | the SDPA body in `comfy/ops.py` (:58-101) | `adapter.use_comfy_attention` | diffusers' attention through a copy of it |
+| `ComfyAttention._load_from_state_dict` and `attention_comfy_kitchen_int8` (`comfy/ldm/modules/attention.py`:82-95, :622-654) | `adapter.use_comfy_attention_config` | a file's per-module attention config: comfy-kitchen's int8 attention where it runs |
+| `pre_run` before sampling (`comfy/samplers.py`:1259) | `prepare` | a model declaring `current_patcher` gets its patcher |
 | the per-node teardown in `execution.py` | `node_teardown` | the sampler to VAE node boundary |
 | aimdo's `control.init` arguments in `main.py` | `pre_torch_init` | comfy-aimdo's allocator hooks before torch |
 | the `ModelPatcher` constructor (`fast_disk`, as sd.py:2277 passes it) | `adapter.build_dynamic_patcher` | the storage policy of the streamed files |

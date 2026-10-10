@@ -666,6 +666,7 @@ def stream_single_file(build_meta, weight_file, operations=None, convert=None, d
             if k in own and v.is_floating_point() and v.dtype != own[k]:
                 sd[k] = v.to(own[k])
 
+    use_comfy_attention_config(model, sd)
     missing = _assign_sd(model, sd)
     # The slices carry the file's dtype, so honour _keep_in_fp32_modules afterwards.
     keep_declared_fp32(model)
@@ -744,11 +745,64 @@ def load_quant_single_file(build_meta, weight_file, load_device, compute_dtype, 
     # _comfy_class_for), so it converts only the non-Linear leaves.
     comfy_ize(model, operations)
 
+    use_comfy_attention_config(model, sd)
     _missing, unexpected = model.load_state_dict(sd, assign=True, strict=False)
     # assign=True installs the checkpoint's own dtype, so honour _keep_in_fp32_modules afterwards.
     keep_declared_fp32(model)
 
     return model, unexpected
+
+
+def use_comfy_attention_config(model, sd):
+    """ComfyAttention._load_from_state_dict (comfy/ldm/modules/attention.py:82-95): a ComfyUI
+    file's `<module>.comfy_attention.config` key picks the attention that module runs. ComfyUI
+    knows one, comfy_kitchen_int8, taken when comfy-kitchen runs it on the device: that module's
+    SDPA then runs comfy-kitchen's int8 kernel as attention_comfy_kitchen_int8 calls it
+    (attention.py:622-654). Pops those keys."""
+    import json
+
+    import torch.nn.functional as F
+
+    suffix = ".comfy_attention.config"
+    int8 = []
+    for key in [k for k in sd if k.endswith(suffix)]:
+        method = json.loads(sd.pop(key).numpy().tobytes()).get("attention")
+        if method == "comfy_kitchen_int8":
+            int8.append(key[:-len(suffix)])
+        else:
+            print("offloader: ignoring unsupported attention method %r for %s"
+                  % (method, key[:-len(suffix)]), flush=True)
+    try:
+        import comfy_kitchen
+    except ImportError:
+        return
+    if not (int8
+            and comfy_kitchen.int8_attention_is_available()
+            and comfy_kitchen.int8_attention_is_available(mm.get_torch_device())):
+        return
+
+    def int8_attention(query, key, value, attn_mask=None, scale=None, **_):
+        # diffusers' SDPA call: [batch, heads, sequence, head_dim], as the kernel takes them.
+        if attn_mask is not None:
+            if attn_mask.ndim == 2:
+                attn_mask = attn_mask.unsqueeze(0)
+            if attn_mask.ndim == 3:
+                attn_mask = attn_mask.unsqueeze(1)
+        return comfy_kitchen.int8_attention(query, key, value, scale=scale, attn_mask=attn_mask)
+
+    def int8_forward(forward):
+        # diffusers reaches torch's SDPA by name, so the module's forward swaps it in.
+        def call(*args, **kwargs):
+            sdpa, F.scaled_dot_product_attention = F.scaled_dot_product_attention, int8_attention
+            try:
+                return forward(*args, **kwargs)
+            finally:
+                F.scaled_dot_product_attention = sdpa
+        return call
+
+    for prefix in int8:
+        module = model.get_submodule(prefix)
+        module.forward = int8_forward(module.forward)
 
 
 _sdpa_patched = False
@@ -1141,10 +1195,11 @@ class ComfyVAE:
     CoreModelPatcher, dynamic when VBAR is on), its encode / decode with sd.py's memory steps and
     out-of-memory fallback to its tiles, the output clamped (process_output). sd.py builds its
     models once ComfyUI's startup picked the patcher; here that is enable_vbar in load_pipe, so the
-    model is built on first use. Any other attribute is the model's (e.g. temperal_downsample)."""
+    file is read and the model built on first use. Any other attribute is the model's (e.g.
+    temperal_downsample)."""
 
-    def __init__(self, sd, config):
-        self._sd = sd
+    def __init__(self, path, config):
+        self._path = path
         self.config = SimpleNamespace(**config)  # what the pipeline reads (z_dim, ...)
 
     def __getattr__(self, name):
@@ -1158,7 +1213,8 @@ class ComfyVAE:
         # sd.py:1104-1125, the end of VAE.__init__.
         if "model" in self.__dict__:
             return
-        sd = self.__dict__.pop("_sd")
+        # As VAELoader reads it (nodes.py:856): under VBAR the weights stay file slices, not RAM.
+        sd = comfy.utils.load_torch_file(self.__dict__.pop("_path"))
         model, settings = _comfy_vae_model(sd)
         self.__dict__.update(settings)
         self.device = mm.vae_device()
