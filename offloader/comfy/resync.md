@@ -90,6 +90,7 @@ branch to `_comfy_vae_model`, then compare a decode against ComfyUI's on the sam
 | the SDPA body in `comfy/ops.py` (:58-101) | `adapter.use_comfy_attention` | diffusers' attention through a copy of it |
 | `ComfyAttention._load_from_state_dict` and `attention_comfy_kitchen_int8` (`comfy/ldm/modules/attention.py`:82-95, :622-654) | `adapter.use_comfy_attention_config` | a file's per-module attention config: comfy-kitchen's int8 attention where it runs |
 | `pre_run` before sampling (`comfy/samplers.py`:1259) | `prepare` | a model declaring `current_patcher` gets its patcher |
+| each node's `load_models_gpu` (CLIPTextEncode, KSampler's `prepare_sampling`, `comfy/sampler_helpers.py`:201) after the teardown marks pins inactive (`model_management.py`:1484) | `prepare`, the encode boundary in `_finalize_pipe` | the encoder loads at encode, the sampling models before sampling |
 | the per-node teardown in `execution.py` | `node_teardown` | the sampler to VAE node boundary |
 | aimdo's `control.init` arguments in `main.py` | `pre_torch_init` | comfy-aimdo's allocator hooks before torch |
 | the `ModelPatcher` constructor (`fast_disk`, as sd.py:2277 passes it) | `adapter.build_dynamic_patcher` | the storage policy of the streamed files |

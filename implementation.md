@@ -39,7 +39,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
 | `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir. **Model-agnostic**: the engine passes each big model as a data spec (`{meta, file, convert, quant}`) plus prebuilt small `components` (vae/tokenizer/scheduler); no model classes or names appear here. `quant` routes a quantized model (scaled fp8, int8 ConvRot) through the comfy quant path (below). |
-| `prepare(pipe)` | `load_models_gpu(patchers)`: place managed models on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory` |
+| `prepare(pipe)` | `load_models_gpu` of the sampling models (the encoder loads at encode, as each ComfyUI node loads its own model): place them on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory` |
 | `reclaim(pipe)` | `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
 | `comfy_api()` | ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI model does: `ck` (comfy_kitchen as ComfyUI configures it, `None` without its kernels), `ops` and `mm` (the vendored comfy.ops / comfy.model_management), called by their ComfyUI names (`ops.linear_input_act`, `mm.pin_memory`, `mm.cast_to`, ...). Names no model; used by `comfy-qwen-image-2-1` (fused forward, host K/V cache with comfy's prefetch). |
@@ -378,6 +378,16 @@ z-image-turbo (20 GB) is not benchmarked here — its working set exceeds this 8
 RAM+swap headroom, so it belongs on a larger-RAM Mac.
 
 ## The node boundary (`node_teardown`)
+
+- **Each node loads its own model.** ComfyUI's teardown also marks every model's pins inactive
+  (`reset_cast_buffers`, `model_management.py:1484`), and only the next node's `load_models_gpu`
+  marks its model active again; CLIPTextEncode loads the encoder, KSampler the sampling models
+  (`prepare_sampling`). Loading all of them once in `prepare` left the transformer as inactive as
+  the encoder while sampling, so on the 4 GB card (Qwen-Image 2.1, 1024×768) it held 4.1-6.0 of its
+  7.26 GB pinned and swapped pins between its own blocks every step, where ComfyUI pins all of it
+  and trims the idle encoder to 5.3 GB. Now `prepare` loads the sampling models, the encode
+  boundary loads the encoder first and the sampling models again after its teardown: the same pins
+  as ComfyUI, same md5 on flux2-4b and comfy-krea2-turbo.
 
 - **z-image was non-deterministic at a fixed seed — fixed by honouring ComfyUI's node boundary.**
   Two runs, same seed, differed (meandiff ~6–14/255: chaotic amplification of a small drift over 8

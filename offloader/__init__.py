@@ -296,6 +296,7 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
     p._offloader_te_device tells us where the encoder lives."""
     import torch
     from . import adapter
+    import comfy.model_management as mm
 
     # Small resident modules (VAE) go straight to the compute device; the offloader handles the
     # heavy ones. VAE tiling/slicing is left to the caller.
@@ -384,13 +385,20 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
     # per-node teardown once the encoder is done, before the denoise loop, exactly as
     # comfy/execution.py:550-554 does between CLIPTextEncode and KSampler. Installed BEFORE the
     # cache so it is the encoder's own boundary -- a cache hit never runs the encoder, so (like a
-    # cached comfy node) it needs no teardown.
+    # cached comfy node) it needs no teardown. Each node loads its own model: CLIPTextEncode the
+    # encoder, then KSampler the sampling models (prepare_sampling). The teardown marks every
+    # model's pins inactive and only those loads mark them active again, so while sampling, pin
+    # pressure takes the encoder's pins, not the transformer's.
     if getattr(p, "encode_prompt", None) is not None:
         _encode = p.encode_prompt
+        encoder = getattr(p, "_offloader_encoder", None)
 
         def _encode_then_teardown(*args, **kwargs):
+            if encoder is not None:
+                mm.load_models_gpu([encoder])
             out = _encode(*args, **kwargs)
             node_teardown()
+            mm.load_models_gpu(_sampling_patchers(p))
             return out
 
         p.encode_prompt = _encode_then_teardown
@@ -578,9 +586,15 @@ def prepare(pipe):
     pipe._offloader_prompt = PromptModelTracker()
     pipe._offloader_prompt.add(patchers)
 
-    mm.load_models_gpu(patchers)
+    mm.load_models_gpu(_sampling_patchers(pipe))  # the encoder loads at encode, see _finalize_pipe
     for patcher in patchers:
         patcher.pre_run()
+
+
+def _sampling_patchers(pipe):
+    # What KSampler loads: every managed model but the text encoder.
+    encoder = getattr(pipe, "_offloader_encoder", None)
+    return [patcher for patcher in pipe._offloader_patchers if patcher is not encoder]
 
 
 def node_teardown():
