@@ -1220,7 +1220,7 @@ class ComfyVAE:
 
         self._build()
         framed = self.latent_dim == 2 and x.dim() == 5
-        device = x.device
+        device, dtype = x.device, x.dtype
         x = (x[:, :, 0] if framed else x).to(self.device, self.vae_dtype)
         do_tile = False
         with mm.cuda_device_context(self.device):
@@ -1236,7 +1236,9 @@ class ComfyVAE:
             if do_tile:
                 mm.soft_empty_cache()
                 mu = self.encode_tiled_3d(x) if self.latent_dim == 3 else self.encode_tiled_(x)
-        mu = mu.to(device, mm.intermediate_dtype())
+        # Back where and as the pipeline passed it, as a diffusers VAE returns it: the pipeline
+        # feeds the latent to its transformer as is (ComfyUI's model casts its input itself).
+        mu = mu.to(device, dtype)
         mu = mu.unsqueeze(2) if framed else mu
         dist = SimpleNamespace(mode=lambda: mu, sample=lambda generator=None: mu)
         return AutoencoderKLOutput(latent_dist=dist) if return_dict else (dist,)

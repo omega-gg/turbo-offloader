@@ -74,7 +74,7 @@ needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.p
 |---|---|---|
 | `VAE.__init__` branches, sd.py:837-878 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:863-878), Qwen-Image 2.1 (:840-850) |
 | end of `VAE.__init__`, sd.py:1104-1125 | `ComfyVAE._build` | device, dtype, the patcher, the weight load |
-| `VAE.decode`, sd.py:1258-1308; `VAE.encode`, sd.py:1411-1460 | `ComfyVAE.decode` / `encode` | `load_models_gpu` with the estimate, the out-of-memory fallback |
+| `VAE.decode`, sd.py:1258-1308; `VAE.encode`, sd.py:1411-1460 | `ComfyVAE.decode` / `encode` | `load_models_gpu` with the estimate, the out-of-memory fallback; unlike sd.py, `encode` returns the caller's dtype, as the pipeline feeds it to its transformer |
 | `decode_tiled_`, `decode_tiled_3d` (sized at sd.py:1323-1346), `encode_tiled_`, `encode_tiled_3d` | the same names on `ComfyVAE` | the tiled fallbacks |
 | main.py:303-304 | `enable_vbar` | `CoreModelPatcher` becomes `ModelPatcherDynamic` |
 
