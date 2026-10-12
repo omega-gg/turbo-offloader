@@ -639,6 +639,13 @@ def reclaim(pipe):
 
     import comfy.model_management as mm
 
+    # The run's end, as ComfyUI's cleanup() marks it (model_patcher.py:1317-1318): a model
+    # declaring current_patcher drops it, and with it what it keeps for one run (Qwen-Image 2.1's
+    # prefix cache). The rest of cleanup() stays out, see prepare.
+    for patcher in pipe._offloader_patchers:
+        if hasattr(patcher.model, "current_patcher"):
+            patcher.model.current_patcher = None
+
     node_teardown()
 
     # After a hard CUDA OOM even mem_get_info raises; reclaim runs on the error path too, so a

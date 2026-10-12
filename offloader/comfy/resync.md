@@ -89,7 +89,7 @@ branch to `_comfy_vae_model`, then compare a decode against ComfyUI's on the sam
 | `pinned_memory` internals | `adapter.install_pin_rollback_guard` | survive a transient `HostBuffer.truncate` failure, keeping ComfyUI's own recovery |
 | the SDPA body in `comfy/ops.py` (:58-101) | `adapter.use_comfy_attention` | diffusers' attention through a copy of it |
 | `ComfyAttention._load_from_state_dict` and `attention_comfy_kitchen_int8` (`comfy/ldm/modules/attention.py`:82-95, :622-654) | `adapter.use_comfy_attention_config` | a file's per-module attention config: comfy-kitchen's int8 attention where it runs |
-| `pre_run` before sampling (`comfy/samplers.py`:1259) | `prepare` | a model declaring `current_patcher` gets its patcher |
+| `pre_run` before sampling (`comfy/samplers.py`:1259); `cleanup`'s `current_patcher = None` after (`model_patcher.py`:1317-1318) | `prepare`; `reclaim` | a model declaring `current_patcher` gets its patcher for the run and drops it at the end (Qwen-Image 2.1 frees its prefix cache) |
 | each node's `load_models_gpu` (CLIPTextEncode, KSampler's `prepare_sampling`, `comfy/sampler_helpers.py`:201) after the teardown marks pins inactive (`model_management.py`:1484) | `prepare`, the encode boundary in `_finalize_pipe` | the encoder loads at encode, the sampling models before sampling |
 | the per-node teardown in `execution.py` | `node_teardown` | the sampler to VAE node boundary |
 | aimdo's `control.init` arguments in `main.py` | `pre_torch_init` | comfy-aimdo's allocator hooks before torch |
