@@ -38,7 +38,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `available()` | True once the vendored offloader imports (any device) |
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
-| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir. **Model-agnostic**: the engine passes each big model as a data spec (`{meta, file, convert, quant}`) plus prebuilt small `components` (vae/tokenizer/scheduler); no model classes or names appear here. `quant` routes a quantized model (scaled fp8, int8 ConvRot) through the comfy quant path (below). |
+| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir. **Model-agnostic**: the engine passes each big model as a data spec (`{meta, file, convert, quant}`) plus prebuilt small `components` (vae/tokenizer/scheduler); no model classes or names appear here. `quant` routes a quantized model (scaled fp8, int8 ConvRot) through the comfy quant path (below). A plain `file` may also be a list, a model's shards: `flux3-6b` streams the FLUX.3 diffusers repo through it. |
 | `prepare(pipe)` | `load_models_gpu` of the sampling models (the encoder loads at encode, as each ComfyUI node loads its own model): place them on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory` |
 | `reclaim(pipe)` | end the run as ComfyUI's `cleanup` does (`current_patcher = None`), then `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
@@ -509,10 +509,11 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
 - **Single-file streaming (ComfyUI-reuse engines).** `load_pipe_comfy` streams the same way from a
   ComfyUI install's split single files rather than a diffusers component dir:
   `adapter.stream_single_file` meta-loads each big model, mmaps the one safetensors via
-  `load_torch_file`, applies an optional key `convert` (the diffusers single-file remap for the
-  transformer: renames + a fused-qkv `torch.chunk` that returns views, which `_own_file_slice`
-  re-wraps as file slices of their own, see the v0.39 note; a `model.`-prefix strip for the Qwen3
-  text encoder, a flat→nested rename for the Qwen2.5-VL one), then rebinds by name (`_assign_sd`).
+  `load_torch_file` (or each shard of a list into one state dict), applies an optional key
+  `convert` (the diffusers single-file remap for the transformer: renames + a fused-qkv
+  `torch.chunk` that returns views, which `_own_file_slice` re-wraps as file slices of their own,
+  see the v0.39 note; a `model.`-prefix strip for the Qwen3 text encoder, a flat→nested rename for
+  the Qwen2.5-VL one), then rebinds by name (`_assign_sd`).
   A scaled-fp8 model (transformer or text encoder) takes the quant sibling `load_quant_single_file`
   (spec `{"quant": True}`) instead. Its `convert` runs on the fp8 state dict too (comfy-krea2-turbo
   remaps the whole ComfyUI-native DiT to the diffusers `Krea2Transformer2DModel` layout). The VAE +

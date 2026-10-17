@@ -637,22 +637,31 @@ def _own_file_slice(t):
     return view
 
 
+def as_files(weight_file):
+    """A spec's "file" as a list: one single file, or a model's shards."""
+    return list(weight_file) if isinstance(weight_file, (list, tuple)) else [weight_file]
+
+
 def stream_single_file(build_meta, weight_file, operations=None, convert=None, device=None):
     """load_streamed's single-file sibling (ComfyUI-reuse engines): meta-load the module via
     build_meta() (accelerate init_empty_weights, so no weight RAM), comfy-ize it, mmap the ONE
-    ComfyUI safetensors via load_torch_file, optionally run `convert` on the state dict -- the
-    diffusers single-file key remap (renames + a fused-qkv chunk that returns views, re-wrapped by
-    _own_file_slice so they stream as file slices), then rebind by name. `device` (MPS direct
-    load, see load_pipe_comfy) reads the file straight onto that device instead of CPU mmap, in
-    the model's dtype. Returns (model, missing)."""
+    ComfyUI safetensors via load_torch_file (or each shard of a model, a list of files, into one
+    state dict), optionally run `convert` on the state dict (the diffusers single-file key remap:
+    renames + a fused-qkv chunk that returns views, re-wrapped by _own_file_slice so they stream
+    as file slices), then rebind by name. `device` (MPS direct load, see load_pipe_comfy) reads
+    the file straight onto that device instead of CPU mmap, in the model's dtype. Returns
+    (model, missing)."""
     import comfy.utils as cu
 
     model = build_meta()
 
     comfy_ize(model, operations)
 
-    sd = cu.load_torch_file(weight_file, device=device or torch.device("cpu"))
-    model._offloader_files = [weight_file]  # build_dynamic_patcher's fast_disk
+    files = as_files(weight_file)
+    sd = {}
+    for f in files:
+        sd.update(cu.load_torch_file(f, device=device or torch.device("cpu")))
+    model._offloader_files = files  # build_dynamic_patcher's fast_disk
 
     if convert is not None:
         sd = {k: _own_file_slice(v) for k, v in convert(sd).items()}

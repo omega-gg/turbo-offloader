@@ -451,6 +451,7 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
                         "lora_keys": fn()->dict}  # optional; comfy model_lora_keys_unet entries
         text_encoder = {"meta": fn(dtype)->module, "file": path, "convert": ..., "quant": bool}
         components   = {<pipeline __init__ arg>: prebuilt module, ...}  # vae/tokenizer/scheduler
+    A plain bf16 "file" may also be a list, a model's shards (a diffusers repo's folder).
     The offloader streams the two big models from their ComfyUI single files (stream_single_file
     for a plain bf16 file, or the fp8 quant path load_quant_single_file when ["quant"]), wires them
     (wire_streamed), assembles pipeline_cls(transformer=, text_encoder=, **components), and runs
@@ -463,7 +464,7 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
     import comfy.model_management as mm
 
     def _fits_full_load():
-        big = (transformer["file"], text_encoder["file"])
+        big = adapter.as_files(transformer["file"]) + adapter.as_files(text_encoder["file"])
         cpu = torch.device("cpu")
         return 2 * sum(os.path.getsize(f) for f in big) <= mm.get_total_memory(cpu) * 0.85
 
