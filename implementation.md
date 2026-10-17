@@ -115,8 +115,9 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
   `ModelPatcher.add_patches`. `load_lora` picks only the bases present in the file, so every
   published naming and format loads — lora_up/down, lora_A/B, `diff`, **LoKr/LoHa** — from one
   path. The engine may supply extra namings via the `lora_keys` spec (below); Krea2 uses it to map
-  ComfyUI-native keys onto the diffusers module tree. Deltas apply while each weight streams in —
-  no fuse, no resident copy.
+  ComfyUI-native keys onto the diffusers module tree. An entry may target a slice as ComfyUI's do,
+  `(weight_key, (dim, offset, size))`: FLUX.3 maps q/k/v LoRAs onto thirds of its fused qkv.
+  Deltas apply while each weight streams in: no fuse, no resident copy.
 - **`install_unpadded_encode`** — drop padded text tokens from the conditioning before the
   transformer sees them. ComfyUI never pads the modern LLM text encoders
   (`pad_to_max_length=False`: qwen3vl/qwen_image/flux-t5; only CLIP keeps `SDTokenizer`'s default
@@ -215,7 +216,7 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   same-image runs, both cool-started): bigger activations leave less VRAM for weight residency,
   more re-streaming per step, and we hide it behind compute while ComfyUI pays it serially.
 - **`use_comfy_attention`** — a verbatim copy of `comfy.ops.scaled_dot_product_attention`
-  (`comfy/ops.py:58-101`): on CUDA it forces ComfyUI's SDPA priority (`ops.SDPA_BACKEND_PRIORITY`,
+  (`comfy/ops.py:58-109`): on CUDA it forces ComfyUI's SDPA priority (`ops.SDPA_BACKEND_PRIORITY`,
   `[FLASH, CUDNN, EFFICIENT, MATH]` since v0.39, read from the vendored ops so a re-sync carries
   it) **per call**, but only for large inputs (`q.nelement() >= 1024*128`); small attentions use
   torch's default backend, and a masked GQA call repeats K/V when no backend runs GQA natively
@@ -231,15 +232,17 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   stays fp16), and torch's SDPA requires one dtype. We coerce
   mismatched q/k/v to the lowest-precision float present (the compute dtype); ComfyUI never hits
   this because it runs its OWN qwen3, but its attention does the same class of thing (upcasts
-  q/k/v, `comfy/ldm/modules/attention.py:244-287`). Model/GPU- agnostic: fires only on a real
+  q/k/v, `comfy/ldm/modules/attention.py:256-299`). Model/GPU- agnostic: fires only on a real
   mismatch, no-op on Ampere+ / non-manual-cast.
 - **`use_comfy_attention_config`** — a ComfyUI file can pick a module's attention with a
   `<module>.comfy_attention.config` key (`ComfyAttention._load_from_state_dict`,
-  `attention.py:82-95`); Qwen-Image-2.1-Turbo's sets `comfy_kitchen_int8` on blocks 1-31. Both
-  single-file loaders pop those keys and, where comfy-kitchen runs it on the device, swap torch's
-  SDPA for `comfy_kitchen.int8_attention` during that module's forward, called as
-  `attention_comfy_kitchen_int8` calls it. Turbo against ComfyUI on an L4: 31-39 dB from
-  29-34 dB with bf16 attention.
+  `attention.py:88-107`); Qwen-Image-2.1-Turbo's sets `comfy_kitchen_int8` on blocks 1-31,
+  FLUX.3 Image Klein's on its image and single blocks. Both single-file loaders pop those keys
+  and, for the first method of the config (one, or a list since v0.41) that comfy-kitchen runs on
+  the device, swap torch's SDPA during that module's forward for `comfy_kitchen.int8_attention`
+  or `comfy_kitchen.sol_attn` (plain attention under a mask), called as
+  `attention_comfy_kitchen_int8` / `_sol` call them. Turbo against ComfyUI on an L4: 31-39 dB
+  from 29-34 dB with bf16 attention.
 - **`use_kitchen_rope`** — routes the diffusers transformer's RoPE through comfy-kitchen's fused
   `apply_rope1` (the kernel ComfyUI's `comfy/ldm/flux/math.py` uses), via a `(cos,sin)→freqs_cis`
   shim + a module-scoped patch of `diffusers.models.embeddings.apply_rotary_emb`. Lazy:
@@ -396,7 +399,7 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   first eviction. Pre-dates the krea2 work (present at `82508b2`).
 
   Root cause: **ComfyUI tears down the offload state after every node**
-  (`comfy/execution.py:550-554`: `cleanup_prefetch_queues` + `reset_cast_buffers` +
+  (`comfy/execution.py:551-555`: `cleanup_prefetch_queues` + `reset_cast_buffers` +
   `vbars_reset_watermark_limits`, in that order), so CLIPTextEncode's per-stream cast buffers,
   prefetch queues and VBAR watermarks are gone before KSampler starts. A diffusers pipeline has
   **no node boundary**: `encode_prompt` flows straight into the denoise loop, so the text encoder's
@@ -417,7 +420,7 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
 - **The sampler→VAE boundary (`install_tiled_vae_fallback`) — krea2 1600×1200 OOM'd + aborted.**
   Same bug class at the pipeline's other seam: ComfyUI's KSampler node ENDS before VAEDecode, so
   the teardown has run and `VAE.decode` then hands its working-memory estimate to
-  `load_models_gpu(memory_required=memory_used_decode(...))` (comfy/sd.py:1267-1269), whose guts
+  `load_models_gpu(memory_required=memory_used_decode(...))` (comfy/sd.py:1273-1275), whose guts
   are `free_memory(max(inference_memory, memory_required + extra_reserved_memory()))`
   (model_management.py:944,1001) — the DiT is evicted through free_memory's CONTROLLED path before
   the VAE's first kernel. A diffusers pipeline calls `vae.decode` inside the same `__call__`: the
@@ -428,9 +431,9 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   aborts on the VAE's first conv3d. Fix, comfy verbatim: at `vae.decode`/`encode`,
   `node_teardown()` + the `memory_used` estimate (comfy's own Wan-2.1 / AutoencoderKL constants,
   sd.py:877-878 / :505-506, keyed only off tensor rank) + `free_memory`, then comfy's OOM fallback
-  (sd.py:1301-1308: `raise_non_oom`, warn, flag-retry OUTSIDE the except so the exception's tensor
+  (sd.py:1307-1314: `raise_non_oom`, warn, flag-retry OUTSIDE the except so the exception's tensor
   refs can gc, tiled via diffusers' `enable_tiling`: the same 256px/64px tile comfy starts from,
-  sd.py:1324-1325, though since v0.39 comfy then resizes a 3D tile to its VRAM budget). Result:
+  sd.py:1330-1331, though since v0.39 comfy then resizes a 3D tile to its VRAM budget). Result:
   krea2 1600×1200 decodes clean — untiled, the fallback never even fires — and z-image stays
   bit-identical. A VAE may carry its own estimates, as comfy's VAE class does
   (`memory_used_decode` / `memory_used_encode(shape, dtype)`). When even that cannot be freed, the
@@ -583,4 +586,15 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   29.9 → 22.4 GB, image unchanged). Upstream's malloc graph for prefetch was tried and dropped:
   ComfyUI only enables it for forwards it owns (never flux2/krea2), and inside a diffusers block
   it aborts on a CUDA sync during recording.
+- **v0.41 re-sync (v0.39.1 → v0.41.2, comfy-aimdo 0.5.5 → 0.5.6, comfy-kitchen stays 0.2.37,
+  torch unchanged), for FLUX.3 Image Klein.** Five vendored files changed upstream (`ops.py`,
+  `model_patcher.py`, `lora.py`, `cli_args.py`, `weight_adapter/bypass.py`) and one joins the
+  copy, `configurable.py`, which `model_patcher.py` now imports. Mirrored: a file's attention
+  config may be a list (the first method that runs wins) and may name comfy-kitchen's `sol`
+  attention besides int8 (`use_comfy_attention_config`), and the SDPA wrapper copies a strided
+  K/V that would spill the L2 cache first (AMD gfx1151 only). The other mirrored lines only
+  moved; their citations follow. On the A1000 at 512² (seed 42), flux2-4b CUDA and CPU and
+  comfy-krea2-turbo CUDA give the same md5 on both stacks. One caution from that check:
+  comfy-krea2-turbo's image changed when it ran right after another engine in the same sequence,
+  on either stack, so compare its runs under the same conditions.
 - **License.** ComfyUI is GPLv3; the vendored copies live in this already-GPLv3 package.

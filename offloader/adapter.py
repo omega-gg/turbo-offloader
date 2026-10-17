@@ -421,7 +421,7 @@ def enable_vbar(device):
     except Exception:
         return False
     import comfy.memory_management as memm
-    # As main.py:303-304 when DynamicVRAM engages: what ComfyUI builds itself (its VAE, ...) gets
+    # As main.py:311-312 when DynamicVRAM engages: what ComfyUI builds itself (its VAE, ...) gets
     # the dynamic patcher too.
     model_patcher.CoreModelPatcher = model_patcher.ModelPatcherDynamic
     memm.aimdo_enabled = True
@@ -754,34 +754,25 @@ def load_quant_single_file(build_meta, weight_file, load_device, compute_dtype, 
 
 
 def use_comfy_attention_config(model, sd):
-    """ComfyAttention._load_from_state_dict (comfy/ldm/modules/attention.py:82-95): a ComfyUI
-    file's `<module>.comfy_attention.config` key picks the attention that module runs. ComfyUI
-    knows one, comfy_kitchen_int8, taken when comfy-kitchen runs it on the device: that module's
-    SDPA then runs comfy-kitchen's int8 kernel as attention_comfy_kitchen_int8 calls it
-    (attention.py:622-654). Pops those keys."""
+    """ComfyAttention._load_from_state_dict (comfy/ldm/modules/attention.py:88-107): a ComfyUI
+    file's `<module>.comfy_attention.config` key picks the attention that module runs, one config
+    or a list tried in order, the first one comfy-kitchen runs on the device winning. ComfyUI
+    knows two, comfy_kitchen_int8 and comfy_kitchen_sol: that module's SDPA then runs the kernel
+    as attention_comfy_kitchen_int8 / attention_comfy_kitchen_sol call it (attention.py:634-666,
+    :695-709). Pops those keys."""
+    import functools
     import json
 
     import torch.nn.functional as F
 
-    suffix = ".comfy_attention.config"
-    int8 = []
-    for key in [k for k in sd if k.endswith(suffix)]:
-        method = json.loads(sd.pop(key).numpy().tobytes()).get("attention")
-        if method == "comfy_kitchen_int8":
-            int8.append(key[:-len(suffix)])
-        else:
-            print("offloader: ignoring unsupported attention method %r for %s"
-                  % (method, key[:-len(suffix)]), flush=True)
     try:
         import comfy_kitchen
     except ImportError:
-        return
-    if not (int8
-            and comfy_kitchen.int8_attention_is_available()
-            and comfy_kitchen.int8_attention_is_available(mm.get_torch_device())):
-        return
+        comfy_kitchen = None
 
-    def int8_attention(query, key, value, attn_mask=None, scale=None, **_):
+    device = mm.get_torch_device()
+
+    def int8_attention(sdpa, query, key, value, attn_mask=None, scale=None, **_):
         # diffusers' SDPA call: [batch, heads, sequence, head_dim], as the kernel takes them.
         if attn_mask is not None:
             if attn_mask.ndim == 2:
@@ -790,19 +781,48 @@ def use_comfy_attention_config(model, sd):
                 attn_mask = attn_mask.unsqueeze(1)
         return comfy_kitchen.int8_attention(query, key, value, scale=scale, attn_mask=attn_mask)
 
-    def int8_forward(forward):
+    def sol_attention(sdpa, query, key, value, attn_mask=None, scale=None, tau=1.0, **kwargs):
+        # A mask falls back to the plain attention; the kernel takes [batch, sequence, heads, dim].
+        if attn_mask is not None:
+            return sdpa(query, key, value, attn_mask=attn_mask, scale=scale, **kwargs)
+        query, key, value = (t.transpose(1, 2) for t in (query, key, value))
+        return comfy_kitchen.sol_attn(query, key, value, tau=tau, scale=scale).transpose(1, 2)
+
+    def pick(configs, prefix):
+        for config in configs:
+            method = config.get("attention")
+            if method == "comfy_kitchen_int8":
+                if (comfy_kitchen is not None
+                        and comfy_kitchen.int8_attention_is_available()
+                        and comfy_kitchen.int8_attention_is_available(device)):
+                    return int8_attention
+            elif method == "comfy_kitchen_sol":
+                if comfy_kitchen is not None and comfy_kitchen.sol_attn_is_available(device):
+                    return functools.partial(sol_attention, tau=config.get("tau", 1.0))
+            else:
+                print("offloader: ignoring unknown attention method %r for %s" % (method, prefix),
+                      flush=True)
+        return None
+
+    def kernel_forward(forward, attention):
         # diffusers reaches torch's SDPA by name, so the module's forward swaps it in.
         def call(*args, **kwargs):
-            sdpa, F.scaled_dot_product_attention = F.scaled_dot_product_attention, int8_attention
+            sdpa = F.scaled_dot_product_attention
+            F.scaled_dot_product_attention = functools.partial(attention, sdpa)
             try:
                 return forward(*args, **kwargs)
             finally:
                 F.scaled_dot_product_attention = sdpa
         return call
 
-    for prefix in int8:
-        module = model.get_submodule(prefix)
-        module.forward = int8_forward(module.forward)
+    suffix = ".comfy_attention.config"
+    for key in [k for k in sd if k.endswith(suffix)]:
+        prefix = key[:-len(suffix)]
+        config = json.loads(sd.pop(key).numpy().tobytes())
+        attention = pick(config if isinstance(config, list) else [config], prefix)
+        if attention is not None:
+            module = model.get_submodule(prefix)
+            module.forward = kernel_forward(module.forward, attention)
 
 
 _sdpa_patched = False
@@ -810,21 +830,22 @@ _sdpa_patched = False
 
 def use_comfy_attention(model=None):
     """Route diffusers' attention through a copy of ComfyUI's own
-    `comfy.ops.scaled_dot_product_attention` (comfy/ops.py:58-101), so our SDPA behaves EXACTLY
+    `comfy.ops.scaled_dot_product_attention` (comfy/ops.py:58-109), so our SDPA behaves EXACTLY
     like ComfyUI's, not an approximation.
 
     ComfyUI, on CUDA with a torch that has `sdpa_kernel(set_priority=)`, forces its SDPA backend
     priority (`ops.SDPA_BACKEND_PRIORITY`: [FLASH, CUDNN, EFFICIENT, MATH] since v0.39), but
     ONLY per call and ONLY for large inputs (`q.nelement() >= 1024*128`); small attentions fall
     through to torch's default backend. It also repeats K/V for a masked GQA call when the backend
-    can't do GQA natively. We reproduce that body verbatim, reading the priority list and the GQA
-    helper from the vendored ops (so a re-sync carries them over). We can't call the vendored
-    function itself: it calls `torch.nn.functional.scaled_dot_product_attention`, the very name we
-    patch. diffusers calls that name by attribute (diffusers/models/attention_dispatch.py), so we
-    patch it once, process-global (idempotent), delegating to the saved original. `model` is
-    accepted only for signature parity with the other patchers; the patch is global, as
-    ComfyUI's is. No-op wherever ComfyUI doesn't define the priority (no CUDA, or a torch without
-    set_priority), exactly ComfyUI's own guard."""
+    can't do GQA natively, and (since v0.41) makes a strided K/V contiguous where it would spill
+    the L2 cache (AMD gfx1151). We reproduce that body verbatim, reading the priority list, the
+    L2 size and the GQA helper from the vendored ops (so a re-sync carries them over). We can't
+    call the vendored function itself: it calls `torch.nn.functional.scaled_dot_product_attention`,
+    the very name we patch. diffusers calls that name by attribute
+    (diffusers/models/attention_dispatch.py), so we patch it once, process-global (idempotent),
+    delegating to the saved original. `model` is accepted only for signature parity with the other
+    patchers; the patch is global, as ComfyUI's is. No-op wherever ComfyUI doesn't define the
+    priority (no CUDA, or a torch without set_priority), exactly ComfyUI's own guard."""
     global _sdpa_patched
     if _sdpa_patched:
         return True
@@ -837,6 +858,8 @@ def use_comfy_attention(model=None):
         return False
 
     from torch.nn.attention import sdpa_kernel
+
+    l2_size = ops.SDPA_CONTIGUOUS_KV_L2_SIZE
 
     orig = F.scaled_dot_product_attention
 
@@ -856,13 +879,18 @@ def use_comfy_attention(model=None):
             if floats:
                 tgt = min(floats, key=lambda d: torch.finfo(d).bits)
                 q, k, v = (t.to(tgt) for t in (q, k, v))
-        # comfy/ops.py:77-98 verbatim from here.
+        # comfy/ops.py:83-106 verbatim from here.
         if q.nelement() < 1024 * 128:  # comfy: small inputs -> default backend
             return orig(q, k, v, *args, **kwargs)
         attn_mask = args[0] if len(args) > 0 else kwargs.get("attn_mask")
         if kwargs.get("enable_gqa", False) and attn_mask is not None and not mm.is_nvidia():
             k, v = ops.repeat_kv_for_gqa(k, v, q.shape[-3], -3)
             kwargs["enable_gqa"] = False
+        # comfy: a strided K/V whose head outgrows the L2 cache gets copied first (AMD gfx1151).
+        if (l2_size
+                and sum(t.shape[-2] * t.shape[-1]
+                        for t in (k, v) if not t.is_contiguous()) * k.element_size() > l2_size):
+            k, v = k.contiguous(), v.contiguous()
         with sdpa_kernel(priority, set_priority=True):
             if (kwargs.get("enable_gqa", False)
                     and attn_mask is not None
@@ -1099,7 +1127,7 @@ def build_dynamic_patcher(model, load_device=None, offload_device=None, size=0):
     it transparently reroutes to a plain ModelPatcher (VBAR is GPU-only).
 
     fast_disk is ComfyUI's per-model storage policy: it passes
-    `comfy.storage.state_dict_fast_disk(sd)` (sd.py:2277), i.e. model_fast_disk over the files the
+    `comfy.storage.state_dict_fast_disk(sd)` (sd.py:2288), i.e. model_fast_disk over the files the
     weights come from. True (a fast NVMe) streams VBAR weights from the file instead of pinning
     them in host RAM. Our loaders record those files as `_offloader_files`."""
     import comfy.model_patcher as model_patcher
@@ -1132,7 +1160,7 @@ def _vae_memory_used(kind, shape, dtype):
 
 
 # -------------------------------------------------------------------------------------------------
-# ComfyUI's VAE, mirrored from comfy/sd.py (v0.39.1): the model sd.py builds for a file and the way
+# ComfyUI's VAE, mirrored from comfy/sd.py (v0.41.2): the model sd.py builds for a file and the way
 # its VAE class runs it. The model code itself is vendored (comfy/ldm/); what sd.py does around it
 # is copied here, each piece citing its sd.py lines, so a re-sync diffs those lines between the
 # two tags and ports any change (comfy/resync.md, category 3).
@@ -1210,10 +1238,10 @@ class ComfyVAE:
         return self.__dict__[name] if name in self.__dict__ else getattr(self.model, name)
 
     def _build(self):
-        # sd.py:1104-1125, the end of VAE.__init__.
+        # sd.py:1110-1131, the end of VAE.__init__.
         if "model" in self.__dict__:
             return
-        # As VAELoader reads it (nodes.py:856): under VBAR the weights stay file slices, not RAM.
+        # As VAELoader reads it (nodes.py:857): under VBAR the weights stay file slices, not RAM.
         sd = comfy.utils.load_torch_file(self.__dict__.pop("_path"))
         model, settings = _comfy_vae_model(sd)
         self.__dict__.update(settings)
@@ -1239,14 +1267,14 @@ class ComfyVAE:
         return self  # ComfyUI's model management places the model
 
     def decode(self, z, return_dict=True):
-        # sd.py:1258-1308: load through load_models_gpu with the estimate, tile straight away only
+        # sd.py:1264-1314: load through load_models_gpu with the estimate, tile straight away only
         # for a model declaring its estimate reliable, else try whole and tile on an OOM.
         from diffusers.models.autoencoders.vae import DecoderOutput
 
         import comfy.model_prefetch  # lazily, as comfy/resync.md says
 
         self._build()
-        framed = self.latent_dim == 2 and z.dim() == 5  # sd.py:1262 drops a 2D model's frame axis
+        framed = self.latent_dim == 2 and z.dim() == 5  # sd.py:1268 drops a 2D model's frame axis
         z = (z[:, :, 0] if framed else z).to(self.device, self.vae_dtype)
         do_tile = False
         with mm.cuda_device_context(self.device):
@@ -1271,7 +1299,7 @@ class ComfyVAE:
         return DecoderOutput(sample=x) if return_dict else (x,)
 
     def encode(self, x, return_dict=True):
-        # sd.py:1411-1460: the same memory steps; it encodes to the mean.
+        # sd.py:1417-1466: the same memory steps; it encodes to the mean.
         from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
         self._build()
@@ -1300,7 +1328,7 @@ class ComfyVAE:
         return AutoencoderKLOutput(latent_dist=dist) if return_dict else (dist,)
 
     def decode_tiled_(self, z, tile_x=64, tile_y=64, overlap=16):
-        # sd.py:1171-1193: three tilings, averaged.
+        # sd.py:1177-1199: three tilings, averaged.
         return sum(comfy.utils.tiled_scale(z, self.model.decode, w, h, overlap,
                                            upscale_amount=self.upscale_ratio,
                                            out_channels=self.output_channels,
@@ -1309,15 +1337,15 @@ class ComfyVAE:
                                 (tile_x, tile_y))) / 3.0
 
     def decode_tiled_3d(self, z):
-        # sd.py:1323-1346: reserve what a whole decode would use, capped at 80% of the device,
+        # sd.py:1329-1352: reserve what a whole decode would use, capped at 80% of the device,
         # shrink the temporal tile until one fits, then grow the spatial tile while it still fits.
-        ratio = self.upscale_ratio  # spacial_compression_decode, sd.py:1524-1528
+        ratio = self.upscale_ratio  # spacial_compression_decode, sd.py:1530-1534
         tile = 256 // (ratio[-1] if isinstance(ratio, tuple) else ratio)
         budget = min(self.memory_used_decode(z.shape, self.vae_dtype),
                      int(mm.get_total_memory(self.device) * 0.8))
         mm.load_models_gpu([self.patcher], memory_required=budget)
 
-        def est(tile_t, tile_xy):  # _tile_bounded_shape, sd.py:1360-1368
+        def est(tile_t, tile_xy):  # _tile_bounded_shape, sd.py:1366-1374
             s = list(z.shape)
             s[2], s[3], s[4] = min(s[2], tile_t), min(s[3], tile_xy), min(s[4], tile_xy)
             return self.memory_used_decode(s, self.vae_dtype)
@@ -1328,14 +1356,14 @@ class ComfyVAE:
         while tile * 2 <= max(z.shape[3], z.shape[4]) and est(tile_t, tile * 2) <= budget:
             tile *= 2
         overlap = tile // 4
-        # decode_tiled_3d, sd.py:1195-1197
+        # decode_tiled_3d, sd.py:1201-1203
         return comfy.utils.tiled_scale_multidim(
             z, self.model.decode, tile=(tile_t, tile, tile), overlap=(1, overlap, overlap),
             upscale_amount=self.upscale_ratio, out_channels=self.output_channels,
             index_formulas=self.upscale_index_formula, output_device=z.device)
 
     def encode_tiled_(self, x, tile_x=512, tile_y=512, overlap=64):
-        # sd.py:1203-1213: three tilings, averaged.
+        # sd.py:1209-1219: three tilings, averaged.
         return sum(comfy.utils.tiled_scale(x, self.model.encode, w, h, overlap,
                                            upscale_amount=1 / self.downscale_ratio,
                                            out_channels=self.latent_channels,
@@ -1344,8 +1372,8 @@ class ComfyVAE:
                                 (tile_x // 2, tile_y * 2))) / 3.0
 
     def encode_tiled_3d(self, x):
-        # sd.py:1451-1458 picks 256-pixel tiles and 64 of overlap; encode_tiled_3d is
-        # sd.py:1235-1237.
+        # sd.py:1457-1464 picks 256-pixel tiles and 64 of overlap; encode_tiled_3d is
+        # sd.py:1241-1243.
         return comfy.utils.tiled_scale_multidim(
             x, self.model.encode, tile=(9999, 256, 256), overlap=(1, 64, 64),
             upscale_amount=self.downscale_ratio, out_channels=self.latent_channels,
@@ -1361,7 +1389,7 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
     __call__, so without this boundary the DiT still pins its VRAM (measured: 2.66GB held, 0 free)
     and a 1600x1200 decode dies on one ~1.4GB fp32 upsample after all 8 steps succeeded.
 
-    Then comfy/sd.py:1267-1269: estimate the call's working memory (`memory_used_decode`) and hand
+    Then comfy/sd.py:1273-1275: estimate the call's working memory (`memory_used_decode`) and hand
     it to load_models_gpu as memory_required BEFORE the first kernel. For an already-resident VAE
     load_models_gpu's guts are free_memory(max(inference_memory, memory_required +
     extra_reserved_memory())) (model_management.py:944,1001): the CONTROLLED eviction of the
@@ -1369,13 +1397,13 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
     demand inside the allocator dies with an uncatchable C++ abort instead of a catchable OOM
     (measured: the abort fires on the VAE's first conv3d).
 
-    Then the fallback itself (comfy/sd.py:1301-1308 decode, :1442-1449 encode): try the regular
+    Then the fallback itself (comfy/sd.py:1307-1314 decode, :1448-1455 encode): try the regular
     call; on OOM, `raise_non_oom` anything else, warn with comfy's own wording, and only set a
     flag -- comfy deliberately retries OUTSIDE the except block because "the exception itself refs
     them all until we get out of this except block", so the tensors can gc first -- then retry
     tiled. Comfy retries with its own tiler; a diffusers VAE ships the equivalent (`enable_tiling`,
     seam-blended; the qwen VAE's 256px tile / 64px overlap equal the tile comfy starts from,
-    sd.py:1324-1325; since v0.39 comfy then resizes a 3D tile to its VRAM budget, sd.py:1335-1346),
+    sd.py:1330-1331; since v0.39 comfy then resizes a 3D tile to its VRAM budget, sd.py:1341-1352),
     and the regular path is restored after, matching comfy's per-call semantics.
     Model-agnostic: keyed only off the vae exposing enable_tiling. A ComfyVAE runs sd.py's own
     memory steps and fallback, so it only gets the node boundary. No-op without a vae, or if

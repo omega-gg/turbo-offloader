@@ -17,8 +17,8 @@ re-sync steps in [`offloader/comfy/resync.md`](offloader/comfy/resync.md):
 
 | dependency    | commit                                     | version                 |
 |---------------|--------------------------------------------|-------------------------|
-| ComfyUI       | `de0125d9aefc225ec1a6f787a3a806730b772678` | `v0.39.1`               |
-| comfy-aimdo   | `3b8e8c162efeb9470d912609a7a6e7a2b1c693ec` | `0.5.5`                 |
+| ComfyUI       | `b53f77a74e21091cbdebfdf7b85fc80326932646` | `v0.41.2`               |
+| comfy-aimdo   | `08b37eec31319b7f245afdc009e34a9861565c25` | `0.5.6`                 |
 | comfy-kitchen | `be003b7c23c5b01328657955b8bc5d3f073d868e` | `0.2.37`                |
 
 ## Credits
