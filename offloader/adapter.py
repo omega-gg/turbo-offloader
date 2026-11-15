@@ -648,8 +648,8 @@ def stream_single_file(build_meta, weight_file, operations=None, convert=None, d
     ComfyUI safetensors via load_torch_file (or each shard of a model, a list of files, into one
     state dict), optionally run `convert` on the state dict (the diffusers single-file key remap:
     renames + a fused-qkv chunk that returns views, re-wrapped by _own_file_slice so they stream
-    as file slices), then rebind by name. `device` (MPS direct load, see load_pipe_comfy) reads
-    the file straight onto that device instead of CPU mmap, in the model's dtype. Returns
+    as file slices), then rebind by name. `device` (MPS direct load, see load_pipe_comfy) copies
+    each tensor from the CPU mmap onto that device, in the model's dtype. Returns
     (model, missing)."""
     import comfy.utils as cu
 
@@ -660,20 +660,23 @@ def stream_single_file(build_meta, weight_file, operations=None, convert=None, d
     files = as_files(weight_file)
     sd = {}
     for f in files:
-        sd.update(cu.load_torch_file(f, device=device or torch.device("cpu")))
+        sd.update(cu.load_torch_file(f))
     model._offloader_files = files  # build_dynamic_patcher's fast_disk
 
     if convert is not None:
         sd = {k: _own_file_slice(v) for k, v in convert(sd).items()}
 
-    # Direct load: cast to the model's own dtype, as ComfyUI's load_state_dict copy into a model
-    # built on the device does -- the resident weights never go through a per-forward cast.
+    # Direct load: one copy per tensor from the CPU mmap onto the device, in the model's own dtype,
+    # as ComfyUI's load_state_dict copy into a model built on the device does -- the resident
+    # weights never go through a per-forward cast. Like ComfyUI, the file is never read onto the
+    # device itself: on MPS (torch 2.14.1) such tensors come out zeroed once GPU work is queued on
+    # them.
     if device is not None:
         own = {n: p.dtype for n, p in model.named_parameters()}
         own.update({n: b.dtype for n, b in model.named_buffers()})
         for k, v in sd.items():
-            if k in own and v.is_floating_point() and v.dtype != own[k]:
-                sd[k] = v.to(own[k])
+            dtype = own[k] if k in own and v.is_floating_point() else v.dtype
+            sd[k] = v.to(device=device, dtype=dtype)
 
     use_comfy_attention_config(model, sd)
     missing = _assign_sd(model, sd)

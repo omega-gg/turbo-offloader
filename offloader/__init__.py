@@ -83,11 +83,13 @@ def available():
 
 
 def _direct_load(module, component_dir, device):
-    """Materialise `module`'s weights straight into `device` memory via ComfyUI's load_torch_file
-    (safetensors safe_open ON the device), then bind them with torch's
-    load_state_dict(assign=True). This is exactly how ComfyUI loads a model on MPS -- read direct
-    to the compute device -- and it halves placement vs diffusers' CPU load followed by
-    load_models_gpu's per-leaf CPU->device copy.
+    """Materialise `module`'s weights in `device` memory: ComfyUI's load_torch_file maps the file
+    on the CPU, each tensor is copied once onto the device, then bound with torch's
+    load_state_dict(assign=True). This is how ComfyUI places a model it builds on MPS -- the file
+    read on the CPU, one copy into the device -- and it halves placement vs diffusers' CPU load
+    followed by load_models_gpu's per-leaf CPU->device copy. The file is never read onto the
+    device itself: on MPS (torch 2.14.1) such tensors come out zeroed once GPU work is queued on
+    them.
 
     Model-agnostic: globs every *.safetensors in the diffusers component dir and merges them, so a
     single-file component (flux2, z-image) and a sharded one (qwen-image-edit's index+shards) both
@@ -106,7 +108,8 @@ def _direct_load(module, component_dir, device):
             return False
         sd = {}
         for shard in shards:
-            sd.update(load_torch_file(shard, device=device))
+            sd.update(load_torch_file(shard))
+        sd = {k: v.to(device) for k, v in sd.items()}
         module.load_state_dict(sd, assign=True, strict=False)
         if hasattr(module, "tie_weights"):
             module.tie_weights()
@@ -195,8 +198,8 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
     # TRANSFORMER); the transformer meta-loads an oversized transformer for the disk-stream path.
     PipelineCls, Transformer = pipeline_cls, transformer_cls
 
-    # Direct-to-device load, MPS only. On MPS (unified memory) we read the big models straight into
-    # device memory (below) instead of diffusers' CPU load + load_models_gpu's per-leaf CPU->device
+    # Direct-to-device load, MPS only. On MPS (unified memory) we copy the big models into device
+    # memory at load (below) instead of diffusers' CPU load + load_models_gpu's per-leaf CPU->device
     # copy. Safe only here: MPS has no separate VRAM pool, so full residency is always chosen and
     # can never OOM -- whereas on CUDA load_models_gpu's partial-residency / VBAR streaming
     # decisions must stand (a full direct load would OOM a smaller-than-model card), and on CPU the
@@ -474,7 +477,7 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
     stream = use_vbar or cpu_stream
 
     # MPS direct load, as load_pipe: ComfyUI builds the diffusion model on MPS under vram_state
-    # SHARED (unet_inital_load_device), so the transformer is read straight onto the device and
+    # SHARED (unet_inital_load_device), so the transformer is copied onto the device at load and
     # stays resident -- left mmap-backed on CPU, load_models_gpu re-pages it from disk per forward.
     direct_load = mm.is_device_mps(load_device) and manual_cast is None
 

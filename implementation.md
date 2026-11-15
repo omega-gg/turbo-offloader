@@ -367,10 +367,10 @@ Python 3.14.
 | flux2-4b | MPS | 1024×768 | 4 | ~249 s | direct-load, TE-CPU |
 | comfy-flux2-4b (single files) | MPS | 512×512 | 4 | ~233 s (`sequential_cpu` ~458 s) | direct-load, TE-CPU |
 
-Notes: MPS runs **fp16-resident** (no `manual_cast`) — the transformer is direct-loaded straight
-onto the device (`safe_open(device="mps")`) and stays resident; there is no VBAR/stream path (MPS
-has no separate VRAM pool). The text encoder runs on **CPU** (ComfyUI's `text_encoder_device()`
-under `vram_state` SHARED), so residency is the transformer alone (~7 GB, down from ~15 GB with
+Notes: MPS runs **fp16-resident** (no `manual_cast`) — the transformer is direct-loaded onto the
+device (file mapped on the CPU, each tensor copied once onto MPS) and stays resident; there is no
+VBAR/stream path (MPS has no separate VRAM pool). The text encoder runs on **CPU** (ComfyUI's
+`text_encoder_device()` under `vram_state` SHARED), so residency is the transformer alone (~7 GB, down from ~15 GB with
 both on-device) and only the conditioning crosses to MPS. On this 8 GB box the run still spills to
 swap and **that** is the scaling wall, not compute: peak swap ~5.3 GB at 512×512, ~9.7 GB at
 1024×768 (both produce clean images — the 1024 corruption seen in image-to-image *edit* is that
@@ -379,6 +379,14 @@ non-gen time and is cached (`install_encode_cache`), so a repeated prompt skips 
 bit-deterministic across runs at a fixed seed (verified: two seed-42 runs, identical SHA-256).
 z-image-turbo (20 GB) is not benchmarked here — its working set exceeds this 8 GB box's usable
 RAM+swap headroom, so it belongs on a larger-RAM Mac.
+
+Re-measured on torch 2.14.1 (with the MPS load fix): comfy-flux2-4b 512×512 ~264 s
+(`sequential_cpu` ~451 s), 1024×768 ~292 s (`sequential_cpu` ~475 s).
+
+Known limit on 8 GB: the VAE decode takes ~15–40 s at 512×512 (vs ~1 s possible). MPS keeps a
+memory heap alive while any tensor in it lives, and the VAE shares heaps with the resident
+transformer, so its swapped memory is never returned. Left as is: releasing it would mean deviating
+from ComfyUI.
 
 ## The node boundary (`node_teardown`)
 
@@ -453,10 +461,10 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
 
 ## Notes
 
-- **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` reads the transformer straight
-  onto the device via ComfyUI's `load_torch_file`
-  (`safetensors.safe_open(device= "mps")`) + `load_state_dict(assign=True)` — exactly how ComfyUI
-  loads on Apple Silicon — instead of diffusers' CPU load followed by `load_models_gpu`'s per-leaf
+- **MPS direct-to-device load.** On MPS (unified memory) `load_pipe` copies the transformer onto
+  the device at load: ComfyUI's `load_torch_file` maps the file on the CPU, each tensor is copied
+  once onto MPS, then `load_state_dict(assign=True)` — how ComfyUI places a model it builds on
+  Apple Silicon — instead of diffusers' CPU load followed by `load_models_gpu`'s per-leaf
   CPU→device copy; `load_models_gpu` then no-ops on the resident weights. Halves placement
   (flux2-4B ~103s → ~51s), flipping offloader one-shot from ~70s slower than a plain `.to("mps")`
   to ~1min faster (also ~15% faster diffusion from the comfy operator swaps → ~21% total).
@@ -467,8 +475,10 @@ RAM+swap headroom, so it belongs on a larger-RAM Mac.
   `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after — on MPS the Qwen3
   text encoder now lands on CPU (next note), so only the transformer takes this direct-load path.
   `load_pipe_comfy` does the same for a plain (non-fp8) single-file transformer:
-  `stream_single_file(device=)` reads it onto MPS and casts each weight to the model's dtype, as
-  ComfyUI's `load_state_dict` copy into a model built on the device does. Left mmap-backed on CPU
+  `stream_single_file(device=)` copies each weight from the CPU mmap onto MPS in the model's dtype,
+  as ComfyUI's `load_state_dict` copy into a model built on the device does. Like ComfyUI, the file
+  is never read onto the device itself: on MPS (torch 2.14.1) `safe_open(device="mps")` tensors
+  come out zeroed once GPU work is queued on them (noise renders). Left mmap-backed on CPU
   instead, `load_models_gpu` re-paged it from disk every forward (comfy-flux2-4b, 8 GB M1: ~562
   s/step at 1024×768, swap full).
 - **Text encoder on CPU on MPS (ComfyUI's `text_encoder_device()`).** ComfyUI runs the text encoder
