@@ -95,7 +95,7 @@ When you run `text-to-image.sh`, the turboCLI runner drives the offloader throug
                 │
   ┌─────────────▼─────────────┐
   │  offloader/comfy/  (GPL)  │   ComfyUI's memory-management subsystem, vendored
-  └───────────────────────────┘   byte-for-byte (pinned to ComfyUI v0.45.0)
+  └───────────────────────────┘   byte-for-byte (pinned to ComfyUI v0.45.4)
 ```
 
 The design philosophy (v2): **don't reimplement offloading — borrow it whole.** ComfyUI's memory

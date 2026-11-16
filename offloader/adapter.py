@@ -1172,7 +1172,7 @@ def _vae_memory_used(kind, shape, dtype):
 
 
 # -------------------------------------------------------------------------------------------------
-# ComfyUI's VAE, mirrored from comfy/sd.py (v0.45.0): the model sd.py builds for a file and the way
+# ComfyUI's VAE, mirrored from comfy/sd.py (v0.45.4): the model sd.py builds for a file and the way
 # its VAE class runs it. The model code itself is vendored (comfy/ldm/); what sd.py does around it
 # is copied here, each piece citing its sd.py lines, so a re-sync diffs those lines between the
 # two tags and ports any change (resync.md, category 3).

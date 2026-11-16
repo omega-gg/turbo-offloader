@@ -17,7 +17,7 @@ re-sync steps in [`resync.md`](resync.md):
 
 | dependency    | commit                                     | version                 |
 |---------------|--------------------------------------------|-------------------------|
-| ComfyUI       | `989d93d0d968e704c589ce0146bb18c77f6b50cc` | `v0.45.0`               |
+| ComfyUI       | `2aa4d535a76e4b6acf6a94f263bc482430c396dd` | `v0.45.4`               |
 | comfy-aimdo   | `68088de9dce9f5e32231fccf230938769c5562da` | `0.6.0`                 |
 | comfy-kitchen | `cbc44a5b7cc3b8f910ef76ae5251c94971eb05d1` | `0.2.41`                |
 

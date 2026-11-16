@@ -20,7 +20,7 @@ comfy-kitchen at the versions that tag's `requirements.txt` pins.
 
 | repo          | commit                                     | tag                    |
 |---------------|--------------------------------------------|------------------------|
-| ComfyUI       | `989d93d0d968e704c589ce0146bb18c77f6b50cc` | v0.45.0                |
+| ComfyUI       | `2aa4d535a76e4b6acf6a94f263bc482430c396dd` | v0.45.4                |
 | comfy-aimdo   | `68088de9dce9f5e32231fccf230938769c5562da` | v0.6.0 (pip)           |
 | comfy-kitchen | `cbc44a5b7cc3b8f910ef76ae5251c94971eb05d1` | v0.2.41 (pip)          |
 
@@ -69,7 +69,7 @@ The verbatim copy does not cover it, so a re-sync diffs the upstream lines liste
 
 `sd.py` imports most of ComfyUI (every model, every text encoder), so it is not vendored: a
 `comfy.sd` import would cost a cold start about 0.8 s and about 100 MB of RAM. What `comfy_vae`
-needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.py` lines (v0.45.0):
+needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.py` lines (v0.45.4):
 
 | upstream | in adapter.py | what |
 |---|---|---|

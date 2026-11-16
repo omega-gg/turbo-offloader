@@ -608,7 +608,7 @@ from ComfyUI.
   comfy-krea2-turbo CUDA give the same md5 on both stacks. One caution from that check:
   comfy-krea2-turbo's image changed when it ran right after another engine in the same sequence,
   on either stack, so compare its runs under the same conditions.
-- **v0.45 re-sync (v0.41.2 → v0.45.0, comfy-aimdo 0.5.6 → 0.6.0, comfy-kitchen 0.2.37 →
+- **v0.45 re-sync (v0.41.2 → v0.45.4, comfy-aimdo 0.5.6 → 0.6.0, comfy-kitchen 0.2.37 →
   0.2.41, torch unchanged).** Ten vendored files changed upstream (`ops.py`, `model_patcher.py`,
   `model_management.py`, `model_prefetch.py`, `memory_management.py`, `pinned_memory.py`,
   `utils.py`, `lora.py`, `cli_args.py`, `ldm/modules/diffusionmodules/model.py`) and one joins
@@ -618,5 +618,6 @@ from ComfyUI.
   uses. The other mirrored lines only moved; their citations follow. On the A1000 at 512² (seed
   42, old and new stacks interleaved twice), flux2-4b CUDA and CPU give the same md5 on both.
   comfy-krea2-turbo gave two images on the old stack alone, the new stack's one among them, the
-  run-order caution above: under the same conditions both stacks match.
+  run-order caution above: under the same conditions both stacks match. Those runs were on v0.45.0;
+  v0.45.1 to v0.45.4 change nothing the offloader copies or mirrors (partner nodes only).
 - **License.** ComfyUI is GPLv3; the vendored copies live in this already-GPLv3 package.
