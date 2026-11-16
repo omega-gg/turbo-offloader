@@ -4,6 +4,7 @@ OTHER_FILES += README.md  \
                LICENSE.md \
                implementation.md \
                dummy.md \
+               resync.md \
                doc/aimdo_v1.md      \
                doc/AIMDO_V2_PLAN.md \
                doc/AIMDO_KITCHEN_PLAN.md \
@@ -16,9 +17,8 @@ OTHER_FILES += README.md  \
 OTHER_FILES += offloader/__init__.py \
                offloader/adapter.py  \
 
-# Vendored ComfyUI offloading snapshot (byte-for-byte; see offloader/comfy/resync.md).
+# Vendored ComfyUI offloading snapshot (byte-for-byte; see resync.md).
 OTHER_FILES += offloader/comfy/__init__.py          \
-               offloader/comfy/resync.md            \
                offloader/comfy/cli_args.py          \
                offloader/comfy/options.py           \
                offloader/comfy/model_management.py  \

@@ -102,7 +102,7 @@ The design philosophy (v2): **don't reimplement offloading — borrow it whole.*
 manager is mature and battle-tested, so `offloader/comfy/` is an unmodified snapshot of it, and
 `adapter.py` is a thin bridge that makes turboCLI's diffusers pipelines drive *exactly* the code
 ComfyUI drives. That gives 1:1 behaviour parity with ComfyUI and makes syncing to a newer ComfyUI
-release a mechanical copy (`offloader/comfy/resync.md`). The runner only ever calls the seam —
+release a mechanical copy (`resync.md`). The runner only ever calls the seam —
 `load_pipe`, `prepare`, `reclaim`, `release`, and friends — and never reaches inside.
 
 ## The two offload paths
@@ -155,7 +155,7 @@ Each of these is one sentence here and a full section in `implementation.md`:
 - `implementation.md` — the full design document: every mechanism, rationale, and benchmark tables.
 - `doc/COMFYUI_OFFLOAD_MAP.md` — a map of ComfyUI's offloading internals with line references.
 - `doc/BENCHMARKING.md` — how turbo and ComfyUI are compared head-to-head.
-- `offloader/comfy/resync.md` — how the vendored ComfyUI snapshot is kept in sync.
+- `resync.md` — how the vendored ComfyUI snapshot is kept in sync.
 
 ## Keeping this document up to date
 

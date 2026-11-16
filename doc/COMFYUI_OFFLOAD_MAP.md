@@ -2,7 +2,7 @@
 
 Reference map of how ComfyUI streams model weights host↔VRAM, and how turbo-offloader
 reproduces it. The map is for ComfyUI v0.39.1 with comfy-aimdo 0.5.5: line refs are against that
-tag, the snapshot vendored in `offloader/comfy/` (see `offloader/comfy/resync.md`).
+tag, the snapshot vendored in `offloader/comfy/` (see `resync.md`).
 
 The one-line summary: **turbo drives the exact same vendored code the same way ComfyUI does.**
 Static `ModelPatcher` vs `ModelPatcherDynamic`, the two pin systems, the budget, the lazy cast-path

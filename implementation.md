@@ -18,14 +18,14 @@ by step, no diffusion background required. It is kept up to date with each itera
 offloader/
   __init__.py   backend seam the runner drives (pre_torch_init/available/supports/load_pipe/...)
   adapter.py    the thin middleman -- the only real logic in the package
-  comfy/        byte-for-byte ComfyUI offloading snapshot (see comfy/resync.md)
+  comfy/        byte-for-byte ComfyUI offloading snapshot (see resync.md)
 ```
 
 `offloader/comfy/` is a pristine mirror of ComfyUI's `model_management.py`, `model_patcher.py`,
 `ops.py`, `memory_management.py`, `model_prefetch.py`, `lora.py`, `utils.py`, etc. Aliased to the
 top-level `comfy` package via a `sys.modules` entry in `comfy/__init__.py`, so the vendored
 `import comfy.X` lines resolve unchanged. The **only** edits over upstream (all documented in
-`comfy/resync.md`): three commented-out off-path imports, `try/except` shims for the optional
+`resync.md`): three commented-out off-path imports, `try/except` shims for the optional
 `comfy_aimdo` / `comfy_kitchen`, and a stubless `cli_args`+`options` (vendored, parses no argv).
 
 ## The seam (`__init__.py`)
@@ -43,7 +43,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `reclaim(pipe)` | end the run as ComfyUI's `cleanup` does (`current_patcher = None`), then `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
 | `comfy_api()` | ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI model does: `ck` (comfy_kitchen as ComfyUI configures it, `None` without its kernels), `ops` and `mm` (the vendored comfy.ops / comfy.model_management), called by their ComfyUI names (`ops.linear_input_act`, `mm.pin_memory`, `mm.cast_to`, ...). Names no model; used by `comfy-qwen-image-2-1` (fused forward, host K/V cache with comfy's prefetch). |
-| `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `comfy/resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1). |
+| `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1). |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
 
@@ -370,15 +370,15 @@ Python 3.14.
 Notes: MPS runs **fp16-resident** (no `manual_cast`) — the transformer is direct-loaded onto the
 device (file mapped on the CPU, each tensor copied once onto MPS) and stays resident; there is no
 VBAR/stream path (MPS has no separate VRAM pool). The text encoder runs on **CPU** (ComfyUI's
-`text_encoder_device()` under `vram_state` SHARED), so residency is the transformer alone (~7 GB, down from ~15 GB with
-both on-device) and only the conditioning crosses to MPS. On this 8 GB box the run still spills to
-swap and **that** is the scaling wall, not compute: peak swap ~5.3 GB at 512×512, ~9.7 GB at
-1024×768 (both produce clean images — the 1024 corruption seen in image-to-image *edit* is that
-mode's larger footprint, not text-to-image). The faithful fp16-on-CPU encode (~50 s) dominates the
-non-gen time and is cached (`install_encode_cache`), so a repeated prompt skips it. Output is
-bit-deterministic across runs at a fixed seed (verified: two seed-42 runs, identical SHA-256).
-z-image-turbo (20 GB) is not benchmarked here — its working set exceeds this 8 GB box's usable
-RAM+swap headroom, so it belongs on a larger-RAM Mac.
+`text_encoder_device()` under `vram_state` SHARED), so residency is the transformer alone (~7 GB,
+down from ~15 GB with both on-device) and only the conditioning crosses to MPS. On this 8 GB box
+the run still spills to swap and **that** is the scaling wall, not compute: peak swap ~5.3 GB at
+512×512, ~9.7 GB at 1024×768 (both produce clean images — the 1024 corruption seen in
+image-to-image *edit* is that mode's larger footprint, not text-to-image). The faithful fp16-on-CPU
+encode (~50 s) dominates the non-gen time and is cached (`install_encode_cache`), so a repeated
+prompt skips it. Output is bit-deterministic across runs at a fixed seed (verified: two seed-42
+runs, identical SHA-256). z-image-turbo (20 GB) is not benchmarked here — its working set exceeds
+this 8 GB box's usable RAM+swap headroom, so it belongs on a larger-RAM Mac.
 
 Re-measured on torch 2.14.1 (with the MPS load fix): comfy-flux2-4b 512×512 ~264 s
 (`sequential_cpu` ~451 s), 1024×768 ~292 s (`sequential_cpu` ~475 s).
@@ -449,7 +449,7 @@ from ComfyUI.
   running a diffusers VAE into a sure OOM can end in the uncatchable abort above (measured on a
   4 GB card). An engine can also opt in to ComfyUI's own VAE, `comfy_vae`: comfy's model
   (`comfy/ldm/*`, vendored verbatim) built and run as sd.py does, mirrored in `adapter.py` (see
-  `comfy/resync.md`), under ComfyUI's model management, so it decodes what ComfyUI decodes, as
+  `resync.md`), under ComfyUI's model management, so it decodes what ComfyUI decodes, as
   fast. It loads through `load_models_gpu` as a dynamic patcher, staged in RAM rather than kept
   on the GPU, so on a small card the transformer keeps that room; a resident VAE decoded 2.5x
   slower there (Krea 2, 2.37 s against ComfyUI's 0.91 s). comfy-qwen-image-2-1's Wan 2.2 decoder
@@ -562,7 +562,7 @@ from ComfyUI.
   older one makes v0.39's `quant_ops.py` import block fail as a whole, which silently drops fp8
   and the kitchen RoPE.
 - **Re-syncing** a newer ComfyUI: re-copy the files and re-apply the short edit set in
-  `comfy/resync.md`; bump the commit pins there, in `comfy/__init__.py`, and in `README.md`.
+  `resync.md`; bump the commit pins there, in `comfy/__init__.py`, and in `README.md`.
 - **v0.39 re-sync (v0.27.0 → v0.39.1, comfy-aimdo 0.4.10 → 0.5.5, comfy-kitchen 0.2.16 →
   0.2.37).** Besides the re-copy, upstream behavior that reaches the adapter was mirrored:
   `pinned_memory`'s per-subset pin state (`install_pin_rollback_guard`); the quant formats a

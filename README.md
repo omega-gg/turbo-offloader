@@ -13,7 +13,7 @@ works on CPU and Apple MPS.
 turbo-offloader ports ComfyUI's memory-management / model-patcher / ops subsystem
 (under `offloader/comfy`), driven through the thin adapter in `offloader/adapter.py`. The port is
 pinned to exact upstream commits. Bump these together with the vendored files and follow the
-re-sync steps in [`offloader/comfy/resync.md`](offloader/comfy/resync.md):
+re-sync steps in [`resync.md`](resync.md):
 
 | dependency    | commit                                     | version                 |
 |---------------|--------------------------------------------|-------------------------|

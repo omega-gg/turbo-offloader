@@ -446,7 +446,7 @@ def install_pin_rollback_guard():
     transfers pageable via comfy/ops.py handle_pin) -- identical to the in-file rollback. Anything
     other than the truncate failure re-raises unchanged.
 
-    Idempotent, and leaves the vendored pinned_memory.py byte-for-byte (see comfy/resync.md).
+    Idempotent, and leaves the vendored pinned_memory.py byte-for-byte (see resync.md).
     Installed on the CUDA/VBAR path where comfy-aimdo pins host memory; unused elsewhere."""
     import comfy.pinned_memory as pm
     import comfy.memory_management as memm
@@ -1175,7 +1175,7 @@ def _vae_memory_used(kind, shape, dtype):
 # ComfyUI's VAE, mirrored from comfy/sd.py (v0.41.2): the model sd.py builds for a file and the way
 # its VAE class runs it. The model code itself is vendored (comfy/ldm/); what sd.py does around it
 # is copied here, each piece citing its sd.py lines, so a re-sync diffs those lines between the
-# two tags and ports any change (comfy/resync.md, category 3).
+# two tags and ports any change (resync.md, category 3).
 # -------------------------------------------------------------------------------------------------
 def _comfy_vae_model(sd):
     """sd.py's VAE.__init__ for the files an engine opts in with: the model, from the file's keys,
@@ -1283,7 +1283,7 @@ class ComfyVAE:
         # for a model declaring its estimate reliable, else try whole and tile on an OOM.
         from diffusers.models.autoencoders.vae import DecoderOutput
 
-        import comfy.model_prefetch  # lazily, as comfy/resync.md says
+        import comfy.model_prefetch  # lazily, as resync.md says
 
         self._build()
         framed = self.latent_dim == 2 and z.dim() == 5  # sd.py:1268 drops a 2D model's frame axis

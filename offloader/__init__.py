@@ -199,15 +199,15 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
     PipelineCls, Transformer = pipeline_cls, transformer_cls
 
     # Direct-to-device load, MPS only. On MPS (unified memory) we copy the big models into device
-    # memory at load (below) instead of diffusers' CPU load + load_models_gpu's per-leaf CPU->device
-    # copy. Safe only here: MPS has no separate VRAM pool, so full residency is always chosen and
-    # can never OOM -- whereas on CUDA load_models_gpu's partial-residency / VBAR streaming
-    # decisions must stand (a full direct load would OOM a smaller-than-model card), and on CPU the
-    # weights already load there so there is nothing to gain. LoRA is fine: direct-load only places
-    # the base weights; load_models_gpu still merges each patch on top via patch_weight_to_device
-    # (verified bit-identical to the normal path). Gated off manual_cast, whose
-    # bf16-storage/fp16-compute split relies on the ModelPatcher cast path a direct assign would
-    # bypass (never hit on MPS+fp16 anyway -> None).
+    # memory at load (below) instead of diffusers' CPU load + load_models_gpu's per-leaf
+    # CPU->device copy. Safe only here: MPS has no separate VRAM pool, so full residency is always
+    # chosen and can never OOM -- whereas on CUDA load_models_gpu's partial-residency / VBAR
+    # streaming decisions must stand (a full direct load would OOM a smaller-than-model card), and
+    # on CPU the weights already load there so there is nothing to gain. LoRA is fine: direct-load
+    # only places the base weights; load_models_gpu still merges each patch on top via
+    # patch_weight_to_device (verified bit-identical to the normal path). Gated off manual_cast,
+    # whose bf16-storage/fp16-compute split relies on the ModelPatcher cast path a direct assign
+    # would bypass (never hit on MPS+fp16 anyway -> None).
     direct_load = mm.is_device_mps(load_device) and manual_cast is None
 
     patchers = []

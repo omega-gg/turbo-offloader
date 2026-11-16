@@ -18,7 +18,7 @@ where turbo went from ~5× slower to per-step parity.
   OS page cache, so the next cold load is disk-bound and slow. That's a cache artifact, not the engine.
 - **Same prompt twice within an engine** exercises turbo's encode cache (2nd gen skips the text
   encoder). Use a *fresh* prompt when you specifically want to measure a cold text-encode.
-- **Same runtime:** turbo pins the torch ComfyUI's install runs (see `offloader/comfy/resync.md`);
+- **Same runtime:** turbo pins the torch ComfyUI's install runs (see `resync.md`);
   compare on that same torch, and use ComfyUI's own template graphs for the engine.
 - **Interleave, small canvas:** the A1000 laptop throttles and its page cache swings a streaming
   phase by ±5 s run to run, so alternate the two sides (A, B, A, B) at 512² and trust a delta only
