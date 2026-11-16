@@ -35,6 +35,7 @@
 # Establishes the top-level `comfy` alias (see offloader/comfy/__init__.py).
 from . import comfy  # noqa: F401
 
+import contextlib
 import math
 import os
 from types import SimpleNamespace
@@ -205,37 +206,6 @@ def comfy_ize(model, operations=None):
         m.weight_function = []
         m.bias_function = []
         count += 1
-    return count
-
-
-def keep_declared_fp32(model):
-    """Honour a model's own `_keep_in_fp32_modules` after a meta-build + assign load.
-
-    diffusers keeps those submodules in fp32 (modeling_utils.py:493) -- but only through
-    from_pretrained. Our meta-build (`from_config(...).to(dtype)`) and
-    `load_state_dict(assign=True)` both bypass it, so they land in the checkpoint dtype instead.
-    That silently costs the fused
-    kernel wherever the module upcasts its input: diffusers' Krea2RMSNorm runs
-    `F.rms_norm(hidden_states.float(), ..., weight=self.weight + 1.0)`, so a bf16 weight makes
-    torch refuse to fuse ("Mismatch dtype between input and weight ... Cannot dispatch to fused
-    implementation") -- measured 1.653 vs 0.679 ms/call on the A1000. ComfyUI casts the scale to
-    fp32 for exactly this reason (comfy/ldm/krea2/model.py:34), so this is also what restores
-    numeric parity with it (a bf16 `+ 1.0` rounds a zero-centered scale).
-
-    Model-agnostic: reads the model's own declaration and matches names diffusers' own way
-    (`any(m in name for m in _keep_in_fp32_modules)`, modeling_utils.py:178). No-op when the model
-    declares none. Returns the number of parameters promoted."""
-    names = getattr(model, "_keep_in_fp32_modules", None)
-
-    if not names:
-        return 0
-
-    count = 0
-    for name, param in model.named_parameters():
-        if param.is_floating_point() and param.dtype != torch.float32 \
-                and any(m in name for m in names):
-            param.data = param.data.float()
-            count += 1
     return count
 
 
@@ -642,50 +612,6 @@ def as_files(weight_file):
     return list(weight_file) if isinstance(weight_file, (list, tuple)) else [weight_file]
 
 
-def stream_single_file(build_meta, weight_file, operations=None, convert=None, device=None):
-    """load_streamed's single-file sibling (ComfyUI-reuse engines): meta-load the module via
-    build_meta() (accelerate init_empty_weights, so no weight RAM), comfy-ize it, mmap the ONE
-    ComfyUI safetensors via load_torch_file (or each shard of a model, a list of files, into one
-    state dict), optionally run `convert` on the state dict (the diffusers single-file key remap:
-    renames + a fused-qkv chunk that returns views, re-wrapped by _own_file_slice so they stream
-    as file slices), then rebind by name. `device` (MPS direct load, see load_pipe_comfy) copies
-    each tensor from the CPU mmap onto that device, in the model's dtype. Returns
-    (model, missing)."""
-    import comfy.utils as cu
-
-    model = build_meta()
-
-    comfy_ize(model, operations)
-
-    files = as_files(weight_file)
-    sd = {}
-    for f in files:
-        sd.update(cu.load_torch_file(f))
-    model._offloader_files = files  # build_dynamic_patcher's fast_disk
-
-    if convert is not None:
-        sd = {k: _own_file_slice(v) for k, v in convert(sd).items()}
-
-    # Direct load: one copy per tensor from the CPU mmap onto the device, in the model's own dtype,
-    # as ComfyUI's load_state_dict copy into a model built on the device does -- the resident
-    # weights never go through a per-forward cast. Like ComfyUI, the file is never read onto the
-    # device itself: on MPS (torch 2.14.1) such tensors come out zeroed once GPU work is queued on
-    # them.
-    if device is not None:
-        own = {n: p.dtype for n, p in model.named_parameters()}
-        own.update({n: b.dtype for n, b in model.named_buffers()})
-        for k, v in sd.items():
-            dtype = own[k] if k in own and v.is_floating_point() else v.dtype
-            sd[k] = v.to(device=device, dtype=dtype)
-
-    use_comfy_attention_config(model, sd)
-    missing = _assign_sd(model, sd)
-    # The slices carry the file's dtype, so honour _keep_in_fp32_modules afterwards.
-    keep_declared_fp32(model)
-
-    return model, missing
-
-
 def mixed_precision_operations(compute_dtype, load_device, quant_config):
     """ComfyUI's mixed-precision op namespace (comfy.ops.mixed_precision_ops) for a scaled-fp8 (or
     other quantized) checkpoint -- the branch ops.pick_operations takes only when a model_config
@@ -693,148 +619,243 @@ def mixed_precision_operations(compute_dtype, load_device, quant_config):
     can't run natively are `disabled` -> emulated dequant, exactly as ComfyUI: on Ampere (no fp8
     tensor cores) float8 runs emulated (dequant to compute_dtype per forward). The disabled set is
     comfy's own (ops.get_disabled_quant_formats, as pick_operations computes it). Reused by
-    load_quant_single_file."""
+    load_comfy_single_file."""
     disabled = ops.get_disabled_quant_formats(load_device)
 
     return ops.mixed_precision_ops(quant_config, compute_dtype, disabled=disabled)
 
 
-def _quant_ize(model, operations, compute_dtype):
-    """Re-class every Linear of `model` to the mixed-precision op namespace and inject the attrs
-    its __init__ would have set -- factory_kwargs / _orig_shape / tensor_class / _full_precision_mm
-    (read by comfy.ops._load_quantized_module) plus the per-instance weight/bias_function lists.
-    Unlike comfy_ize (which re-classes over live weights for cast-only ops), a mixed-precision
-    Linear then LOADS its weight via _load_from_state_dict -> _load_quantized_module (a
-    comfy_kitchen QuantizedTensor); a non-quant Linear (e.g. lm_head) falls through its plain
-    branch. Returns the count re-classed."""
-    count = 0
+def load_comfy_single_file(build, weight_file, load_device, compute_dtype, convert=None):
+    """A model of ComfyUI's own (vendored under comfy/ldm/) from its single file (or a model's
+    shards, a list of files), as sd.py's load_diffusion_model_state_dict does (sd.py:2484-2552,
+    v0.45.4): mmap the file, inject its quant markers (convert_old_quants), detect its
+    quantization, pick ComfyUI's ops for it, build the model through `build(sd, operations)`
+    (model_base.py:184-187) and assign the file's weights (load_model_weights, as a dynamic
+    patcher has it). `convert`, after the quant markers, renames a file of another layout into
+    ComfyUI's and runs the model's process_unet_state_dict. Returns (model, unexpected_keys)."""
+    files = as_files(weight_file)
 
-    for _name, m in model.named_modules():
-        if isinstance(m, torch.nn.Linear) and not isinstance(m, operations.Linear):
-            out_features, in_features = m.weight.shape
+    sd, metadata = {}, None
+    for f in files:
+        part, part_metadata = comfy.utils.load_torch_file(f, device=torch.device("cpu"),
+                                                          return_metadata=True)
+        sd.update(part)
+        metadata = metadata or part_metadata
 
-            m.__class__ = operations.Linear
-            m.factory_kwargs = {"device": None, "dtype": compute_dtype}
-            m._orig_shape = (out_features, in_features)
-            m.tensor_class = None
-            m._full_precision_mm = operations._full_precision_mm
-            m._full_precision_mm_config = False
-            m.weight_function = []
-            m.bias_function = []
-            count += 1
-
-    return count
-
-
-def load_quant_single_file(build_meta, weight_file, load_device, compute_dtype, convert=None):
-    """stream_single_file's fp8 sibling for a ComfyUI scaled-fp8 single file (transformer OR text
-    encoder), kept fp8 (mmap, dequantized per forward -- "what comfy does"). Meta-build via
-    build_meta() (no weight RAM), mmap the file (load_torch_file, with metadata), run comfy's
-    convert_old_quants -- which injects the .comfy_quant markers from either the classic
-    scaled_fp8 + scale_weight keys OR the file's `_quantization_metadata` -- detect the quant,
-    re-class Linears to the mixed-precision namespace (+ comfy_ize the rest), optionally `convert`
-    the state-dict keys (e.g. a flat->nested rename), then load_state_dict(assign=True) so each
-    quant Linear builds its QuantizedTensor. Returns (model, unexpected_keys)."""
-    import comfy.utils as cu
-
-    model = build_meta()
-
-    sd, metadata = cu.load_torch_file(weight_file, device=torch.device("cpu"),
-                                      return_metadata=True)
-    model._offloader_files = [weight_file]  # build_dynamic_patcher's fast_disk
-    sd, metadata = cu.convert_old_quants(sd, model_prefix="", metadata=metadata)
-    quant_config = cu.detect_layer_quantization(sd, "")
+    sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
 
     if convert is not None:
         sd = {k: _own_file_slice(v) for k, v in convert(sd).items()}
 
-    operations = mixed_precision_operations(compute_dtype, load_device, quant_config)
-    _quant_ize(model, operations, compute_dtype)
-    # _quant_ize only re-classes Linears (they need the quant _load_from_state_dict); comfy_ize the
-    # REST of the leaves (Embedding, Conv, norms) into the same namespace so they stream too, else
-    # keep_uncastable_resident pins them (e.g. the ~1GB input Embedding), starving the transformer
-    # VRAM stream budget. comfy_ize skips the already-quant Linears (CastWeightBiasOp; see
-    # _comfy_class_for), so it converts only the non-Linear leaves.
-    comfy_ize(model, operations)
+    quant_config = comfy.utils.detect_layer_quantization(sd, "")
 
-    use_comfy_attention_config(model, sd)
-    _missing, unexpected = model.load_state_dict(sd, assign=True, strict=False)
-    # assign=True installs the checkpoint's own dtype, so honour _keep_in_fp32_modules afterwards.
-    keep_declared_fp32(model)
+    if quant_config is not None:
+        operations = mixed_precision_operations(compute_dtype, load_device, quant_config)
+    else:
+        operations = pick_operations(compute_dtype, compute_dtype, load_device)
+
+    model = build(sd, operations)
+    model.requires_grad_(False)
+    model.eval()
+    model._offloader_files = files  # build_dynamic_patcher's fast_disk
+
+    _missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
 
     return model, unexpected
 
 
-def use_comfy_attention_config(model, sd):
-    """ComfyAttention._load_from_state_dict (comfy/ldm/modules/attention.py:89-110): a ComfyUI
-    file's `<module>.comfy_attention.config` key picks the attention that module runs, one config
-    or a list tried in order, the first one comfy-kitchen runs on the device winning. ComfyUI
-    knows two, comfy_kitchen_int8 and comfy_kitchen_sol: that module's SDPA then runs the kernel
-    as attention_comfy_kitchen_int8 / attention_comfy_kitchen_sol call it (attention.py:637-669,
-    :698-712). Pops those keys."""
-    import functools
-    import json
+def llama_detect(state_dict, prefix=""):
+    """hunyuan_video.llama_detect (text_encoders/hunyuan_video.py:11-23): a Llama-family text
+    encoder's dtype and quantization off its file."""
+    out = {}
+    for key in ("{}model.norm.weight".format(prefix),
+                "{}model.layers.0.input_layernorm.weight".format(prefix)):
+        if key in state_dict:
+            out["dtype_llama"] = state_dict[key].dtype
+            break
 
-    import torch.nn.functional as F
+    quant = comfy.utils.detect_layer_quantization(state_dict, prefix)
+    if quant is not None:
+        out["llama_quantization_metadata"] = quant
+    return out
 
-    try:
-        import comfy_kitchen
-    except ImportError:
-        comfy_kitchen = None
 
-    device = mm.get_torch_device()
+def load_clip_sd(path):
+    """A text encoder's file (or shards) as load_clip reads it (sd.py:1717-1720), with
+    load_text_encoder_state_dicts' renames that apply to it (sd.py:1898-1899)."""
+    sd = {}
+    for f in as_files(path):
+        sd.update(comfy.utils.load_torch_file(f, safe_load=True))
 
-    def int8_attention(sdpa, query, key, value, attn_mask=None, scale=None, **_):
-        # diffusers' SDPA call: [batch, heads, sequence, head_dim], as the kernel takes them.
-        if attn_mask is not None:
-            if attn_mask.ndim == 2:
-                attn_mask = attn_mask.unsqueeze(0)
-            if attn_mask.ndim == 3:
-                attn_mask = attn_mask.unsqueeze(1)
-        return comfy_kitchen.int8_attention(query, key, value, scale=scale, attn_mask=attn_mask)
+    if "lm_head.weight" in sd:
+        sd["model.lm_head.weight"] = sd.pop("lm_head.weight")  # prefix missing in some models
+    return sd
 
-    def sol_attention(sdpa, query, key, value, attn_mask=None, scale=None, tau=1.0, **kwargs):
-        # A mask falls back to the plain attention; the kernel takes [batch, sequence, heads, dim].
-        if attn_mask is not None:
-            return sdpa(query, key, value, attn_mask=attn_mask, scale=scale, **kwargs)
-        query, key, value = (t.transpose(1, 2) for t in (query, key, value))
-        return comfy_kitchen.sol_attn(query, key, value, tau=tau, scale=scale).transpose(1, 2)
 
-    def pick(configs, prefix):
-        for config in configs:
-            method = config.get("attention")
-            if method == "comfy_kitchen_int8":
-                if (comfy_kitchen is not None
-                        and comfy_kitchen.int8_attention_is_available()
-                        and comfy_kitchen.int8_attention_is_available(device)):
-                    return int8_attention
-            elif method == "comfy_kitchen_sol":
-                if comfy_kitchen is not None and comfy_kitchen.sol_attn_is_available(device):
-                    return functools.partial(sol_attention, tau=config.get("tau", 1.0))
-            else:
-                print("offloader: ignoring unknown attention method %r for %s" % (method, prefix),
-                      flush=True)
-        return None
+def qwen3vl_sd(sd):
+    """The renames every Qwen3-VL branch of load_text_encoder_state_dicts makes
+    (sd.py:2067-2111)."""
+    return comfy.utils.state_dict_prefix_replace(sd, {"model.language_model.": "model.",
+                                                      "model.visual.": "visual.",
+                                                      "lm_head.": "model.lm_head."})
 
-    def kernel_forward(forward, attention):
-        # diffusers reaches torch's SDPA by name, so the module's forward swaps it in.
-        def call(*args, **kwargs):
-            sdpa = F.scaled_dot_product_attention
-            F.scaled_dot_product_attention = functools.partial(attention, sdpa)
-            try:
-                return forward(*args, **kwargs)
-            finally:
-                F.scaled_dot_product_attention = sdpa
-        return call
 
-    suffix = ".comfy_attention.config"
-    for key in [k for k in sd if k.endswith(suffix)]:
-        prefix = key[:-len(suffix)]
-        config = json.loads(sd.pop(key).numpy().tobytes())
-        attention = pick(config if isinstance(config, list) else [config], prefix)
-        if attention is not None:
-            module = model.get_submodule(prefix)
-            module.forward = kernel_forward(module.forward, attention)
+def load_image(image):
+    """LoadImage's IMAGE for a PIL image (nodes.py:1782-1789): upright, RGB, (1, H, W, 3) in
+    [0, 1]."""
+    import numpy
+    from PIL import ImageOps
+
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    return torch.from_numpy(numpy.array(image).astype(numpy.float32) / 255.0)[None]
+
+
+class CLIP:
+    """sd.py's CLIP (sd.py:246-310, :332-343, :408-439, :441-455, :471-476, v0.45.4) for a text
+    encoder of ComfyUI's own: its tokenizer, its model behind a patcher, and the encode its
+    CLIPTextEncode runs. `clip` and `tokenizer` are the model's (its sd.py branch), `state_dict`
+    the file's, as load_text_encoder_state_dicts hands them over (sd.py:1887-2232)."""
+
+    def __init__(self, clip, tokenizer, state_dict):
+        import comfy.hooks
+        import comfy.storage
+
+        load_device = mm.text_encoder_device()
+        offload_device = mm.text_encoder_offload_device()
+        dtype = mm.text_encoder_dtype(load_device)
+        parameters = comfy.utils.calculate_parameters(state_dict)
+
+        params = {"dtype": dtype, "model_options": {},
+                  "device": mm.text_encoder_initial_device(load_device, offload_device,
+                                                           parameters * mm.dtype_size(dtype))}
+
+        self.cond_stage_model = clip(**params)
+
+        for dt in self.cond_stage_model.dtypes:
+            if not mm.supports_cast(load_device, dt):
+                load_device = offload_device
+                if params["device"] != offload_device:
+                    self.cond_stage_model.to(offload_device)
+
+        mm.archive_model_dtypes(self.cond_stage_model)
+
+        self.tokenizer = tokenizer(embedding_directory=None, tokenizer_data={})
+
+        dynamic = not getattr(self.cond_stage_model, "disable_offload", False)
+        patcher = model_patcher.CoreModelPatcher if dynamic else model_patcher.ModelPatcher
+        self.patcher = patcher(self.cond_stage_model, load_device=load_device,
+                               offload_device=offload_device,
+                               fast_disk=comfy.storage.state_dict_fast_disk(state_dict))
+        # Match torch.float32 hardcode upcast in TE implemention
+        self.patcher.set_model_compute_dtype(torch.float32)
+        self.patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
+        self.patcher.is_clip = True
+
+        self.load_sd(state_dict)
+
+        if params["device"] == load_device:
+            mm.load_models_gpu([self.patcher], force_full_load=True)
+
+    def tokenize(self, text, **kwargs):
+        return self.tokenizer.tokenize_with_weights(text, False, **kwargs)
+
+    def encode(self, text):
+        """CLIPTextEncode's conditioning for `text`."""
+        return self.encode_from_tokens(self.tokenize(text))[0]
+
+    def encode_from_tokens(self, tokens):
+        """encode_from_tokens with return_dict, as encode_from_tokens_scheduled runs it
+        unscheduled: the conditioning and what the model returns beside it."""
+        self.cond_stage_model.reset_clip_options()
+
+        self.load_model(tokens)
+        device = self.patcher.load_device
+        self.cond_stage_model.set_clip_options({"execution_device": device})
+
+        with mm.cuda_device_context(device):
+            o = self.cond_stage_model.encode_token_weights(tokens)
+
+        return o[0], (o[2] if len(o) > 2 else {})
+
+    def load_sd(self, sd):
+        can_assign = self.patcher.is_dynamic()
+        self.cond_stage_model.can_assign_sd = can_assign
+        for m in self.cond_stage_model.modules():
+            m.can_assign_sd = can_assign
+        return self.cond_stage_model.load_sd(sd)
+
+    def load_model(self, tokens={}):
+        memory_used = 0
+        if hasattr(self.cond_stage_model, "memory_estimation_function"):
+            memory_used = self.cond_stage_model.memory_estimation_function(
+                tokens, device=self.patcher.load_device)
+        mm.load_models_gpu([self.patcher], memory_required=memory_used)
+        return self.patcher
+
+
+def id_grids(ids, axis, scale=1.0):
+    """Each grid's (h, w) off a pipeline's (seq, 4) position ids, the grids one after another,
+    one per value on `axis`: a grid ends on (h - 1, w - 1), times `scale`, in its columns 1 and 2,
+    as ComfyUI builds them. It reads the ids on the host, so once per run."""
+    rows = ids.tolist()
+    return [(round(row[1] / scale) + 1, round(row[2] / scale) + 1)
+            for i, row in enumerate(rows)
+            if i + 1 == len(rows) or rows[i + 1][axis] != row[axis]]
+
+
+class BaseModel(torch.nn.Module):
+    """ComfyUI's BaseModel (model_base.py:174-276) around a transformer of its own, for one run
+    behind the call a diffusers pipeline makes: what the patcher reads off it (device, get_dtype,
+    current_patcher), what the pipeline reads (config, dtype), and _apply_model's options. A
+    model's adapter subclasses it with its forward (offloader/qwen_image21.py, flux3.py)."""
+
+    current_patcher = None  # set by pre_run, as BaseModel's
+
+    def __init__(self, diffusion_model, config, dtype):
+        super().__init__()
+        self.diffusion_model = diffusion_model
+        self.config = SimpleNamespace(**config)
+        self.device = None  # set by the patcher
+        self._dtype = dtype
+
+    @classmethod
+    def load(cls, build, weight_file, config, load_device, dtype, convert=None):
+        """The model of `build` from its file (load_comfy_single_file) behind the pipeline's call;
+        `config` is what the pipeline reads off its transformer's config. Returns
+        (model, unexpected_keys)."""
+        model, unexpected = load_comfy_single_file(build, weight_file, load_device, dtype,
+                                                   convert=convert)
+        out = cls(model, config, dtype)
+        out._offloader_files = model._offloader_files  # build_dynamic_patcher's fast_disk
+        return out, unexpected
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def get_dtype(self):
+        return self._dtype
+
+    @contextlib.contextmanager
+    def cache_context(self, name):
+        """The context a pipeline names each call by ("cond", "uncond"), as a diffusers model takes
+        it; a model that keeps something per cond reads it."""
+        yield
+
+    def transformer_options(self):
+        """_apply_model's (model_base.py:254-257)."""
+        patcher = self.current_patcher
+        return {"prefetch_dynamic_vbars": patcher is not None and patcher.is_dynamic()}
+
+    def lora_keys(self):
+        """model_lora_keys_unet's generic entries (lora.py:200-207), as {LoRA key: target}."""
+        key_map = {}
+        for k, _ in self.named_parameters():
+            if k.startswith("diffusion_model.") and k.endswith(".weight"):
+                key_lora = k[len("diffusion_model."):-len(".weight")]
+                key_map["lora_unet_{}".format(key_lora.replace(".", "_"))] = k
+                key_map[k[:-len(".weight")]] = k
+        return key_map
 
 
 _sdpa_patched = False
@@ -1396,11 +1417,12 @@ class ComfyVAE:
 def install_tiled_vae_fallback(pipe, node_boundary=None):
     """ComfyUI's sampler->VAE node boundary + its VAE out-of-memory fallback.
 
-    `node_boundary` (the seam's node_teardown) runs first: in ComfyUI the KSampler node ENDS before
-    VAEDecode begins, so the teardown has already reset the VBAR watermarks and the DiT's residency
-    is evictable when the VAE needs VRAM. A diffusers pipeline calls vae.decode inside the same
-    __call__, so without this boundary the DiT still pins its VRAM (measured: 2.66GB held, 0 free)
-    and a 1600x1200 decode dies on one ~1.4GB fp32 upsample after all 8 steps succeeded.
+    `node_boundary(kind)` (the seam's node boundary, "decoding" or "encoding") runs first: in
+    ComfyUI the KSampler node ENDS before VAEDecode begins, so the teardown has already reset the
+    VBAR watermarks and the DiT's residency is evictable when the VAE needs VRAM. A diffusers
+    pipeline calls vae.decode inside the same __call__, so without this boundary the DiT still pins
+    its VRAM (measured: 2.66GB held, 0 free) and a 1600x1200 decode dies on one ~1.4GB fp32
+    upsample after all 8 steps succeeded.
 
     Then comfy/sd.py:1369-1371: estimate the call's working memory (`memory_used_decode`) and hand
     it to load_models_gpu as memory_required BEFORE the first kernel. For an already-resident VAE
@@ -1427,15 +1449,15 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
         return
 
     if isinstance(vae, ComfyVAE):
-        def bounded(real):
+        def bounded(real, kind):
             def call(*args, **kwargs):
                 if node_boundary is not None:
-                    node_boundary()
+                    node_boundary(kind)
                 return real(*args, **kwargs)
             return call
 
-        vae.decode = bounded(vae.decode)
-        vae.encode = bounded(vae.encode)
+        vae.decode = bounded(vae.decode, "decoding")
+        vae.encode = bounded(vae.encode, "encoding")
         vae._tiled_fallback_installed = True
         return
 
@@ -1445,7 +1467,7 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
     def wrap(real, kind):
         def call(*args, **kwargs):
             if node_boundary is not None:
-                node_boundary()
+                node_boundary(kind)
             samples_in = args[0] if args else next(iter(kwargs.values()), None)
             do_tile = False
             if hasattr(samples_in, "shape") and samples_in.device.type != "cpu":

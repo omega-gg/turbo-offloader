@@ -6,7 +6,7 @@ through `offloader/adapter.py` so turboCLI's diffusers pipelines reuse ComfyUI's
 three categories, and each one has its own step in a re-sync:
 
 1. **Copied verbatim**: re-copy the files from the new tag.
-2. **Edited**: three one-line comment-outs, re-applied after the copy.
+2. **Edited**: two one-line comment-outs, re-applied after the copy.
 3. **Mirrored or called by name, not copied**: code in `offloader/` that reproduces a piece of
    ComfyUI or depends on one of its internals, each citing its upstream lines; diff those lines
    between the two tags and port any change.
@@ -44,11 +44,31 @@ Model code, for the VAEs an engine runs as ComfyUI's own (`comfy_vae`, category 
 2.1), and what they import, `ldm/modules/diffusionmodules/model.py` (with that package's empty
 `__init__.py`).
 
+Model code, for the transformers an engine runs as ComfyUI's own (category 3):
+`ldm/qwen_image/model.py` (Qwen-Image, Qwen-Image-Edit), `ldm/qwen_image21/model.py`
+(Qwen-Image 2.1), `ldm/flux/model.py` (FLUX.2), `ldm/flux3/model.py` (FLUX.3),
+`ldm/krea2/model.py` (Krea 2), `ldm/lumina/model.py` (Z-Image), and what they import when they
+load: `ldm/flux/layers.py`, `ldm/flux/math.py`, `ldm/lightricks/model.py`,
+`ldm/lightricks/symmetric_patchifier.py`, `ldm/modules/attention.py`,
+`ldm/modules/sub_quadratic_attention.py`, `ldm/modules/diffusionmodules/util.py`,
+`ldm/modules/diffusionmodules/mmdit.py`, `ldm/chroma_radiance/layers.py`, `ldm/util.py`,
+`ldm/common_dit.py`, `ldm/wan/model.py`, `ldm/wan/model_animate2.py`. Imports made inside a
+function are left out: they only run on paths the offloader never takes.
+
+Model code, for the text encoders an engine runs as ComfyUI's own (category 3):
+`text_encoders/qwen_image.py` (Qwen2.5-VL-7B), `text_encoders/qwen_image21.py` (Qwen3-VL-8B),
+`text_encoders/flux.py` (FLUX.2's Qwen3 4B and 8B, FLUX.3's Qwen3-VL-4B), `text_encoders/krea2.py`
+(Krea 2's Qwen3-VL-4B), `text_encoders/z_image.py` (Qwen3 4B), and what they import when they
+load: `text_encoders/qwen3vl.py`, `text_encoders/qwen35.py`, `text_encoders/qwen_vl.py`,
+`text_encoders/llama.py`, `text_encoders/sd3_clip.py`, `text_encoders/t5.py`,
+`text_encoders/bpe_tokenizer.py`, `sd1_clip.py`, `sdxl_clip.py`, `clip_model.py`, with the
+tokenizer files they read, `text_encoders/qwen25_tokenizer/` (data, byte-for-byte).
+
 `cli_args.py` + `options.py` are vendored as-is (not stubbed): `options.args_parsing` is `False`, so
 `cli_args` does `parser.parse_args([])` and every flag gets its upstream default. This is more
 faithful and lower-maintenance than a hand-written `args` stub (no field list to drift).
 
-## 2. Edited: three one-line comment-outs
+## 2. Edited: two one-line comment-outs
 
 Each is a single commented import for a dependency that is **off the offloader's code path**, so
 the offloader is unaffected; only unrelated helper functions would `NameError` if ever called (they
@@ -56,7 +76,6 @@ are not). Grep `# [turbo-offloader] disabled for turboCLI:` to find them all.
 
 | file      | line   | commented import                              | why it's off-path |
 |-----------|--------|-----------------------------------------------|-------------------|
-| `utils.py`| ~34    | `from einops import rearrange`                | only used by an attention-reshape helper (~L1424), not the offloader; drops the `einops` dependency |
 | `lora.py` | ~22    | `import comfy.model_base`                     | only used by `model_lora_keys_unet()` (LoRA key-mapping at load time), which the adapter bypasses; would otherwise pull the whole model zoo |
 | `hooks.py`| ~17    | `from node_helpers import conditioning_set_values` | only used by the conditioning helpers at the bottom of the file (~L692-781); keeps every hook class/enum `ModelPatcher` needs verbatim |
 
@@ -82,6 +101,80 @@ needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.p
 Adding a VAE: vendor its `comfy/ldm/` model file and what it imports (category 1), add its `sd.py`
 branch to `_comfy_vae_model`, then compare a decode against ComfyUI's on the same latent.
 
+### ComfyUI's transformers, behind a diffusers pipeline's call
+
+An engine can name its transformer by ComfyUI's model (`load_pipe_comfy`'s `transformer["model"]`):
+the offloader then builds ComfyUI's own model from its file and runs it behind the call the
+diffusers pipeline makes, so its fused kernels, per-block prefetch and caches come with each
+re-sync. Each model has an adapter in `offloader/` (`_comfy_model` picks it); what ComfyUI keeps
+around the model is mirrored there (v0.45.4):
+
+| upstream | in offloader/ | what |
+|---|---|---|
+| `load_diffusion_model_state_dict`, sd.py:2484-2552; model_base.py:184-187 | `adapter.load_comfy_single_file` | the file read, its quantization, ComfyUI's ops, the build and the weight load |
+| `BaseModel`, model_base.py:174-276 (`_apply_model`'s options, :254-257); `model_lora_keys_unet`'s generic entries, lora.py:200-207 | `adapter.BaseModel` | what every model shares: what the patcher and the pipeline read off it (a `cache_context` that keeps nothing), its LoRA keys |
+| the grids `process_img` builds per image (e.g. ldm/flux/model.py, ldm/flux3/model.py) | `adapter.id_grids` | each grid's size off a pipeline's position ids, read once per run |
+| model_detection.py:1012-1021 | `qwen_image.detect` | Qwen-Image's settings off its file (2511's `index_timestep_zero`) |
+| `model_base.QwenImage`, model_base.py:2784-2815; `BaseModel._apply_model`, model_base.py:221-263 | `qwen_image.QwenImage` | the model ComfyUI samples, its references as `edit` hands them |
+| `TextEncodeQwenImageEditPlus`, nodes_qwen.py:75-109 | `qwen_image.QwenImage.edit`, `qwen_image._scale` | each reference at about 1024x1024 on the 8 grid, VAE-encoded before sampling |
+| `model_lora_keys_unet`, lora.py:337-350 | `qwen_image.QwenImage.lora_keys` | its names, a fused `gate_up` (Qwen-Image 2.1's) by its two halves |
+| model_detection.py:991-1010 | `qwen_image21.detect` | Qwen-Image 2.1's settings off its file |
+| `model_base.QwenImage21`, model_base.py:2825-2879; `BaseModel._apply_model`, model_base.py:221-263 | `qwen_image21.QwenImage21`, over `qwen_image.QwenImage` | the model ComfyUI samples: dynamic units, `current_patcher`, the writable prefix cache, the casts around the transformer |
+| `ModelPatcher.writable_models` around sampling, samplers.py:1237, model_patcher.py:1408-1417 | `qwen_image21.QwenImage21._get_writable` | opened on a run's first forward, once its conditioning is known, closed at its end |
+| `TEModel.encode_token_weights`, text_encoders/qwen_image21.py:62-76 | `qwen_image21.QwenImage21.forward` | the vision tokens leave the text, a slot recording where each image goes |
+| model_detection.py:273-329, :359-362 | `flux2.detect` | FLUX.2's settings off its file |
+| `Flux.process_unet_state_dict`, supported_models.py:756-763 | `flux2.process` | the QK norms' scales as weights (FLUX.2 and FLUX.3) |
+| `model_base.Flux2` and `Flux`, model_base.py:996-1126; `BaseModel._apply_model`, model_base.py:221-263 | `flux2.Flux2` | the model ComfyUI samples: the text left-padded to 512, guidance 3.5, the references by index |
+| `model_lora_keys_unet`, lora.py:276-290 | `flux2.Flux2.lora_keys` | its diffusers names, the fused `linear1`'s qkv |
+| model_detection.py:263-272 | `flux3.detect` | FLUX.3's settings off its file |
+| `model_base.Flux3`, model_base.py:1129-1159; `BaseModel._apply_model`, model_base.py:221-263 | `flux3.Flux3` | the model ComfyUI samples; a flow map's step target as `sample_sigmas`, and its text and references run every step (:1141) |
+| `model_lora_keys_unet`, lora.py:352-358 | `flux3.Flux3.lora_keys` | the fused qkv by its three projections |
+| model_detection.py:1060-1073 | `krea2.detect` | Krea 2's settings off its file |
+| `model_base.Krea2`, model_base.py:2918-2945; `BaseModel._apply_model`, model_base.py:221-263 | `krea2.Krea2` | the model ComfyUI samples, the target's grid off the pipeline's position ids |
+| `model_lora_keys_unet`, lora.py:373-382 | `krea2.Krea2.lora_keys` | the diffusers names of each weight (`krea2_to_diffusers`) |
+| model_detection.py:594-604, :616-640 | `lumina2.detect` | Z-Image's settings off its file |
+| `model_base.Lumina2`, model_base.py:1569-1622; `BaseModel._apply_model`, model_base.py:221-263 | `lumina2.Lumina2` | the model ComfyUI samples: the text's length as `num_tokens`, conds of different lengths apart |
+| `model_lora_keys_unet`, lora.py:384-393 | `lumina2.Lumina2.lora_keys` | its diffusers names (`z_image_to_diffusers`) |
+
+### ComfyUI's text encoders, behind a diffusers pipeline's encode
+
+An engine can name its text encoder by ComfyUI's model too (`text_encoder["model"]`): the
+offloader loads it as `CLIPLoader` does, and the pipeline encodes through it, as `CLIPTextEncode`
+does. sd.py is not vendored (see above), so what it does for a text encoder is mirrored:
+
+| upstream | in offloader/ | what |
+|---|---|---|
+| `CLIP`, sd.py:246-310, :332-343, :408-439, :441-455, :471-476 | `adapter.CLIP` | the tokenizer, the model behind its patcher, the encode |
+| `llama_detect`, text_encoders/hunyuan_video.py:11-23 (sd.py:1877-1885 picks the file) | `adapter.llama_detect` | a Llama-family encoder's dtype and quantization |
+| `LoadImage`, nodes.py:1782-1789 | `adapter.load_image` | a PIL image as an IMAGE |
+| `load_text_encoder_state_dicts`, sd.py:1891-1899 | `adapter.load_clip_sd`, `adapter.qwen3vl_sd` | the file's renames, a Qwen3-VL file's prefixes |
+| the krea2 branch, sd.py:2084-2087 | `krea2.TextEncoder` | Krea 2's model and tokenizer |
+| the qwen_image branch, sd.py:2023-2032; `TextEncodeQwenImageEditPlus`, nodes_qwen.py:75-109 | `qwen_image.TextEncoder` | Qwen-Image's, the prompt with each image at about 384x384 |
+| sd.py:2108-2111; `TextEncodeQwenImage21`, nodes_qwen.py:144-180 | `qwen_image21.TextEncoder` | Qwen-Image 2.1's, the prompt with its images |
+| sd.py:1844-1853, :2046-2062 | `flux2.TextEncoder` | FLUX.2's, Qwen3 4B or 8B by its width |
+| sd.py:2088-2091 | `flux3.TextEncoder` | FLUX.3's Qwen3-VL-4B |
+| sd.py:2046-2052 | `lumina2.TextEncoder` | Z-Image's Qwen3 4B |
+
+A Krea 2 edit runs the forward of the comfyui-krea2edit node pack (v2.0.0, Apache-2.0,
+`__init__.py`), what a ComfyUI user runs for it, on the path its `fit` mode takes. Re-sync it
+like category 3 when the pack moves:
+
+| upstream (comfyui-krea2edit `__init__.py`) | in offloader/ | what |
+|---|---|---|
+| `_imgids`, `_imgids_offset`, `_place_refs`, :30-81 | `krea2._imgids`, `_imgids_offset`, `_place_refs` | the references' positions, aligned on the target's grid or beside it |
+| `_ref_attn_bias`, :170-199 | `krea2._ref_attn_bias` | the boost on the target's attention to a reference, no mask |
+| `krea2_edit_forward`, :202-292; `Krea2EditModelPatch.patch`, :328-427 | `krea2.Krea2._edit_forward`, `Krea2.edit` | [text, references, target], the references fitted in pixels (`ref_native`, stride-1 positions) |
+| `_fit_encode_image`, :107-151 | `krea2._fit_encode_image` | a reference fitted to the target in pixels and VAE-encoded, before sampling |
+| `Krea2EditGroundedEncode`, :428-524 | `krea2.TextEncoder.encode` | the prompt encoded with the references in the user turn, their longest side capped |
+
+Adding a text encoder: vendor its `comfy/text_encoders/` file and what it imports (category 1),
+mirror its sd.py branch as the model's `TextEncoder` after `krea2.py`, then compare its
+conditioning with ComfyUI's on the same prompt (and image).
+
+Adding a transformer: vendor its `comfy/ldm/` model file and what it imports (category 1), write
+its adapter on `adapter.BaseModel` after `flux3.py`, add it to `_comfy_model`, then compare its
+images and speed against ComfyUI's on the same files and template graph.
+
 ### Offloading internals
 
 | upstream | in offloader/ | what |
@@ -89,19 +182,14 @@ branch to `_comfy_vae_model`, then compare a decode against ComfyUI's on the sam
 | per-block `prefetch_queue_pop` loop (e.g. `comfy/ldm/lightricks/av_model.py`) | `adapter.install_prefetch` | the same loop, through forward hooks on the diffusers transformer's block ModuleLists |
 | `pinned_memory` internals | `adapter.install_pin_rollback_guard` | survive a transient `HostBuffer.truncate` failure, keeping ComfyUI's own recovery |
 | the SDPA body in `comfy/ops.py` (:58-109) | `adapter.use_comfy_attention` | diffusers' attention through a copy of it |
-| `ComfyAttention._load_from_state_dict`, `attention_comfy_kitchen_int8` and `attention_comfy_kitchen_sol` (`comfy/ldm/modules/attention.py`:89-110, :637-669, :698-712) | `adapter.use_comfy_attention_config` | a file's per-module attention config (one or a list, the first that runs wins): comfy-kitchen's int8 or sol attention |
-| `pre_run` before sampling (`comfy/samplers.py`:1260); `cleanup`'s `current_patcher = None` after (`model_patcher.py`:1337-1338) | `prepare`; `reclaim` | a model declaring `current_patcher` gets its patcher for the run and drops it at the end (Qwen-Image 2.1 frees its prefix cache) |
+| `pre_run` before sampling (`comfy/samplers.py`:1260); `cleanup`'s `current_patcher = None` after (`model_patcher.py`:1337-1338) | `prepare`; `_end_sampling` | a model declaring `current_patcher` gets its patcher for the run and drops it before the VAE decodes (Qwen-Image 2.1 frees its prefix cache) |
 | each node's `load_models_gpu` (CLIPTextEncode, KSampler's `prepare_sampling`, `comfy/sampler_helpers.py`:201) after the teardown marks pins inactive (`model_management.py`:1484) | `prepare`, the encode boundary in `_finalize_pipe` | the encoder loads at encode, the sampling models before sampling |
-| the per-node teardown in `execution.py` | `node_teardown` | the sampler to VAE node boundary |
+| the per-node teardown in `execution.py` | `node_teardown`, `_end_sampling` | the sampler to VAE node boundary |
+| `VAE.decode` / `encode` casting their input to the VAE's dtype (e.g. sd.py:1279) | `_finalize_pipe` | a diffusers VAE gets its input in its own dtype, float32 latents from ComfyUI's models included |
 | aimdo's `control.init` arguments in `main.py` | `pre_torch_init` | comfy-aimdo's allocator hooks before torch |
 | the `ModelPatcher` constructor (`fast_disk`, as sd.py:2408 passes it) | `adapter.build_dynamic_patcher` | the storage policy of the streamed files |
 | `PromptModelTracker` | `prepare` / `reclaim` | a generation is ComfyUI's prompt |
 | `load_safetensors` storage tags `_comfy_tensor_file_slice` / `_comfy_tensor_mmap_refs` | `adapter._own_file_slice` | file slices read straight to the device |
-
-Not mirrored: `ModelPatcher.writable_models` around sampling (`comfy/samplers.py`:1237, since
-v0.45). It hands what a model's `get_writable_model` returns a VBAR-backed copy, and only
-ComfyUI's Qwen-Image 2.1 returns one, its prefix K/V cache. turbo's comfy-qwen-image-2-1 keeps
-that cache in its engine (turboCLI), as ComfyUI did up to v0.41.
 
 ## The offloader's own glue: `offloader/comfy/__init__.py`
 
@@ -139,7 +227,7 @@ silently disabling fp8 and the kitchen RoPE.
 2. Update the commits in this file, in `offloader/comfy/__init__.py` and in `README.md`, and the
    comfy-aimdo / comfy-kitchen versions in turboCLI `bash/turbo/build.sh`, along with the torch /
    torchvision / torchaudio the reference ComfyUI install runs.
-3. Re-apply the 3 comment-outs of category 2 (grep the marker in the OLD tree first to relocate
+3. Re-apply the 2 comment-outs of category 2 (grep the marker in the OLD tree first to relocate
    them if line numbers moved). If new upstream imports pull an off-path top-level module (like
    `node_helpers`), add a documented one-line comment-out there rather than vendoring the tail.
 4. Smoke test: it must print `import OK` and `aimdo_enabled= False`, both as is and with the

@@ -32,9 +32,7 @@ import logging
 import itertools
 from torch.nn.functional import interpolate
 from tqdm.auto import trange
-# [turbo-offloader] disabled for turboCLI: einops only feeds the off-path attention-reshape helper
-# (~L1424), not the offloader; dropped to avoid the dependency.
-# from einops import rearrange
+from einops import rearrange
 from comfy.cli_args import args
 import json
 import time

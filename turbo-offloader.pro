@@ -15,7 +15,13 @@ OTHER_FILES += README.md  \
 
 # Backend seam + the thin diffusers <-> ComfyUI bridge (the only real logic).
 OTHER_FILES += offloader/__init__.py \
-               offloader/adapter.py  \
+               offloader/adapter.py \
+               offloader/qwen_image.py \
+               offloader/qwen_image21.py \
+               offloader/flux2.py \
+               offloader/flux3.py \
+               offloader/krea2.py \
+               offloader/lumina2.py \
 
 # Vendored ComfyUI offloading snapshot (byte-for-byte; see resync.md).
 OTHER_FILES += offloader/comfy/__init__.py          \
@@ -38,6 +44,51 @@ OTHER_FILES += offloader/comfy/__init__.py          \
                offloader/comfy/internal_logging.py  \
                offloader/comfy/rmsnorm.py           \
                offloader/comfy/storage.py           \
+
+# Vendored ComfyUI text encoders, run as ComfyUI's own.
+OTHER_FILES += offloader/comfy/clip_model.py                                        \
+               offloader/comfy/sd1_clip.py                                          \
+               offloader/comfy/sdxl_clip.py                                         \
+               offloader/comfy/text_encoders/bpe_tokenizer.py                       \
+               offloader/comfy/text_encoders/flux.py                                \
+               offloader/comfy/text_encoders/krea2.py                               \
+               offloader/comfy/text_encoders/llama.py                               \
+               offloader/comfy/text_encoders/qwen25_tokenizer/merges.txt            \
+               offloader/comfy/text_encoders/qwen25_tokenizer/tokenizer_config.json \
+               offloader/comfy/text_encoders/qwen25_tokenizer/vocab.json            \
+               offloader/comfy/text_encoders/qwen35.py                              \
+               offloader/comfy/text_encoders/qwen3vl.py                             \
+               offloader/comfy/text_encoders/qwen_image.py                          \
+               offloader/comfy/text_encoders/qwen_image21.py                        \
+               offloader/comfy/text_encoders/qwen_vl.py                             \
+               offloader/comfy/text_encoders/sd3_clip.py                            \
+               offloader/comfy/text_encoders/t5.py                                  \
+               offloader/comfy/text_encoders/z_image.py                             \
+
+# Vendored ComfyUI model code: the VAEs and transformers run as ComfyUI's own.
+OTHER_FILES += offloader/comfy/ldm/chroma_radiance/layers.py            \
+               offloader/comfy/ldm/common_dit.py                        \
+               offloader/comfy/ldm/flux/layers.py                       \
+               offloader/comfy/ldm/flux/math.py                         \
+               offloader/comfy/ldm/flux/model.py                        \
+               offloader/comfy/ldm/flux3/model.py                       \
+               offloader/comfy/ldm/krea2/model.py                       \
+               offloader/comfy/ldm/lightricks/model.py                  \
+               offloader/comfy/ldm/lightricks/symmetric_patchifier.py   \
+               offloader/comfy/ldm/lumina/model.py                      \
+               offloader/comfy/ldm/modules/attention.py                 \
+               offloader/comfy/ldm/modules/diffusionmodules/__init__.py \
+               offloader/comfy/ldm/modules/diffusionmodules/mmdit.py    \
+               offloader/comfy/ldm/modules/diffusionmodules/model.py    \
+               offloader/comfy/ldm/modules/diffusionmodules/util.py     \
+               offloader/comfy/ldm/modules/sub_quadratic_attention.py   \
+               offloader/comfy/ldm/qwen_image/model.py                  \
+               offloader/comfy/ldm/qwen_image21/model.py                \
+               offloader/comfy/ldm/util.py                              \
+               offloader/comfy/ldm/wan/model.py                         \
+               offloader/comfy/ldm/wan/model_animate2.py                \
+               offloader/comfy/ldm/wan/vae.py                           \
+               offloader/comfy/ldm/wan/vae2_2.py                        \
 
 # Vendored comfy sub-packages.
 OTHER_FILES += offloader/comfy/comfy_types/README.md      \

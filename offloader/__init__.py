@@ -310,20 +310,22 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
         # comfy mode the pipeline is already fp32, and on GPU we keep the pipeline dtype.
         if cpu_stream:
             p.vae.to(device=load_device, dtype=torch.float32)
-            # diffusers' flux2 pipeline hands the VAE bf16 latents; ComfyUI upcasts the latent to
-            # the VAE's own dtype before decode (VAE.decode: samples.to(self.vae_dtype)). Mirror
-            # that so the fp32 VAE never sees bf16 input (else conv raises a dtype mismatch).
+        else:
+            p.vae.to(load_device)
+
+        # ComfyUI hands a VAE its input in the VAE's own dtype (VAE.decode / encode:
+        # samples.to(self.vae_dtype)), whatever the pipeline samples in: float32 latents from
+        # ComfyUI's models, bf16 ones from a diffusers transformer. A ComfyVAE does it itself.
+        if not isinstance(p.vae, adapter.ComfyVAE):
             _vae = p.vae
 
             def _cast_in(fn):
                 def wrapped(x, *a, **k):
-                    return fn(x.to(torch.float32) if hasattr(x, "to") else x, *a, **k)
+                    return fn(x.to(_vae.dtype) if hasattr(x, "to") else x, *a, **k)
                 return wrapped
 
             _vae.decode = _cast_in(_vae.decode)
             _vae.encode = _cast_in(_vae.encode)
-        else:
-            p.vae.to(load_device)
 
     p._offloader_patchers = patchers
     p._offloader_device = load_device
@@ -382,7 +384,9 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
 
     # ComfyUI's sampler->VAE node boundary (DiT VBAR residency becomes evictable before the VAE
     # needs VRAM) + its OOM fallback: regular decode/encode, retry tiled (comfy/sd.py:1403).
-    adapter.install_tiled_vae_fallback(p, node_boundary=node_teardown)
+    # KSampler ends before VAEDecode; a reference's VAEEncode runs before sampling starts.
+    adapter.install_tiled_vae_fallback(
+        p, node_boundary=lambda kind: _end_sampling(p) if kind == "decoding" else node_teardown())
 
     # The TE->transformer node boundary ComfyUI has and a diffusers pipeline doesn't: run comfy's
     # per-node teardown once the encoder is done, before the denoise loop, exactly as
@@ -419,47 +423,37 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
     return p
 
 
-def wire_streamed(model, load_device, dtype, manual_cast, build, prefetch=False, lora_files=None,
-                  lora_key_map=None):
-    """Shared post-load wiring for a streamed big model: keep stragglers resident, ComfyUI
-    attention + fused rope (both no-op unless the module matches), optional VBAR prefetch +
-    manual_cast + LoRA, then wrap in the (dynamic) patcher. Model-agnostic -- keyed off module
-    structure, names nothing. Returns the patcher. lora_key_map: engine-supplied
-    {lora_key -> model key} entries (comfy's model_lora_keys_unet vocabulary, see
-    adapter.add_lora) for published namings that differ from the model's own."""
-    from . import adapter
+# ComfyUI's models with an adapter here, each in the module named after it (its model_detection
+# image_model): offloader/qwen_image.py, qwen_image21.py, flux2.py, flux3.py, krea2.py,
+# lumina2.py.
+_COMFY_MODELS = ("qwen_image", "qwen_image21", "flux2", "flux3", "krea2", "lumina2")
 
-    adapter.keep_uncastable_resident(model, load_device, manual_cast)
-    if prefetch:
-        adapter.install_prefetch(model)
-    adapter.use_comfy_attention(model)
-    adapter.use_kitchen_rope(model)
-    if manual_cast is not None:
-        adapter.install_manual_cast(model, manual_cast, dtype)
 
-    patcher = build(model)
+def _comfy_model(name):
+    """The adapter running ComfyUI's model `name` behind the calls a diffusers pipeline makes."""
+    import importlib
 
-    if lora_files:
-        n = adapter.add_lora(patcher, lora_files, key_map=lora_key_map)
-        print("offloader: applied %d LoRA patches" % n, flush=True)
+    if name not in _COMFY_MODELS:
+        raise ValueError("offloader: no adapter for ComfyUI's model %r" % name)
 
-    return patcher
+    return importlib.import_module("." + name, __name__)
 
 
 def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device="cuda:0",
                     lora_files=None):
-    """Model-agnostic assembly of a ComfyUI-reuse pipeline on the disk-stream offloader. The engine
-    (engine/<id>.py) supplies every model-specific piece as data:
-        transformer  = {"meta": fn(dtype)->module, "file": path, "convert": ..., "quant": bool,
-                        "lora_keys": fn()->dict}  # optional; comfy model_lora_keys_unet entries
-        text_encoder = {"meta": fn(dtype)->module, "file": path, "convert": ..., "quant": bool}
+    """A pipeline whose transformer and text encoder are ComfyUI's own models, each run by its
+    adapter in offloader/ (_COMFY_MODELS) behind the calls the pipeline makes. The engine
+    (engine/<id>.py) names them as data:
+        transformer  = {"model": ComfyUI model name, "file": path,
+                        "config": what the pipeline reads off its transformer's config,
+                        "convert": ...,  # optional; a file of another layout into ComfyUI's
+                        "lora_names": fn(ComfyUI's LoRA key map)->dict}  # optional aliases
+        text_encoder = {"model": ComfyUI model name, "file": path}  # its TextEncoder
         components   = {<pipeline __init__ arg>: prebuilt module, ...}  # vae/tokenizer/scheduler
-    A plain bf16 "file" may also be a list, a model's shards (a diffusers repo's folder).
-    The offloader streams the two big models from their ComfyUI single files (stream_single_file
-    for a plain bf16 file, or the fp8 quant path load_quant_single_file when ["quant"]), wires them
-    (wire_streamed), assembles pipeline_cls(transformer=, text_encoder=, **components), and runs
-    the shared _finalize_pipe tail. No model classes or names appear here -- see the comfy_* engine
-    modules for the specs."""
+    A "file" may also be a list, a model's shards (a diffusers repo's folder). The transformer is
+    built with ComfyUI's ops and loads as sd.py loads it, so it prefetches, attends and ropes as
+    ComfyUI's does; the text encoder loads and sits where its CLIPLoader puts it. Then
+    pipeline_cls(transformer=, text_encoder=, **components) and the shared _finalize_pipe tail."""
     import os
     import torch  # noqa: F401
     from . import adapter
@@ -471,89 +465,30 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
         cpu = torch.device("cpu")
         return 2 * sum(os.path.getsize(f) for f in big) <= mm.get_total_memory(cpu) * 0.85
 
-    load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build = _prepare_offload(
-        device, dtype, _fits_full_load)
+    load_device, dtype, cpu_stream, manual_cast, _operations, _use_vbar, build =         _prepare_offload(device, dtype, _fits_full_load)
 
-    stream = use_vbar or cpu_stream
+    tf, unexpected = _comfy_model(transformer["model"]).load(
+        transformer["file"], transformer["config"], load_device, dtype,
+        convert=transformer.get("convert"))
+    if unexpected:
+        print("offloader: %d transformer keys unexpected" % len(unexpected), flush=True)
+    tf_patcher = build(tf)
+    if lora_files:
+        # ComfyUI's keys for the model, plus the engine's other names for them (diffusers').
+        key_map = tf.lora_keys()
+        key_map.update(transformer.get("lora_names", lambda keys: {})(key_map))
+        n = adapter.add_lora(tf_patcher, lora_files, key_map=key_map)
+        print("offloader: applied %d LoRA patches" % n, flush=True)
 
-    # MPS direct load, as load_pipe: ComfyUI builds the diffusion model on MPS under vram_state
-    # SHARED (unet_inital_load_device), so the transformer is copied onto the device at load and
-    # stays resident -- left mmap-backed on CPU, load_models_gpu re-pages it from disk per forward.
-    direct_load = mm.is_device_mps(load_device) and manual_cast is None
-
-    # Transformer: meta-load + stream from the single file (mmap; the engine's `convert` applies
-    # any single-file key remap). A scaled-fp8 file goes through the comfy quant path (like the TE,
-    # which owns its compute dtype -> manual_cast=None); a plain bf16 file streams via cast ops.
-    if transformer.get("quant"):
-        tf, unexpected = adapter.load_quant_single_file(
-            lambda: transformer["meta"](dtype), transformer["file"], load_device, dtype,
-            convert=transformer.get("convert"))
-        if unexpected:
-            print("offloader: %d transformer quant keys unexpected" % len(unexpected), flush=True)
-        tf_patcher = wire_streamed(tf, load_device, dtype, None, build,
-                                   prefetch=(stream and use_vbar), lora_files=lora_files,
-                                   lora_key_map=transformer.get("lora_keys", dict)())
-    else:
-        tf, missing = adapter.stream_single_file(
-            lambda: transformer["meta"](dtype), transformer["file"], operations,
-            convert=transformer.get("convert"), device=load_device if direct_load else None)
-        if missing:
-            print("offloader: %d transformer weights had no module (skipped)" % len(missing),
-                  flush=True)
-        tf_patcher = wire_streamed(tf, load_device, dtype, manual_cast, build,
-                                   prefetch=(stream and use_vbar), lora_files=lora_files,
-                                   lora_key_map=transformer.get("lora_keys", dict)())
-
-    # Text encoder: the fp8 quant path owns its own compute dtype (no manual_cast); a plain
-    # streamed encoder goes on comfy's text_encoder_device (CPU under vram_state SHARED, e.g. MPS)
-    # and is wired like the transformer, so only the conditioning crosses to the compute device.
-    if text_encoder.get("quant"):
-        te, unexpected = adapter.load_quant_single_file(
-            lambda: text_encoder["meta"](dtype), text_encoder["file"], load_device, dtype,
-            convert=text_encoder.get("convert"))
-        if unexpected:
-            print("offloader: %d text-encoder quant keys unexpected" % len(unexpected), flush=True)
-        te_dev = load_device
-        te_patcher = wire_streamed(te, load_device, dtype, None, build)
-    else:
-        te, te_missing = adapter.stream_single_file(
-            lambda: text_encoder["meta"](dtype), text_encoder["file"], operations,
-            convert=text_encoder.get("convert"))
-        if te_missing:
-            print("offloader: %d text-encoder weights had no matching param (skipped)"
-                  % len(te_missing), flush=True)
-        te_dev = mm.text_encoder_device()
-        if te_dev == load_device:
-            te_patcher = wire_streamed(te, load_device, dtype, manual_cast, build)
-        else:
-            adapter.keep_uncastable_resident(te, te_dev, manual_cast)
-            adapter.use_comfy_attention(te)
-            te_patcher = adapter.build_patcher(te, load_device=te_dev, offload_device=te_dev)
+    te = _comfy_model(text_encoder["model"]).TextEncoder(text_encoder["file"])
 
     p = pipeline_cls(transformer=tf, text_encoder=te, **components)
 
-    p._offloader_te_device = te_dev
-    p._offloader_encoder = te_patcher
+    p._offloader_te_device = te.patcher.load_device
+    p._offloader_encoder = te.patcher
 
-    return _finalize_pipe(p, [tf_patcher, te_patcher], load_device, cpu_stream,
+    return _finalize_pipe(p, [tf_patcher, te.patcher], load_device, cpu_stream,
                           manual_cast or dtype)
-
-
-def comfy_api():
-    """ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI
-    model does: comfy_kitchen as ComfyUI configures it (`ck`, None without its kernels) and the
-    vendored comfy.ops / comfy.model_management (`ops`, `mm`), called by their ComfyUI names
-    (ops.linear_input_act, mm.pin_memory, mm.cast_to, ...). Names no model."""
-    from types import SimpleNamespace
-
-    from . import adapter  # noqa: F401  (brings up the vendored comfy package)
-    import comfy.model_management as mm
-    import comfy.ops as ops
-    import comfy.quant_ops as qo
-
-    return SimpleNamespace(ck=qo.ck if getattr(qo, "_CK_AVAILABLE", False) else None, ops=ops,
-                           mm=mm)
-
 
 
 def comfy_vae(path, config):
@@ -634,6 +569,18 @@ def node_teardown():
         print(traceback.format_exc(), flush=True)
 
 
+def _end_sampling(pipe):
+    """KSampler's end: the run's end as ComfyUI's cleanup() marks it (model_patcher.py:1337-1338),
+    then the node's teardown. A model declaring current_patcher drops it, and with it what it
+    keeps for one run (Qwen-Image 2.1's prefix cache), before the VAE needs the memory. The rest
+    of cleanup() stays out, see prepare."""
+    for patcher in pipe._offloader_patchers:
+        if hasattr(patcher.model, "current_patcher"):
+            patcher.model.current_patcher = None
+
+    node_teardown()
+
+
 def reclaim(pipe):
     """Per-generation housekeeping: run ComfyUI's per-node offloader teardown (node_teardown --
     the same one we run at the encode boundary), then free non-resident models + return the
@@ -643,14 +590,8 @@ def reclaim(pipe):
 
     import comfy.model_management as mm
 
-    # The run's end, as ComfyUI's cleanup() marks it (model_patcher.py:1337-1338): a model
-    # declaring current_patcher drops it, and with it what it keeps for one run (Qwen-Image 2.1's
-    # prefix cache). The rest of cleanup() stays out, see prepare.
-    for patcher in pipe._offloader_patchers:
-        if hasattr(patcher.model, "current_patcher"):
-            patcher.model.current_patcher = None
-
-    node_teardown()
+    # A run the VAE never ended (an error, a latent output) ends here.
+    _end_sampling(pipe)
 
     # After a hard CUDA OOM even mem_get_info raises; reclaim runs on the error path too, so a
     # failure here must not bury the real exception under a cleanup cascade.

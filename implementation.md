@@ -38,11 +38,10 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `available()` | True once the vendored offloader imports (any device) |
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
-| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | same, but the big models stream from ComfyUI's split single files (ComfyUI-reuse engines) instead of a diffusers component dir. **Model-agnostic**: the engine passes each big model as a data spec (`{meta, file, convert, quant}`) plus prebuilt small `components` (vae/tokenizer/scheduler); no model classes or names appear here. `quant` routes a quantized model (scaled fp8, int8 ConvRot) through the comfy quant path (below). A plain `file` may also be a list, a model's shards: `flux3-6b` streams the FLUX.3 diffusers repo through it. |
+| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config, convert}` for the transformer, `{model, file}` for the text encoder) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
 | `prepare(pipe)` | `load_models_gpu` of the sampling models (the encoder loads at encode, as each ComfyUI node loads its own model): place them on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory` |
-| `reclaim(pipe)` | end the run as ComfyUI's `cleanup` does (`current_patcher = None`), then `node_teardown` + `free_memory` + `soft_empty_cache` between generations; end the prompt |
+| `reclaim(pipe)` | end a run the VAE decode did not end (`_end_sampling`: `current_patcher = None` as ComfyUI's `cleanup` does, then `node_teardown`), then `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
-| `comfy_api()` | ComfyUI itself, for an engine that runs its diffusers model the way the matching ComfyUI model does: `ck` (comfy_kitchen as ComfyUI configures it, `None` without its kernels), `ops` and `mm` (the vendored comfy.ops / comfy.model_management), called by their ComfyUI names (`ops.linear_input_act`, `mm.pin_memory`, `mm.cast_to`, ...). Names no model; used by `comfy-qwen-image-2-1` (fused forward, host K/V cache with comfy's prefetch). |
 | `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1). |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
@@ -131,34 +130,16 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
   so removing them is a no-op for any model that honours it. Gathers (krea2 pads mid-template),
   re-pads ragged batches, and falls through untouched for a pipeline returning a second embeds
   tensor instead of a mask (z-image's `prompt_embeds, negative_prompt_embeds`).
-- **`keep_declared_fp32`** — honour a model's own `_keep_in_fp32_modules` after a meta-build +
-  `assign=True` load (diffusers only applies it via `from_pretrained`). Without it diffusers'
-  `Krea2RMSNorm` runs `F.rms_norm(x.float(), ..., weight=self.weight + 1.0)` with a **bf16**
-  weight, so torch refuses the fused kernel ("Cannot dispatch to fused implementation") -- measured
-  **2.4× slower per call**. ComfyUI casts its scale to fp32 for the same reason
-  (`ldm/krea2/model.py:34`); this also restores exact numeric parity with it (a bf16 `+ 1.0` rounds
-  a zero-centered scale), taking the cross-framework cosine 0.99997 → **1.0**.
-- **`load_quant_single_file` / `mixed_precision_operations`** — `stream_single_file`'s fp8
-  sibling, for any ComfyUI **scaled-fp8** single file — a text encoder (qwen-image-edit's
-  `qwen_2.5_vl_7b_fp8_scaled`, ~8.7GB) **or a transformer** (comfy-krea2-turbo's
-  `krea2_turbo_fp8_scaled`). `convert_old_quants` reads the fp8 markers from either the classic
-  `scaled_fp8` + `scale_weight` keys or the file's `_quantization_metadata`. Meta-build →
-  `convert_old_quants` →
-  `detect_layer_quantization` → re-class each `Linear` to `comfy.ops.mixed_precision_ops`
-  (injecting the `__init__` attrs `_load_quantized_module` reads) → `comfy_ize` the **non-Linear**
-  leaves (Embedding/Conv/norms) into the same namespace so they stream too → `load_state_dict`
-  (`assign=True`), so each Linear builds a comfy `QuantizedTensor`. The weights stay **fp8** (mmap,
-  never materialized) and dequantize per forward — "what comfy does", not a load-time dequant.
-  **The `comfy_ize` step is load-bearing:** `_quant_ize` only touches Linears, so without it the
-  non-quant leaves — notably the ~1 GB input `Embedding` — would be pinned resident by
-  `keep_uncastable_resident`, stealing the transformer's VBAR VRAM budget (~2.5× slower per step on
-  the 4 GB A1000; see Benchmarks). With it, the fp8 TE offloads to **0 GB resident**, matching the
-  stock bf16 TE.
+- **`load_comfy_single_file` / `mixed_precision_operations`** — a model of ComfyUI's own from its
+  single file (or shards), as sd.py's `load_diffusion_model_state_dict` loads it: mmap the file,
+  `convert_old_quants` (the fp8 markers from either the classic `scaled_fp8` + `scale_weight` keys
+  or the file's `_quantization_metadata`), `detect_layer_quantization`, ComfyUI's ops for it
+  (`comfy.ops.mixed_precision_ops` for a quantized file, cast ops otherwise), build, then
+  `load_state_dict(assign=True)`, so each quantized Linear builds a comfy `QuantizedTensor`. The
+  weights stay fp8 or int8 (mmap, never materialized) and dequantize per forward, as ComfyUI does.
   **Device-agnostic like the rest:** the `disabled` set is computed from comfy's
   `supports_fp8_compute(load_device)` (& nvfp4/mxfp8), so a device without fp8 tensor cores — CPU,
-  MPS, Ampere sm_86 — emulates the dequant to the compute dtype, as ComfyUI does. The fp8 TE loads
-  and its forward runs on CPU too (probed in isolation: 0 unexpected keys, `QuantizedTensor`
-  weights, forward executing), just slowly. Verified end-to-end on CUDA/Ampere (real image); MPS
+  MPS, Ampere sm_86 — emulates the dequant to the compute dtype, as ComfyUI does. MPS
   untested. (Note: the practical blocker to a *full* CPU run is unrelated to the quant path. On CPU
   `load_torch_file` takes its non-aimdo branch — a full-file `safetensors.safe_open` mmap — and
   mmapping the 39GB transformer can exceed Windows' commit limit on a 32GB box, OS error 1455
@@ -234,15 +215,6 @@ Diffusers runs some ops on slower kernels than ComfyUI. Copied from ComfyUI, not
   this because it runs its OWN qwen3, but its attention does the same class of thing (upcasts
   q/k/v, `comfy/ldm/modules/attention.py:259-302`). Model/GPU- agnostic: fires only on a real
   mismatch, no-op on Ampere+ / non-manual-cast.
-- **`use_comfy_attention_config`** — a ComfyUI file can pick a module's attention with a
-  `<module>.comfy_attention.config` key (`ComfyAttention._load_from_state_dict`,
-  `attention.py:89-110`); Qwen-Image-2.1-Turbo's sets `comfy_kitchen_int8` on blocks 1-31,
-  FLUX.3 Image Klein's on its image and single blocks. Both single-file loaders pop those keys
-  and, for the first method of the config (one, or a list since v0.41) that comfy-kitchen runs on
-  the device, swap torch's SDPA during that module's forward for `comfy_kitchen.int8_attention`
-  or `comfy_kitchen.sol_attn` (plain attention under a mask), called as
-  `attention_comfy_kitchen_int8` / `_sol` call them. Turbo against ComfyUI on an L4: 31-39 dB
-  from 29-34 dB with bf16 attention.
 - **`use_kitchen_rope`** — routes the diffusers transformer's RoPE through comfy-kitchen's fused
   `apply_rope1` (the kernel ComfyUI's `comfy/ldm/flux/math.py` uses), via a `(cos,sin)→freqs_cis`
   shim + a module-scoped patch of `diffusers.models.embeddings.apply_rotary_emb`. Lazy:
@@ -279,12 +251,9 @@ change here.
   weights fault straight from the file — page cache when the working set fits RAM, disk when it
   doesn't — and run where they wouldn't fit VRAM. (The transformer is meta-loaded so it never sits
   in RAM; the text encoder is loaded by `from_pretrained` then swapped for slices, a transient ~1×
-  peak.) A `comfy-qwen-image-edit-2511` variant reuses a ComfyUI install via `load_pipe_comfy`:
-  bf16 transformer streamed, **scaled-fp8** TE through the quant path (`load_quant_single_file`),
-  VAE reused (WAN→diffusers convert). It is offloader-only (the fp8 quant path needs comfy ops) and
-  has a `-lightning` sibling that also reuses ComfyUI's Lightning LoRA. `comfy-krea2-turbo` reuses
-  the same seam with **both** big models scaled-fp8 (transformer + Qwen3-VL TE), each spec carrying
-  `{"quant": True}`. All model-specifics live engine-side.
+  peak.) The ComfyUI-reuse engines (`comfy-*`) go through `load_pipe_comfy`
+  instead: their transformer and text encoder are ComfyUI's own models, loaded from a ComfyUI
+  install's files as they are. All model-specifics live engine-side or in each model's adapter.
 
 ## Benchmarks
 
@@ -474,13 +443,7 @@ from ComfyUI.
   bit-identical); gated off `manual_cast`; any mismatch falls back to normal placement.
   `assign=True` breaks tied weights (Qwen3 `lm_head`), so it re-ties after — on MPS the Qwen3
   text encoder now lands on CPU (next note), so only the transformer takes this direct-load path.
-  `load_pipe_comfy` does the same for a plain (non-fp8) single-file transformer:
-  `stream_single_file(device=)` copies each weight from the CPU mmap onto MPS in the model's dtype,
-  as ComfyUI's `load_state_dict` copy into a model built on the device does. Like ComfyUI, the file
-  is never read onto the device itself: on MPS (torch 2.14.1) `safe_open(device="mps")` tensors
-  come out zeroed once GPU work is queued on them (noise renders). Left mmap-backed on CPU
-  instead, `load_models_gpu` re-paged it from disk every forward (comfy-flux2-4b, 8 GB M1: ~562
-  s/step at 1024×768, swap full).
+  ComfyUI's own models (`load_pipe_comfy`) load as sd.py loads them; on MPS they are untested.
 - **Text encoder on CPU on MPS (ComfyUI's `text_encoder_device()`).** ComfyUI runs the text encoder
   on `text_encoder_device()` — CPU under `vram_state` SHARED (Apple Silicon), the compute device
   otherwise — keeping only the transformer resident on the compute device and moving just the
@@ -495,7 +458,7 @@ from ComfyUI.
   timesteps/latents are built to match the transformer.
   Gated on `te_dev != load_device`, so the streamed paths (VBAR / CPU-stream, TE placed their own
   way) and plain CPU (`text_encoder_device()` → CPU == `load_device`) are unchanged; the effect is
-  MPS, plus a low-VRAM CUDA card for `load_pipe_comfy`'s plain TE, which it lands on CPU.
+  MPS. ComfyUI's own text encoders (`load_pipe_comfy`) sit where their CLIPLoader puts them.
   Was materialising both transformer + TE on MPS (~15GB); now the TE is CPU-resident.
   Measured on an 8GB M1 (512×512): MPS residency ~15 → 7GB, peak swap 12.8 → 5.3GB, diffusion
   2:26 → 1:46, total 247 → 188s.
@@ -516,28 +479,15 @@ from ComfyUI.
   `prompt_embeds.shape[1]` against the mask's `.sum()` first; it costs a print, and per-step time
   is linear in the sequence length. The attention mask such padding forces is a symptom, not a
   cause.
-- **Single-file streaming (ComfyUI-reuse engines).** `load_pipe_comfy` streams the same way from a
-  ComfyUI install's split single files rather than a diffusers component dir:
-  `adapter.stream_single_file` meta-loads each big model, mmaps the one safetensors via
-  `load_torch_file` (or each shard of a list into one state dict), applies an optional key
-  `convert` (the diffusers single-file remap for the transformer: renames + a fused-qkv
-  `torch.chunk` that returns views, which `_own_file_slice` re-wraps as file slices of their own,
-  see the v0.39 note; a `model.`-prefix strip for the Qwen3 text encoder, a flat→nested rename for
-  the Qwen2.5-VL one), then rebinds by name (`_assign_sd`).
-  A scaled-fp8 model (transformer or text encoder) takes the quant sibling `load_quant_single_file`
-  (spec `{"quant": True}`) instead. Its `convert` runs on the fp8 state dict too (comfy-krea2-turbo
-  remaps the whole ComfyUI-native DiT to the diffusers `Krea2Transformer2DModel` layout). The VAE +
-  scheduler + tokenizer come straight from the scaffold, or a reused ComfyUI VAE is rebuilt
-  engine-side (qwen's WAN-keyed VAE → `convert_wan_vae_to_diffusers`) and handed in as a prebuilt
-  `component`. It shares both ends with `load_pipe`: the `_prepare_offload` setup (device / CPU
-  comfy-vs-stream mode / dtype / manual_cast / operations / VBAR / builder) and the
-  `_finalize_pipe` tail (VAE placement, execution device, encode bridge/cache) — only the weight
-  source differs, plus the CPU full-load fit is sized from the single files rather than
-  `cpu_fits_full_load`'s component-dir shards. Model-agnostic: every model-specific piece
-  (meta-builders, key remaps, quant flag, the optional `lora_keys` builder for LoRA naming, the
-  reused-VAE rebuild) is data the engine passes in; no names here. Verified on the A1000:
-  z-image-turbo 1024×768 (VBAR, 0 unmatched) and comfy-qwen-image-edit-2511 image-to-image (fp8 TE
-  emulated), both seed-valid.
+- **Single files (ComfyUI-reuse engines).** `load_pipe_comfy` loads a ComfyUI install's split
+  single files rather than a diffusers component dir, each big model through its adapter
+  (`adapter.load_comfy_single_file` for the transformer, `adapter.CLIP` for the text encoder),
+  the file mmapped and its weights file slices (`_own_file_slice` re-wraps what a `convert`
+  renames, see the v0.39 note). The VAE, scheduler and tokenizer come from the scaffold, or the
+  VAE is ComfyUI's own (`comfy_vae`), handed in as a prebuilt `component`. It shares both ends with
+  `load_pipe`: the `_prepare_offload` setup (device / CPU comfy-vs-stream mode / dtype / VBAR /
+  builder) and the `_finalize_pipe` tail (VAE placement, execution device, encode bridge/cache),
+  the CPU full-load fit sized from the single files.
 - **Pinning matches ComfyUI (measured).** comfy-aimdo pins the streamed working set lazily per
   module up to `MAX_PINNED_MEMORY` (40% RAM on Windows), degrading via `_steal_pin` past that; the
   weight VBAR survives `reset_cast_buffers` between gens, so there is **no per-gen re-fault**.
@@ -602,9 +552,10 @@ from ComfyUI.
   `model_patcher.py`, `lora.py`, `cli_args.py`, `weight_adapter/bypass.py`) and one joins the
   copy, `configurable.py`, which `model_patcher.py` now imports. Mirrored: a file's attention
   config may be a list (the first method that runs wins) and may name comfy-kitchen's `sol`
-  attention besides int8 (`use_comfy_attention_config`), and the SDPA wrapper copies a strided
-  K/V that would spill the L2 cache first (AMD gfx1151 only). The other mirrored lines only
-  moved; their citations follow. On the A1000 at 512² (seed 42), flux2-4b CUDA and CPU and
+  attention besides int8 (then `use_comfy_attention_config`, since gone with the files that
+  used it running as ComfyUI's own models), and the SDPA wrapper copies a strided K/V that would
+  spill the L2 cache first (AMD gfx1151 only). The other mirrored lines only moved; their
+  citations follow. On the A1000 at 512² (seed 42), flux2-4b CUDA and CPU and
   comfy-krea2-turbo CUDA give the same md5 on both stacks. One caution from that check:
   comfy-krea2-turbo's image changed when it ran right after another engine in the same sequence,
   on either stack, so compare its runs under the same conditions.
@@ -613,11 +564,51 @@ from ComfyUI.
   `model_management.py`, `model_prefetch.py`, `memory_management.py`, `pinned_memory.py`,
   `utils.py`, `lora.py`, `cli_args.py`, `ldm/modules/diffusionmodules/model.py`) and one joins
   the copy, `anonymous_file.py`, which `utils.py` now imports. Mirrored: `ComfyVAE` hands its
-  model its patcher (`current_patcher`), as sd.py's VAE now does. Not mirrored: the writable
-  models sampling now runs under (resync.md, category 3), which only ComfyUI's Qwen-Image 2.1
-  uses. The other mirrored lines only moved; their citations follow. On the A1000 at 512² (seed
+  model its patcher (`current_patcher`), as sd.py's VAE now does. The writable models sampling
+  now runs under, which only ComfyUI's Qwen-Image 2.1 uses, came with its transformer (below).
+  The other mirrored lines only moved; their citations follow. On the A1000 at 512² (seed
   42, old and new stacks interleaved twice), flux2-4b CUDA and CPU give the same md5 on both.
   comfy-krea2-turbo gave two images on the old stack alone, the new stack's one among them, the
   run-order caution above: under the same conditions both stacks match. Those runs were on v0.45.0;
   v0.45.1 to v0.45.4 change nothing the offloader copies or mirrors (partner nodes only).
+- **ComfyUI's own models: Qwen-Image 2.1, FLUX.3, Krea 2, FLUX.2, Z-Image and Qwen-Image
+  (v0.45.4).** An engine names ComfyUI's model instead of building a diffusers one
+  (`transformer["model"]`), and its adapter runs ComfyUI's transformer (vendored with what it
+  imports, resync.md) behind the call the diffusers pipeline makes, on `adapter.BaseModel`,
+  ComfyUI's BaseModel for what every model shares. The engines lost their hand-copied forwards
+  and key remaps, and `comfy_api()` and `use_comfy_attention_config` went with them. For
+  Qwen-Image 2.1 (`qwen_image21.py`) the packed tokens become ComfyUI's latents, the reference's
+  vision tokens leave the text as `image_slots`, and the prefix K/V cache, its v0.45 writable slots
+  and the per-block prefetch are ComfyUI's own; the run ends before the VAE decodes, as KSampler
+  ends before VAEDecode, so the cache is gone by then. For FLUX.3 (`flux3.py`) the grids come off
+  the pipeline's ids and a flow map's step target goes in as ComfyUI's `sample_sigmas`. Krea 2's file loads as
+  it is (430/430), and its edits run the comfyui-krea2edit node pack's forward, pixel fit and
+  grounded encode. FLUX.2 (`flux2.py`) is ComfyUI's Flux with model_base.Flux2's conditions (the
+  text left-padded to 512, references by index); Z-Image (`lumina2.py`) is ComfyUI's NextDiT, the
+  diffusers call's 1 - sigma and negated output mapped onto ComfyUI's. Qwen-Image (`qwen_image.py`)
+  runs Qwen-Image-Edit 2511 as TextEncodeQwenImageEditPlus does, on the stock text-to-image
+  pipeline: its references go to the transformer through `edit`; it has not run yet (its files
+  are not on the test machine). Every text encoder is ComfyUI's own too (`text_encoder["model"]`,
+  `adapter.CLIP` mirroring sd.py's): the conditioning is ComfyUI's exactly, where transformers'
+  Qwen3-VL and its image processing put a grounded prompt 25-125% off and dropped the face from an
+  identity edit. A diffusers VAE gets its input in its own dtype, as ComfyUI's VAE casts it, since
+  ComfyUI's models sample in float32. `load_pipe_comfy` takes nothing else any more:
+  `stream_single_file`, `load_quant_single_file`, `wire_streamed` and `keep_declared_fp32` went.
+  **`load_pipe` and its diffusers-side helpers stay** (`load_streamed`, `comfy_ize`,
+  `install_prefetch`, `use_comfy_attention`, `use_kitchen_rope`, ...): turboCLI's stock engines
+  run diffusers' own models through them: the published models at full precision for powerful
+  hardware, and no dependency on ComfyUI. ComfyUI's models are for its `comfy-*` engines, fast on
+  a reasonable computer; never move a stock engine onto them to drop that path.
+- **Against ComfyUI, on the A1000 (seed 42, interleaved).** ComfyUI's progress bar moves its
+  start back by one step after the second (`model_trange`, utils.py:1299-1319), so its rate
+  understates the later steps: real sampling time is its first step plus `elapsed_N -
+  elapsed_2 / 2`. Sampling times, turbo against ComfyUI: Qwen-Image-2.1-Turbo at 1024² edits in
+  38-40 s (42.5-43.5 s; the engine's own forward took 57-60 s) and generates in 29-33 s
+  (28-31.5 s); FLUX.3 Image Klein SD at 1024² in 32-33 s (31-32 s); Krea 2 Turbo at 512² in
+  31-34 s (30-32.5 s, 31.75 against 31.5 on average), an identity edit in 84 s (89.5 s), a
+  general edit in 75 s (75.5 s); FLUX.2 Klein 4B at 1024² in 13 s (21 s), Klein 9B distilled in
+  25-32 s (25.5-30.5 s); Z-Image Turbo at 1024² in 54-58 s (52.5-58 s). Images from ComfyUI's,
+  with ComfyUI's text encoders: Qwen-Image 2.1 43.5 dB and edit 48.6, FLUX.3 44.5, Krea 2 42.1
+  and identity edit 37.4, FLUX.2 4B 48.5 and 9B 48.3, Z-Image 49.7 (on euler, the sampler of
+  diffusers' scheduler, in place of the template's res_multistep).
 - **License.** ComfyUI is GPLv3; the vendored copies live in this already-GPLv3 package.
