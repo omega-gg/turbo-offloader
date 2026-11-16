@@ -421,7 +421,7 @@ def enable_vbar(device):
     except Exception:
         return False
     import comfy.memory_management as memm
-    # As main.py:311-312 when DynamicVRAM engages: what ComfyUI builds itself (its VAE, ...) gets
+    # As main.py:318-319 when DynamicVRAM engages: what ComfyUI builds itself (its VAE, ...) gets
     # the dynamic patcher too.
     model_patcher.CoreModelPatcher = model_patcher.ModelPatcherDynamic
     memm.aimdo_enabled = True
@@ -610,7 +610,7 @@ def _own_file_slice(t):
     """A view a key `convert` cut out of a file-sliced weight (diffusers chunking ComfyUI's fused
     qkv) is not a whole slice, so comfy's cast skips its direct file->device read for it
     (read_tensor_file_slice_into) and pages it through the mmap. Rebuild it the way comfy's
-    load_safetensors builds every tensor (utils.py:150-155): own buffer over the same mmap, own
+    load_safetensors builds every tensor (utils.py:183-188): own buffer over the same mmap, own
     TensorFileSlice. Anything else is returned as-is."""
     import warnings
 
@@ -766,12 +766,12 @@ def load_quant_single_file(build_meta, weight_file, load_device, compute_dtype, 
 
 
 def use_comfy_attention_config(model, sd):
-    """ComfyAttention._load_from_state_dict (comfy/ldm/modules/attention.py:88-107): a ComfyUI
+    """ComfyAttention._load_from_state_dict (comfy/ldm/modules/attention.py:89-110): a ComfyUI
     file's `<module>.comfy_attention.config` key picks the attention that module runs, one config
     or a list tried in order, the first one comfy-kitchen runs on the device winning. ComfyUI
     knows two, comfy_kitchen_int8 and comfy_kitchen_sol: that module's SDPA then runs the kernel
-    as attention_comfy_kitchen_int8 / attention_comfy_kitchen_sol call it (attention.py:634-666,
-    :695-709). Pops those keys."""
+    as attention_comfy_kitchen_int8 / attention_comfy_kitchen_sol call it (attention.py:637-669,
+    :698-712). Pops those keys."""
     import functools
     import json
 
@@ -1139,7 +1139,7 @@ def build_dynamic_patcher(model, load_device=None, offload_device=None, size=0):
     it transparently reroutes to a plain ModelPatcher (VBAR is GPU-only).
 
     fast_disk is ComfyUI's per-model storage policy: it passes
-    `comfy.storage.state_dict_fast_disk(sd)` (sd.py:2288), i.e. model_fast_disk over the files the
+    `comfy.storage.state_dict_fast_disk(sd)` (sd.py:2408), i.e. model_fast_disk over the files the
     weights come from. True (a fast NVMe) streams VBAR weights from the file instead of pinning
     them in host RAM. Our loaders record those files as `_offloader_files`."""
     import comfy.model_patcher as model_patcher
@@ -1172,7 +1172,7 @@ def _vae_memory_used(kind, shape, dtype):
 
 
 # -------------------------------------------------------------------------------------------------
-# ComfyUI's VAE, mirrored from comfy/sd.py (v0.41.2): the model sd.py builds for a file and the way
+# ComfyUI's VAE, mirrored from comfy/sd.py (v0.45.0): the model sd.py builds for a file and the way
 # its VAE class runs it. The model code itself is vendored (comfy/ldm/); what sd.py does around it
 # is copied here, each piece citing its sd.py lines, so a re-sync diffs those lines between the
 # two tags and ports any change (resync.md, category 3).
@@ -1180,11 +1180,11 @@ def _vae_memory_used(kind, shape, dtype):
 def _comfy_vae_model(sd):
     """sd.py's VAE.__init__ for the files an engine opts in with: the model, from the file's keys,
     and the settings sd.py gives it. Another file needs its sd.py branch added here."""
-    if "decoder.middle.0.residual.0.gamma" in sd:  # sd.py:837-878, the Wan VAEs
+    if "decoder.middle.0.residual.0.gamma" in sd:  # sd.py:846-887, the Wan VAEs
         wan22_layout = "decoder.upsamples.0.upsamples.0.residual.2.weight" in sd
         head = sd.get("decoder.head.2.weight", None)
         if wan22_layout and head is not None and head.ndim == 5 and head.shape[2] == 1:
-            # sd.py:840-850, the Qwen Image 2.1 VAE: Wan 2.2 layout, temporal kernel 1, RGBA.
+            # sd.py:849-859, the Qwen Image 2.1 VAE: Wan 2.2 layout, temporal kernel 1, RGBA.
             import comfy.ldm.wan.vae2_2
 
             output_channels = sd["decoder.head.2.weight"].shape[0]
@@ -1204,7 +1204,7 @@ def _comfy_vae_model(sd):
                 memory_used_decode=lambda shape, dtype: (900 * shape[2] * shape[3] * (16 * 16)
                                                          * mm.dtype_size(dtype)))
         if not wan22_layout:
-            # sd.py:863-878, the Wan 2.1 VAE (Qwen-Image, Krea 2).
+            # sd.py:872-887, the Wan 2.1 VAE (Qwen-Image, Krea 2).
             import comfy.ldm.wan.vae
 
             output_channels = sd["encoder.conv1.weight"].shape[1]
@@ -1250,7 +1250,7 @@ class ComfyVAE:
         return self.__dict__[name] if name in self.__dict__ else getattr(self.model, name)
 
     def _build(self):
-        # sd.py:1110-1131, the end of VAE.__init__.
+        # sd.py:1166-1188, the end of VAE.__init__.
         if "model" in self.__dict__:
             return
         # As VAELoader reads it (nodes.py:857): under VBAR the weights stay file slices, not RAM.
@@ -1265,6 +1265,7 @@ class ComfyVAE:
         self.output_device = mm.intermediate_device()
         self.patcher = model_patcher.CoreModelPatcher(model, load_device=self.device,
                                                       offload_device=offload_device)
+        model.current_patcher = self.patcher
         model.load_state_dict(sd, strict=True, assign=self.patcher.is_dynamic())
         if not self.patcher.is_dynamic():
             model.to(self.vae_dtype)
@@ -1279,14 +1280,14 @@ class ComfyVAE:
         return self  # ComfyUI's model management places the model
 
     def decode(self, z, return_dict=True):
-        # sd.py:1264-1314: load through load_models_gpu with the estimate, tile straight away only
+        # sd.py:1360-1410: load through load_models_gpu with the estimate, tile straight away only
         # for a model declaring its estimate reliable, else try whole and tile on an OOM.
         from diffusers.models.autoencoders.vae import DecoderOutput
 
-        import comfy.model_prefetch  # lazily, as resync.md says
+        import comfy.model_prefetch
 
         self._build()
-        framed = self.latent_dim == 2 and z.dim() == 5  # sd.py:1268 drops a 2D model's frame axis
+        framed = self.latent_dim == 2 and z.dim() == 5  # sd.py:1364 drops a 2D model's frame axis
         z = (z[:, :, 0] if framed else z).to(self.device, self.vae_dtype)
         do_tile = False
         with mm.cuda_device_context(self.device):
@@ -1311,7 +1312,7 @@ class ComfyVAE:
         return DecoderOutput(sample=x) if return_dict else (x,)
 
     def encode(self, x, return_dict=True):
-        # sd.py:1417-1466: the same memory steps; it encodes to the mean.
+        # sd.py:1513-1562: the same memory steps; it encodes to the mean.
         from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
         self._build()
@@ -1340,7 +1341,7 @@ class ComfyVAE:
         return AutoencoderKLOutput(latent_dist=dist) if return_dict else (dist,)
 
     def decode_tiled_(self, z, tile_x=64, tile_y=64, overlap=16):
-        # sd.py:1177-1199: three tilings, averaged.
+        # sd.py:1273-1295: three tilings, averaged.
         return sum(comfy.utils.tiled_scale(z, self.model.decode, w, h, overlap,
                                            upscale_amount=self.upscale_ratio,
                                            out_channels=self.output_channels,
@@ -1349,15 +1350,15 @@ class ComfyVAE:
                                 (tile_x, tile_y))) / 3.0
 
     def decode_tiled_3d(self, z):
-        # sd.py:1329-1352: reserve what a whole decode would use, capped at 80% of the device,
+        # sd.py:1425-1448: reserve what a whole decode would use, capped at 80% of the device,
         # shrink the temporal tile until one fits, then grow the spatial tile while it still fits.
-        ratio = self.upscale_ratio  # spacial_compression_decode, sd.py:1530-1534
+        ratio = self.upscale_ratio  # spacial_compression_decode, sd.py:1626-1630
         tile = 256 // (ratio[-1] if isinstance(ratio, tuple) else ratio)
         budget = min(self.memory_used_decode(z.shape, self.vae_dtype),
                      int(mm.get_total_memory(self.device) * 0.8))
         mm.load_models_gpu([self.patcher], memory_required=budget)
 
-        def est(tile_t, tile_xy):  # _tile_bounded_shape, sd.py:1366-1374
+        def est(tile_t, tile_xy):  # _tile_bounded_shape, sd.py:1462-1470
             s = list(z.shape)
             s[2], s[3], s[4] = min(s[2], tile_t), min(s[3], tile_xy), min(s[4], tile_xy)
             return self.memory_used_decode(s, self.vae_dtype)
@@ -1368,14 +1369,14 @@ class ComfyVAE:
         while tile * 2 <= max(z.shape[3], z.shape[4]) and est(tile_t, tile * 2) <= budget:
             tile *= 2
         overlap = tile // 4
-        # decode_tiled_3d, sd.py:1201-1203
+        # decode_tiled_3d, sd.py:1297-1299
         return comfy.utils.tiled_scale_multidim(
             z, self.model.decode, tile=(tile_t, tile, tile), overlap=(1, overlap, overlap),
             upscale_amount=self.upscale_ratio, out_channels=self.output_channels,
             index_formulas=self.upscale_index_formula, output_device=z.device)
 
     def encode_tiled_(self, x, tile_x=512, tile_y=512, overlap=64):
-        # sd.py:1209-1219: three tilings, averaged.
+        # sd.py:1305-1315: three tilings, averaged.
         return sum(comfy.utils.tiled_scale(x, self.model.encode, w, h, overlap,
                                            upscale_amount=1 / self.downscale_ratio,
                                            out_channels=self.latent_channels,
@@ -1384,8 +1385,8 @@ class ComfyVAE:
                                 (tile_x // 2, tile_y * 2))) / 3.0
 
     def encode_tiled_3d(self, x):
-        # sd.py:1457-1464 picks 256-pixel tiles and 64 of overlap; encode_tiled_3d is
-        # sd.py:1241-1243.
+        # sd.py:1553-1560 picks 256-pixel tiles and 64 of overlap; encode_tiled_3d is
+        # sd.py:1337-1339.
         return comfy.utils.tiled_scale_multidim(
             x, self.model.encode, tile=(9999, 256, 256), overlap=(1, 64, 64),
             upscale_amount=self.downscale_ratio, out_channels=self.latent_channels,
@@ -1401,7 +1402,7 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
     __call__, so without this boundary the DiT still pins its VRAM (measured: 2.66GB held, 0 free)
     and a 1600x1200 decode dies on one ~1.4GB fp32 upsample after all 8 steps succeeded.
 
-    Then comfy/sd.py:1273-1275: estimate the call's working memory (`memory_used_decode`) and hand
+    Then comfy/sd.py:1369-1371: estimate the call's working memory (`memory_used_decode`) and hand
     it to load_models_gpu as memory_required BEFORE the first kernel. For an already-resident VAE
     load_models_gpu's guts are free_memory(max(inference_memory, memory_required +
     extra_reserved_memory())) (model_management.py:944,1001): the CONTROLLED eviction of the
@@ -1409,13 +1410,13 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
     demand inside the allocator dies with an uncatchable C++ abort instead of a catchable OOM
     (measured: the abort fires on the VAE's first conv3d).
 
-    Then the fallback itself (comfy/sd.py:1307-1314 decode, :1448-1455 encode): try the regular
+    Then the fallback itself (comfy/sd.py:1403-1410 decode, :1448-1455 encode): try the regular
     call; on OOM, `raise_non_oom` anything else, warn with comfy's own wording, and only set a
     flag -- comfy deliberately retries OUTSIDE the except block because "the exception itself refs
     them all until we get out of this except block", so the tensors can gc first -- then retry
     tiled. Comfy retries with its own tiler; a diffusers VAE ships the equivalent (`enable_tiling`,
     seam-blended; the qwen VAE's 256px tile / 64px overlap equal the tile comfy starts from,
-    sd.py:1330-1331; since v0.39 comfy then resizes a 3D tile to its VRAM budget, sd.py:1341-1352),
+    sd.py:1426-1427; since v0.39 comfy then resizes a 3D tile to its VRAM budget, sd.py:1437-1448),
     and the regular path is restored after, matching comfy's per-call semantics.
     Model-agnostic: keyed only off the vae exposing enable_tiling. A ComfyVAE runs sd.py's own
     memory steps and fallback, so it only gets the node boundary. No-op without a vae, or if
@@ -1490,8 +1491,8 @@ def install_unpadded_encode(pipe):
     """Drop padded text tokens from the conditioning before it ever reaches the transformer.
 
     ComfyUI never pads: its Qwen3-VL tokenizer runs `pad_to_max_length=False`
-    (comfy/text_encoders/qwen3vl.py:129), and its krea2 text encoder drops an all-ones mask
-    outright (comfy/text_encoders/krea2.py:69-70), so every attention call gets mask=None.
+    (comfy/text_encoders/qwen3vl.py:133), and its krea2 text encoder drops an all-ones mask
+    outright (comfy/text_encoders/krea2.py:65-66), so every attention call gets mask=None.
     diffusers' own qwen pipeline already agrees (`padding=True`, then `if prompt_embeds_mask.all():
     prompt_embeds_mask = None` -- pipeline_qwenimage_edit_plus.py:327). Its krea2 pipeline is the
     outlier: it pads every prompt to a fixed 512 tokens (`padding="max_length"`,

@@ -19,6 +19,7 @@ OTHER_FILES += offloader/__init__.py \
 
 # Vendored ComfyUI offloading snapshot (byte-for-byte; see resync.md).
 OTHER_FILES += offloader/comfy/__init__.py          \
+               offloader/comfy/anonymous_file.py    \
                offloader/comfy/cli_args.py          \
                offloader/comfy/options.py           \
                offloader/comfy/model_management.py  \

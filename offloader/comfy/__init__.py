@@ -24,9 +24,9 @@
 #   turboCLI:` comment-outs. Re-sync = re-copy the files then re-apply that short list.
 #
 #   Source snapshots (bump together with the files):
-#       ComfyUI       b53f77a74e21091cbdebfdf7b85fc80326932646  (v0.41.2)
-#       comfy-aimdo   08b37eec31319b7f245afdc009e34a9861565c25  (v0.5.6)
-#       comfy-kitchen be003b7c23c5b01328657955b8bc5d3f073d868e  (v0.2.37, pip-installed)
+#       ComfyUI       989d93d0d968e704c589ce0146bb18c77f6b50cc  (v0.45.0)
+#       comfy-aimdo   68088de9dce9f5e32231fccf230938769c5562da  (v0.6.0)
+#       comfy-kitchen cbc44a5b7cc3b8f910ef76ae5251c94971eb05d1  (v0.2.41, pip-installed)
 #
 #==================================================================================================
 

@@ -67,7 +67,7 @@ def pre_torch_init():
 
     try:
         import comfy_aimdo.control as ctl  # must not import torch at module load
-        # NVML memory pressure: ComfyUI's default (main.py:81, disable-nvml-pressure off).
+        # NVML memory pressure: ComfyUI's default (main.py:83, disable-nvml-pressure off).
         _vbar_ready = bool(ctl.init(nvml_pressure=True))
         if _vbar_ready:
             ctl.set_log_warning()
@@ -381,12 +381,12 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
         p.encode_prompt = _encode_on_te
 
     # ComfyUI's sampler->VAE node boundary (DiT VBAR residency becomes evictable before the VAE
-    # needs VRAM) + its OOM fallback: regular decode/encode, retry tiled (comfy/sd.py:1307).
+    # needs VRAM) + its OOM fallback: regular decode/encode, retry tiled (comfy/sd.py:1403).
     adapter.install_tiled_vae_fallback(p, node_boundary=node_teardown)
 
     # The TE->transformer node boundary ComfyUI has and a diffusers pipeline doesn't: run comfy's
     # per-node teardown once the encoder is done, before the denoise loop, exactly as
-    # comfy/execution.py:551-555 does between CLIPTextEncode and KSampler. Installed BEFORE the
+    # comfy/execution.py:559-563 does between CLIPTextEncode and KSampler. Installed BEFORE the
     # cache so it is the encoder's own boundary -- a cache hit never runs the encoder, so (like a
     # cached comfy node) it needs no teardown. Each node loads its own model: CLIPTextEncode the
     # encoder, then KSampler the sampling models (prepare_sampling). The teardown marks every
@@ -577,7 +577,7 @@ def prepare(pipe):
     A generation is ComfyUI's prompt: mark its models in use by the current prompt
     (PromptModelTracker, as comfy/execution.py does per node output), so pin eviction under host
     RAM pressure takes other models' pins before the running ones'. reclaim() ends it. As a
-    sampling run does (comfy/samplers.py:1259), pre_run hands a model declaring `current_patcher`
+    sampling run does (comfy/samplers.py:1260), pre_run hands a model declaring `current_patcher`
     (as ComfyUI's BaseModel does) its patcher, for get_free_memory. Its cleanup() is left out: from
     reclaim(), its eject of the dynamic model trips aimdo's VBAR warnings."""
     patchers = getattr(pipe, "_offloader_patchers", None)
@@ -604,7 +604,7 @@ def _sampling_patchers(pipe):
 def node_teardown():
     """ComfyUI's per-NODE offloader teardown, verbatim: cleanup_prefetch_queues +
     reset_cast_buffers + vbars_reset_watermark_limits, in that order: what comfy runs in the
-    `finally` after EVERY node execution when the offloader is on (comfy/execution.py:551-555). It
+    `finally` after EVERY node execution when the offloader is on (comfy/execution.py:559-563). It
     resets the block prefetch queues (and aborts a malloc graph), the globally-cached per-stream
     cast buffers and the VBAR watermarks.
 
@@ -643,7 +643,7 @@ def reclaim(pipe):
 
     import comfy.model_management as mm
 
-    # The run's end, as ComfyUI's cleanup() marks it (model_patcher.py:1334-1335): a model
+    # The run's end, as ComfyUI's cleanup() marks it (model_patcher.py:1337-1338): a model
     # declaring current_patcher drops it, and with it what it keeps for one run (Qwen-Image 2.1's
     # prefix cache). The rest of cleanup() stays out, see prepare.
     for patcher in pipe._offloader_patchers:
