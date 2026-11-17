@@ -135,8 +135,13 @@ own `comfy.ops` modules and a `ModelPatcher`. The adapter closes that gap, minim
   `convert_old_quants` (the fp8 markers from either the classic `scaled_fp8` + `scale_weight` keys
   or the file's `_quantization_metadata`), `detect_layer_quantization`, ComfyUI's ops for it
   (`comfy.ops.mixed_precision_ops` for a quantized file, cast ops otherwise), build, then
-  `load_state_dict(assign=True)`, so each quantized Linear builds a comfy `QuantizedTensor`. The
-  weights stay fp8 or int8 (mmap, never materialized) and dequantize per forward, as ComfyUI does.
+  `load_state_dict`, so each quantized Linear builds a comfy `QuantizedTensor`. The weights stay
+  fp8 or int8 (mmap, never materialized) and dequantize per forward, as ComfyUI does. As sd.py
+  does too, the model is built in the storage dtype `_prepare_offload` picks (ComfyUI's
+  `unet_dtype`: fp32 on a CPU unless streamed), computes in its manual_cast dtype where that
+  differs, and takes the file's tensors as they are (`assign`) only under a dynamic patcher
+  (`model_patcher.is_dynamic()`); otherwise they are copied in. Assigning them everywhere once
+  left bf16 weights under fp32 inputs on CPU, an error on the first matmul.
   **Device-agnostic like the rest:** the `disabled` set is computed from comfy's
   `supports_fp8_compute(load_device)` (& nvfp4/mxfp8), so a device without fp8 tensor cores — CPU,
   MPS, Ampere sm_86 — emulates the dequant to the compute dtype, as ComfyUI does. MPS
@@ -356,6 +361,44 @@ Known limit on 8 GB: the VAE decode takes ~15–40 s at 512×512 (vs ~1 s possib
 memory heap alive while any tensor in it lives, and the VAE shares heaps with the resident
 transformer, so its swapped memory is never returned. Left as is: releasing it would mean deviating
 from ComfyUI.
+
+**Machine:** NVIDIA L40S (48 GB, Ada sm_89) on Modal · 64 GB RAM · Debian · torch
+2.14.1 + cu130 · models on a network Volume. Measured on 2026-11-17 with turboCLI's
+`test/modal.sh run --record --repeat 2 --comfy /opt/ComfyUI`: one container per engine, turbo and
+ComfyUI v0.45.4 alternating on the same GPU, each side's fastest of two runs, 1024², seed 42.
+Sampling only (the sampler's first to last step, stamped as printed), turbo against ComfyUI:
+
+| Engine | Mode | turbo | ComfyUI | turbo vs ComfyUI | images |
+|---|---|---|---|---|---|
+| comfy-flux2-4b | text to image | 4.69 s | 5.64 s | −16% | 47.8 dB |
+| comfy-flux2-9b-distilled | text to image | 3.04 s | 3.31 s | −8% | 38.3 dB |
+| comfy-flux3-6b | text to image | 3.75 s | 3.80 s | −1% | 42.0 dB |
+| comfy-krea2-turbo | text to image | 8.50 s | 8.54 s | 0% | 28.0 dB |
+| comfy-krea2-turbo-edit-identity | image to image | 13.48 s | 13.93 s | −3% | 27.7 dB |
+| comfy-krea2-turbo-edit-general | image to image | 15.59 s | 14.40 s | +8% | 34.9 dB |
+| comfy-qwen-image-2-1-turbo | text to image | 3.72 s | 3.76 s | −1% | 43.7 dB |
+| comfy-qwen-image-2-1-turbo | image to image | 3.84 s | 3.93 s | −2% | (sizes differed) |
+| comfy-z-image-turbo | text to image | 5.92 s | 6.26 s | −5% | 47.6 dB |
+
+Turbo-only on the same run (no ComfyUI graph, or a stock engine): comfy-flux2-9b 5.99 s (edit
+6.53), comfy-flux2-4b edit 5.73, comfy-flux2-9b-distilled edit 3.57, comfy-flux3-6b edit 5.18,
+comfy-qwen-image-2-1 7.90 (edit 8.92), flux2-4b 4.52 (edit 4.57), flux2-9b 4.90 (edit 5.60),
+flux3-6b 7.76 (edit 11.94), z-image-turbo 20.05.
+
+Read with care:
+
+- turbo is at parity or faster everywhere but the Krea 2 general edit, +8% (inside the 10%
+  tolerance, one container); the identity edit runs the same forward at −3%. Unconfirmed.
+- The same engine on two L40S hosts at once sampled 2× apart (comfy-flux2-4b: 4.69 / 5.64 s and
+  2.25 / 2.57 s), the ratio holding (−16%, −12%): on Modal, compare turbo with ComfyUI in one
+  container, not a time with another host's.
+- CUDA runs ahead of the step lines on a fast GPU, so the end of sampling can land in the decode
+  that follows; sampling to the saved image would be the sturdier measure.
+- Images sit further from ComfyUI's here than on the A1000 for Krea 2 (27.7 to 34.9 dB, 37.4 to
+  42.1 there) and FLUX.2 9B distilled (38.3, 48.3 there); the others match. Not yet explained.
+- The stock z-image-turbo (diffusers' model on `load_pipe`) samples 3.4× slower than
+  comfy-z-image-turbo on the same weights. Not yet explained.
+- The Qwen-Image-Edit 2511 family is not part of it.
 
 ## The node boundary (`node_teardown`)
 
