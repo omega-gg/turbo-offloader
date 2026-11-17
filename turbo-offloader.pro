@@ -22,11 +22,13 @@ OTHER_FILES += offloader/__init__.py \
                offloader/flux3.py \
                offloader/krea2.py \
                offloader/lumina2.py \
+               offloader/moss_image.py \
 
 # Vendored ComfyUI offloading snapshot (byte-for-byte; see resync.md).
 OTHER_FILES += offloader/comfy/__init__.py          \
                offloader/comfy/anonymous_file.py    \
                offloader/comfy/cli_args.py          \
+               offloader/comfy/diffusers_convert.py \
                offloader/comfy/options.py           \
                offloader/comfy/model_management.py  \
                offloader/comfy/model_patcher.py     \
@@ -53,10 +55,14 @@ OTHER_FILES += offloader/comfy/clip_model.py                                    
                offloader/comfy/text_encoders/flux.py                                \
                offloader/comfy/text_encoders/krea2.py                               \
                offloader/comfy/text_encoders/llama.py                               \
+               offloader/comfy/text_encoders/moss_image.py                          \
                offloader/comfy/text_encoders/qwen25_tokenizer/merges.txt            \
                offloader/comfy/text_encoders/qwen25_tokenizer/tokenizer_config.json \
                offloader/comfy/text_encoders/qwen25_tokenizer/vocab.json            \
                offloader/comfy/text_encoders/qwen35.py                              \
+               offloader/comfy/text_encoders/qwen35_tokenizer/merges.txt            \
+               offloader/comfy/text_encoders/qwen35_tokenizer/tokenizer_config.json \
+               offloader/comfy/text_encoders/qwen35_tokenizer/vocab.json            \
                offloader/comfy/text_encoders/qwen3vl.py                             \
                offloader/comfy/text_encoders/qwen_image.py                          \
                offloader/comfy/text_encoders/qwen_image21.py                        \
@@ -76,12 +82,17 @@ OTHER_FILES += offloader/comfy/ldm/chroma_radiance/layers.py            \
                offloader/comfy/ldm/lightricks/model.py                  \
                offloader/comfy/ldm/lightricks/symmetric_patchifier.py   \
                offloader/comfy/ldm/lumina/model.py                      \
+               offloader/comfy/ldm/models/autoencoder.py                \
                offloader/comfy/ldm/modules/attention.py                 \
+               offloader/comfy/ldm/modules/distributions/__init__.py    \
+               offloader/comfy/ldm/modules/distributions/distributions.py \
+               offloader/comfy/ldm/modules/ema.py                       \
                offloader/comfy/ldm/modules/diffusionmodules/__init__.py \
                offloader/comfy/ldm/modules/diffusionmodules/mmdit.py    \
                offloader/comfy/ldm/modules/diffusionmodules/model.py    \
                offloader/comfy/ldm/modules/diffusionmodules/util.py     \
                offloader/comfy/ldm/modules/sub_quadratic_attention.py   \
+               offloader/comfy/ldm/moss_image/model.py                  \
                offloader/comfy/ldm/qwen_image/model.py                  \
                offloader/comfy/ldm/qwen_image21/model.py                \
                offloader/comfy/ldm/util.py                              \

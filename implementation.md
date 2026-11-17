@@ -18,6 +18,8 @@ by step, no diffusion background required. It is kept up to date with each itera
 offloader/
   __init__.py   backend seam the runner drives (pre_torch_init/available/supports/load_pipe/...)
   adapter.py    the thin middleman -- the only real logic in the package
+  <model>.py    one adapter per ComfyUI model an engine runs as ComfyUI's own (qwen_image,
+                qwen_image21, flux2, flux3, krea2, lumina2, moss_image)
   comfy/        byte-for-byte ComfyUI offloading snapshot (see resync.md)
 ```
 
@@ -38,11 +40,12 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `available()` | True once the vendored offloader imports (any device) |
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
-| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config}` for the transformer, `{model, file}` for the text encoder) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
+| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config}` for the transformer, `{model, file}` for the text encoder) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`, `moss_image.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
 | `prepare(pipe)` | `load_models_gpu` of the sampling models (the encoder loads at encode, as each ComfyUI node loads its own model): place them on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory` |
 | `reclaim(pipe)` | end a run the VAE decode did not end (`_end_sampling`: `current_patcher = None` as ComfyUI's `cleanup` does, then `node_teardown`), then `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
-| `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1). |
+| `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1), `comfy-moss-image` (FLUX.2, its small decoder, in fp16 as ComfyUI picks it). |
+| `comfy_sampler(model, sampler, scheduler)` | opt in to ComfyUI's own KSampler for a template that samples otherwise than diffusers' schedulers: `adapter.FlowSampler`, behind the scheduler calls a pipeline makes (`set_timesteps`, `timesteps`, `sigmas`, `step`), on ComfyUI's model `model`'s flow shift; the pipeline sets its `seed`. The `simple` and `normal` schedulers, `euler` and `er_sde` with its seeded noise, bit-identical to ComfyUI's on CUDA; `resync.md` lists the mirrored lines. Used by `comfy-moss-image`. |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
 
@@ -248,9 +251,7 @@ change here.
 
 - **flux2** (`Flux2KleinPipeline`) — text-to-image and image-input (edit); the pipeline accepts
   `image=`, so the seam is unchanged.
-- **z-image** (`ZImagePipeline`) — text-to-image, Turbo (few-step). A `comfy-z-image-turbo` variant
-  reuses a ComfyUI install's split single files (transformer + Qwen3 TE + VAE) via
-  `load_pipe_single_file` — same `TYPE`/pipeline, no re-download.
+- **z-image** (`ZImagePipeline`) — text-to-image, Turbo (few-step).
 - **qwen-image-edit** (`QwenImageEditPlusPipeline`) — image-edit; on-cast Lightning 4-step LoRA;
   ~55GB of weights (transformer + Qwen2.5-VL TE). Both components are mmap file-sliced, so their
   weights fault straight from the file — page cache when the working set fits RAM, disk when it
@@ -379,11 +380,14 @@ Sampling only (the sampler's first to last step, stamped as printed), turbo agai
 | comfy-qwen-image-2-1-turbo | text to image | 3.72 s | 3.76 s | −1% | 43.7 dB |
 | comfy-qwen-image-2-1-turbo | image to image | 3.84 s | 3.93 s | −2% | (sizes differed) |
 | comfy-z-image-turbo | text to image | 5.92 s | 6.26 s | −5% | 47.6 dB |
+| comfy-moss-image | text to image | 9.17 s | 9.28 s | −1% | 40.4 dB |
+| comfy-moss-image | image to image | 11.17 s | 11.13 s | 0% | 30.8 dB |
 
 Turbo-only on the same run (no ComfyUI graph, or a stock engine): comfy-flux2-9b 5.99 s (edit
 6.53), comfy-flux2-4b edit 5.73, comfy-flux2-9b-distilled edit 3.57, comfy-flux3-6b edit 5.18,
 comfy-qwen-image-2-1 7.90 (edit 8.92), flux2-4b 4.52 (edit 4.57), flux2-9b 4.90 (edit 5.60),
-flux3-6b 7.76 (edit 11.94), z-image-turbo 20.05.
+flux3-6b 7.76 (edit 11.94), z-image-turbo 20.05. MOSS-Image, added after on another L40S:
+moss-image 33.36 (50 steps, CFG 3).
 
 Read with care:
 
@@ -617,8 +621,8 @@ Read with care:
   comfy-krea2-turbo gave two images on the old stack alone, the new stack's one among them, the
   run-order caution above: under the same conditions both stacks match. Those runs were on v0.45.0;
   v0.45.1 to v0.45.4 change nothing the offloader copies or mirrors (partner nodes only).
-- **ComfyUI's own models: Qwen-Image 2.1, FLUX.3, Krea 2, FLUX.2, Z-Image and Qwen-Image
-  (v0.45.4).** An engine names ComfyUI's model instead of building a diffusers one
+- **ComfyUI's own models: Qwen-Image 2.1, FLUX.3, Krea 2, FLUX.2, Z-Image, Qwen-Image and
+  MOSS-Image (v0.45.4).** An engine names ComfyUI's model instead of building a diffusers one
   (`transformer["model"]`), and its adapter runs ComfyUI's transformer (vendored with what it
   imports, resync.md) behind the call the diffusers pipeline makes, on `adapter.BaseModel`,
   ComfyUI's BaseModel for what every model shares. The engines lost their hand-copied forwards
@@ -634,7 +638,13 @@ Read with care:
   diffusers call's 1 - sigma and negated output mapped onto ComfyUI's. Qwen-Image (`qwen_image.py`)
   runs Qwen-Image-Edit 2511 as TextEncodeQwenImageEditPlus does, on the stock text-to-image
   pipeline: its references go to the transformer through `edit`; it has not run yet (its files
-  are not on the test machine). Every text encoder is ComfyUI's own too (`text_encoder["model"]`,
+  are not on the test machine). MOSS-Image (`moss_image.py`) runs behind the official
+  MOSS-Image pipeline's call, its uncond's skipped block as SkipLayerGuidanceDiTSimple replaces
+  it, an edit's reference keys and values computed once as extra_conds does, and samples
+  through ComfyUI's own KSampler (`comfy_sampler`): its template's er_sde draws noise every
+  step, which no diffusers scheduler reproduces. Its VAE is ComfyUI's own too (`comfy_vae`):
+  an edit turned a 1% difference in its reference (diffusers' VAE in bf16 against ComfyUI's
+  in fp16) into another picture. Every text encoder is ComfyUI's own too (`text_encoder["model"]`,
   `adapter.CLIP` mirroring sd.py's): the conditioning is ComfyUI's exactly, where transformers'
   Qwen3-VL and its image processing put a grounded prompt 25-125% off and dropped the face from an
   identity edit. A diffusers VAE gets its input in its own dtype, as ComfyUI's VAE casts it, since

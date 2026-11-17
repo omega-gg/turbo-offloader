@@ -121,7 +121,7 @@ def _direct_load(module, component_dir, device):
 
 
 def _prepare_offload(device, dtype, fits_full_load):
-    """Shared offloader setup for load_pipe / load_pipe_single_file. Resolves the compute device,
+    """Shared offloader setup for load_pipe / load_pipe_comfy. Resolves the compute device,
     then -- exactly as ComfyUI decides -- the CPU comfy/stream mode + storage dtype, the
     manual_cast compute dtype, the comfy op namespace, whether comfy-aimdo VBAR engages, and the
     patcher builder. `fits_full_load` is a thunk giving the caller's 'does the fp32 model fit RAM'
@@ -293,7 +293,7 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
 
 def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
     """Shared tail for the offloader pipes (dir-based load_pipe and single-file
-    load_pipe_single_file). Places the small VAE, records the patchers, pins the execution device,
+    load_pipe_comfy). Places the small VAE, records the patchers, pins the execution device,
     wires the ComfyUI-faithful encode bridge, and installs the prompt-encode cache. The heavy
     models (transformer, text encoder) are already comfy-ized / patched by the caller;
     p._offloader_te_device tells us where the encoder lives."""
@@ -425,8 +425,9 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
 
 # ComfyUI's models with an adapter here, each in the module named after it (its model_detection
 # image_model): offloader/qwen_image.py, qwen_image21.py, flux2.py, flux3.py, krea2.py,
-# lumina2.py.
-_COMFY_MODELS = ("qwen_image", "qwen_image21", "flux2", "flux3", "krea2", "lumina2")
+# lumina2.py, moss_image.py.
+_COMFY_MODELS = ("qwen_image", "qwen_image21", "flux2", "flux3", "krea2", "lumina2",
+                 "moss_image")
 
 
 def _comfy_model(name):
@@ -500,6 +501,15 @@ def comfy_vae(path, config):
     from . import adapter
 
     return adapter.ComfyVAE(path, config)
+
+
+def comfy_sampler(model, sampler, scheduler):
+    """KSampler's `sampler` and `scheduler` on ComfyUI's model `model` (its adapter's flow SHIFT),
+    behind the calls a pipeline makes on its scheduler; the pipeline sets its `seed`. See
+    adapter.FlowSampler."""
+    from . import adapter
+
+    return adapter.FlowSampler(sampler, scheduler, _comfy_model(model).SHIFT)
 
 
 def prepare(pipe):

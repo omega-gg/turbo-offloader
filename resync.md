@@ -41,14 +41,16 @@ Packages (whole dir): `comfy_types/`, `weight_adapter/`.
 
 Model code, for the VAEs an engine runs as ComfyUI's own (`comfy_vae`, category 3):
 `ldm/wan/vae.py` (Wan 2.1: Qwen-Image, Krea 2), `ldm/wan/vae2_2.py` (Wan 2.2 layout: Qwen-Image
-2.1), and what they import, `ldm/modules/diffusionmodules/model.py` (with that package's empty
-`__init__.py`).
+2.1), `ldm/models/autoencoder.py` (the FLUX.2 VAE: MOSS-Image), and what they import,
+`ldm/modules/diffusionmodules/model.py` (with that package's empty `__init__.py`),
+`ldm/modules/distributions/` (whole dir), `ldm/modules/ema.py`; and `diffusers_convert.py`, which
+sd.py runs on a VAE file in diffusers' layout.
 
 Model code, for the transformers an engine runs as ComfyUI's own (category 3):
-`ldm/qwen_image/model.py` (Qwen-Image, Qwen-Image-Edit), `ldm/qwen_image21/model.py`
-(Qwen-Image 2.1), `ldm/flux/model.py` (FLUX.2), `ldm/flux3/model.py` (FLUX.3),
-`ldm/krea2/model.py` (Krea 2), `ldm/lumina/model.py` (Z-Image), and what they import when they
-load: `ldm/flux/layers.py`, `ldm/flux/math.py`, `ldm/lightricks/model.py`,
+`ldm/qwen_image/model.py` (Qwen-Image, Qwen-Image-Edit), `ldm/qwen_image21/model.py` (Qwen-Image
+2.1), `ldm/flux/model.py` (FLUX.2), `ldm/flux3/model.py` (FLUX.3), `ldm/krea2/model.py` (Krea 2),
+`ldm/lumina/model.py` (Z-Image), `ldm/moss_image/model.py` (MOSS-Image), and what they import when
+they load: `ldm/flux/layers.py`, `ldm/flux/math.py`, `ldm/lightricks/model.py`,
 `ldm/lightricks/symmetric_patchifier.py`, `ldm/modules/attention.py`,
 `ldm/modules/sub_quadratic_attention.py`, `ldm/modules/diffusionmodules/util.py`,
 `ldm/modules/diffusionmodules/mmdit.py`, `ldm/chroma_radiance/layers.py`, `ldm/util.py`,
@@ -58,11 +60,12 @@ function are left out: they only run on paths the offloader never takes.
 Model code, for the text encoders an engine runs as ComfyUI's own (category 3):
 `text_encoders/qwen_image.py` (Qwen2.5-VL-7B), `text_encoders/qwen_image21.py` (Qwen3-VL-8B),
 `text_encoders/flux.py` (FLUX.2's Qwen3 4B and 8B, FLUX.3's Qwen3-VL-4B), `text_encoders/krea2.py`
-(Krea 2's Qwen3-VL-4B), `text_encoders/z_image.py` (Qwen3 4B), and what they import when they
-load: `text_encoders/qwen3vl.py`, `text_encoders/qwen35.py`, `text_encoders/qwen_vl.py`,
-`text_encoders/llama.py`, `text_encoders/sd3_clip.py`, `text_encoders/t5.py`,
-`text_encoders/bpe_tokenizer.py`, `sd1_clip.py`, `sdxl_clip.py`, `clip_model.py`, with the
-tokenizer files they read, `text_encoders/qwen25_tokenizer/` (data, byte-for-byte).
+(Krea 2's Qwen3-VL-4B), `text_encoders/z_image.py` (Qwen3 4B), `text_encoders/moss_image.py`
+(MOSS-Image's Qwen3.5 9B), and what they import when they load: `text_encoders/qwen3vl.py`,
+`text_encoders/qwen35.py`, `text_encoders/qwen_vl.py`, `text_encoders/llama.py`,
+`text_encoders/sd3_clip.py`, `text_encoders/t5.py`, `text_encoders/bpe_tokenizer.py`,
+`sd1_clip.py`, `sdxl_clip.py`, `clip_model.py`, with the tokenizer files they read,
+`text_encoders/qwen25_tokenizer/` and `text_encoders/qwen35_tokenizer/` (data, byte-for-byte).
 
 `cli_args.py` + `options.py` are vendored as-is (not stubbed): `options.args_parsing` is `False`, so
 `cli_args` does `parser.parse_args([])` and every flag gets its upstream default. This is more
@@ -92,8 +95,8 @@ needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.p
 
 | upstream | in adapter.py | what |
 |---|---|---|
-| `VAE.__init__` branches, sd.py:846-887 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:872-887), Qwen-Image 2.1 (:849-859) |
-| end of `VAE.__init__`, sd.py:1166-1188; `VAELoader.load_vae`, nodes.py:857 | `ComfyVAE._build` | the file read, device, dtype, the patcher, the weight load |
+| `VAE.__init__` branches, sd.py:846-887, :678-716 on the defaults of :509-519 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:872-887), Qwen-Image 2.1 (:849-859), the FLUX.2 VAE (:678-716, its small decoder too) |
+| sd.py:503-505; end of `VAE.__init__`, sd.py:1166-1188; `VAELoader.load_vae`, nodes.py:857 | `ComfyVAE._build` | the file read (a diffusers layout converted), device, dtype, the patcher, the weight load |
 | `VAE.decode`, sd.py:1360-1410; `VAE.encode`, sd.py:1513-1562 | `ComfyVAE.decode` / `encode` | `load_models_gpu` with the estimate, the out-of-memory fallback; unlike sd.py, `encode` returns the caller's dtype, as the pipeline feeds it to its transformer |
 | `decode_tiled_`, `decode_tiled_3d` (sized at sd.py:1425-1448), `encode_tiled_`, `encode_tiled_3d` | the same names on `ComfyVAE` | the tiled fallbacks |
 | main.py:318-319 | `enable_vbar` | `CoreModelPatcher` becomes `ModelPatcherDynamic` |
@@ -136,6 +139,27 @@ around the model is mirrored there (v0.45.4):
 | model_detection.py:594-604, :616-640 | `lumina2.detect` | Z-Image's settings off its file |
 | `model_base.Lumina2`, model_base.py:1569-1622; `BaseModel._apply_model`, model_base.py:221-263 | `lumina2.Lumina2` | the model ComfyUI samples: the text's length as `num_tokens`, conds of different lengths apart |
 | `model_lora_keys_unet`, lora.py:384-393 | `lumina2.Lumina2.lora_keys` | its diffusers names (`z_image_to_diffusers`) |
+| model_detection.py:1050-1058; `MOSSImage.process_unet_state_dict`, supported_models.py:2082-2084 | `moss_image.detect`, `moss_image._process` | MOSS-Image's settings off its file, `rope.bands` dropped |
+| `model_base.MOSSImage`, model_base.py:2947-2976; `BaseModel._apply_model`, model_base.py:221-263 | `moss_image.MOSSImage` | the model ComfyUI samples: the uncond's skipped blocks as `SkipLayerGuidanceDiTSimple` replaces them (nodes_slg.py:116-151), the references' keys and values computed once |
+| `TextEncodeMOSSImageEdit` (Moss-Image-Edit), nodes_moss_image.py:95-149; `ImageScaleToTotalPixels`, nodes_post_processing.py:249-258 | `moss_image.MOSSImage.edit`, `_scale`, `_encode` | the source at about 1 MP on the 16 grid, encoded by ComfyUI's VAE (`comfy_vae`) |
+| `MOSSImage.extra_conds`' `ref_kv`, model_base.py:2966-2974 | `moss_image.MOSSImage.extra_conds` | the references' keys and values once, before sampling |
+| `model_lora_keys_unet`, lora.py:361-371 | `moss_image.MOSSImage.lora_keys` | bare module paths, a fused qkv by its three projections |
+
+### ComfyUI's sampler, behind a pipeline's scheduler
+
+An engine whose template samples otherwise than diffusers' schedulers do can take ComfyUI's
+KSampler instead (`comfy_sampler`): `adapter.FlowSampler` answers the scheduler calls a pipeline
+makes (`set_timesteps`, `timesteps`, `sigmas`, `step`), for a flow model. `samplers.py` and
+`k_diffusion/` are not vendored (they import most of ComfyUI); what it needs is mirrored (v0.45.4),
+and checked against them bit for bit:
+
+| upstream | in adapter.py | what |
+|---|---|---|
+| `ModelSamplingDiscreteFlow`, model_sampling.py:289-336 | `FlowSampler._table`, `_sigma`, `percent_to_sigma` | the shifted sigma table |
+| `simple_scheduler`, `normal_scheduler`, samplers.py:645-693; the sigmas on the device, samplers.py:1257 | `FlowSampler._schedule`, `set_timesteps` | the schedules |
+| `calculate_denoised` (CONST), model_sampling.py:35-37 | `FlowSampler.step` | the denoised off the model's velocity |
+| `sample_euler`, k_diffusion/sampling.py:190-212 | `FlowSampler.step` | one Euler step |
+| `sample_er_sde`, k_diffusion/sampling.py:1593-1656; `offset_first_sigma_for_snr`, :168-176; `default_noise_sampler`, :78-88 | `FlowSampler._er_sde`, `_noise` | one ER-SDE step, its noise drawn from the KSampler's seed |
 
 ### ComfyUI's text encoders, behind a diffusers pipeline's encode
 
@@ -155,6 +179,7 @@ does. sd.py is not vendored (see above), so what it does for a text encoder is m
 | sd.py:1844-1853, :2046-2062 | `flux2.TextEncoder` | FLUX.2's, Qwen3 4B or 8B by its width |
 | sd.py:2088-2091 | `flux3.TextEncoder` | FLUX.3's Qwen3-VL-4B |
 | sd.py:2046-2052 | `lumina2.TextEncoder` | Z-Image's Qwen3 4B |
+| sd.py:2066-2070 | `moss_image.TextEncoder` | MOSS-Image's Qwen3.5 9B |
 
 A Krea 2 edit runs the forward of the comfyui-krea2edit node pack (v2.0.0, Apache-2.0,
 `__init__.py`), what a ComfyUI user runs for it, on the path its `fit` mode takes. Re-sync it
@@ -244,6 +269,8 @@ silently disabling fp8 and the kitchen RoPE.
 6. Verify on CUDA at 512² (seed 42), keeping runs short: flux2-4b, comfy-krea2-turbo and (CPU)
    flux2-4b give the same md5 before and after, unless upstream changed numerics on purpose;
    then compare against the ComfyUI install at the same tag, same files and template graph. For
-   the VAE, decode one latent with a comfy- engine and with ComfyUI and compare the images.
+   the VAE, decode one latent with a comfy- engine and with ComfyUI and compare the images. For
+   `FlowSampler`, run ComfyUI's `simple` / `normal` schedulers and `sample_euler` /
+   `sample_er_sde` on a stand-in model next to it: on CUDA they must be bit-identical.
    The test laptop throttles: interleave the runs (A, B, A, B) and trust a delta only once a
    second pair reproduces it.

@@ -842,6 +842,136 @@ class BaseModel(torch.nn.Module):
         return key_map
 
 
+class FlowSampler:
+    """ComfyUI's KSampler for a flow model (ModelSamplingDiscreteFlow, CONST) behind the calls a
+    pipeline makes on its scheduler: set_timesteps, then `timesteps` (what the model takes),
+    `sigmas`, and a `step` per model output (the velocity), with the KSampler's `seed`. It mirrors,
+    citing v0.45.4:
+
+      - ModelSamplingDiscreteFlow (model_sampling.py:289-336): the sigma table, percent_to_sigma;
+      - the simple and normal schedulers (samplers.py:645-693), the sigmas on the model's device
+        (samplers.py:1257);
+      - calculate_denoised for CONST (model_sampling.py:35-37);
+      - sample_euler (k_diffusion/sampling.py:190-212) and sample_er_sde (:1593-1656), its first
+        sigma offset (:168-176) and its noise (default_noise_sampler, :78-88), one step a call.
+
+    The initial noise is the pipeline's, as ComfyUI's (sample.py:22-38): the seed's CPU float32
+    draw, scaled by a first sigma of 1."""
+
+    def __init__(self, sampler, scheduler, shift, multiplier=1.0):
+        if sampler not in ("euler", "er_sde") or scheduler not in ("simple", "normal"):
+            raise ValueError("FlowSampler: no %s / %s" % (sampler, scheduler))
+
+        self.sampler = sampler
+        self.scheduler = scheduler
+        self.shift = shift
+        self.multiplier = multiplier
+        self.seed = None
+
+        self._table = self._sigma((torch.arange(1, 1001, 1) / 1000) * multiplier)
+
+    def _shifted(self, t):
+        if self.shift == 1.0:
+            return t
+        return self.shift * t / (1 + (self.shift - 1) * t)
+
+    def _sigma(self, timestep):
+        return self._shifted(timestep / self.multiplier)
+
+    def percent_to_sigma(self, percent):
+        if percent <= 0.0:
+            return 1.0
+        if percent >= 1.0:
+            return 0.0
+        return self._shifted(1.0 - percent)
+
+    def _schedule(self, steps):
+        s = self._table
+        if self.scheduler == "simple":
+            ss = len(s) / steps
+            return torch.FloatTensor([float(s[-(1 + int(x * ss))]) for x in range(steps)] + [0.0])
+
+        start, end = s[-1] * self.multiplier, s[0] * self.multiplier
+        append_zero = True
+        if math.isclose(float(self._sigma(end)), 0, abs_tol=0.00001):
+            steps += 1
+            append_zero = False
+        sigs = [float(self._sigma(t)) for t in torch.linspace(start, end, steps)]
+        return torch.FloatTensor(sigs + ([0.0] if append_zero else []))
+
+    def set_timesteps(self, num_inference_steps, device=None):
+        sigmas = self._schedule(num_inference_steps).to(device)
+
+        if self.sampler == "er_sde":
+            if sigmas[0] >= 1:
+                sigmas = sigmas.clone()
+                sigmas[0] = self.percent_to_sigma(1e-4)
+            self._lambdas = sigmas.logit().neg().neg().exp()  # er_lambda_t = sigma_t / alpha_t
+
+        self.sigmas = sigmas
+        self.timesteps = sigmas[:-1] * self.multiplier
+        self._i = 0
+        self._old = self._old_d = self._generator = None
+
+    def _noise(self, x):
+        if self._generator is None and self.seed is not None:
+            self._generator = torch.Generator(device=x.device)
+            self._generator.manual_seed(self.seed + (1 if x.device.type == "cpu" else 0))
+        return torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device=x.device,
+                           generator=self._generator)
+
+    def step(self, model_output, timestep, sample, return_dict=False):
+        i, s, x = self._i, self.sigmas, sample
+        denoised = x - model_output * s[i]
+
+        if self.sampler == "euler":
+            x = x + (x - denoised) / s[i] * (s[i + 1] - s[i])
+        else:
+            x = self._er_sde(i, x, denoised)
+
+        self._i += 1
+        return (x,)
+
+    def _er_sde(self, i, x, denoised):
+        s, lam = self.sigmas, self._lambdas
+
+        def scaler(v):
+            return v * ((v ** 0.3).exp() + 10.0)
+
+        if s[i + 1] == 0:
+            x = denoised
+        else:
+            lam_s, lam_t = lam[i], lam[i + 1]
+            alpha_t = s[i + 1] / lam_t
+            r = scaler(lam_t) / scaler(lam_s)
+
+            # Stage 1 Euler
+            x = alpha_t / (s[i] / lam_s) * r * x + alpha_t * (1 - r) * denoised
+
+            if i >= 1:
+                dt = lam_t - lam_s
+                step = -dt / 200.0
+                pos = lam_t + torch.arange(0, 200.0, dtype=torch.float32, device=x.device) * step
+                scaled = scaler(pos)
+
+                # Stage 2
+                d = (denoised - self._old) / (lam_s - lam[i - 1])
+                x = x + alpha_t * (dt + torch.sum(1 / scaled) * step * scaler(lam_t)) * d
+
+                if i >= 2:
+                    # Stage 3
+                    s_u = torch.sum((pos - lam_s) / scaled) * step
+                    u = (d - self._old_d) / ((lam_s - lam[i - 2]) / 2)
+                    x = x + alpha_t * ((dt ** 2) / 2 + s_u * scaler(lam_t)) * u
+                self._old_d = d
+
+            spread = (lam_t ** 2 - lam_s ** 2 * r ** 2).sqrt().nan_to_num(nan=0.0)
+            x = x + alpha_t * self._noise(x) * spread
+
+        self._old = denoised
+        return x
+
+
 _sdpa_patched = False
 
 
@@ -1230,6 +1360,51 @@ def _comfy_vae_model(sd):
                 memory_used_decode=lambda shape, dtype: ((2200 if shape[2] <= 4 else 7000)
                                                          * shape[3] * shape[4] * (8 * 8)
                                                          * mm.dtype_size(dtype)))
+    if "bn.running_mean" in sd and "decoder.conv_in.weight" in sd:
+        # sd.py:678-716, the FLUX.2 VAE (its small decoder too) on sd.py's AutoencoderKL defaults
+        # (:509-519): the latent's 2x2 patches batch-normalized, 128 channels at 1/16.
+        from comfy.ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
+        from comfy.ldm.modules.diffusionmodules.model import fused_norm_served
+        from comfy.utils import state_dict_prefix_replace
+
+        ratio = 2.73 if mm.is_amd() else 1.0
+        ddconfig = {"double_z": True, "z_channels": sd["decoder.conv_in.weight"].shape[1],
+                    "resolution": 256, "in_channels": 3, "out_ch": 3, "ch": 128,
+                    "ch_mult": [1, 2, 4, 4], "num_res_blocks": 2, "attn_resolutions": [],
+                    "dropout": 0.0, "batch_norm_latent": True, "fused_norm": True}
+        if "decoder.post_quant_conv.weight" in sd:
+            state_dict_prefix_replace(sd, {"decoder.post_quant_conv.": "post_quant_conv.",
+                                           "encoder.quant_conv.": "quant_conv."})
+        decoder = None
+        decoder_ch = sd["decoder.conv_in.weight"].shape[0] // ddconfig["ch_mult"][-1]
+        if decoder_ch != ddconfig["ch"]:
+            decoder = dict(ddconfig, ch=decoder_ch)
+        if "post_quant_conv.weight" in sd:
+            model = AutoencoderKL(ddconfig=ddconfig,
+                                  embed_dim=sd["post_quant_conv.weight"].shape[1],
+                                  **({"decoder_ddconfig": decoder} if decoder is not None else {}))
+        else:
+            model = AutoencodingEngine(
+                regularizer_config={
+                    "target": "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                encoder_config={"target": "comfy.ldm.modules.diffusionmodules.model.Encoder",
+                                "params": ddconfig},
+                decoder_config={"target": "comfy.ldm.modules.diffusionmodules.model.Decoder",
+                                "params": decoder or ddconfig})
+
+        def memory_used_decode(shape, dtype):
+            fused = fused_norm_served(mm.vae_device(), dtype)
+            return (2178 * shape[2] * shape[3] * 64 * mm.dtype_size(dtype) * ratio
+                    * (1.0 if fused else 4.0))
+
+        return model, dict(
+            latent_dim=2, latent_channels=ddconfig["z_channels"] * 4, output_channels=3,
+            working_dtypes=[torch.float16, torch.bfloat16, torch.float32],
+            upscale_ratio=16, downscale_ratio=16,
+            upscale_index_formula=None, downscale_index_formula=None,
+            memory_used_encode=lambda shape, dtype: (1767 * shape[2] * shape[3]
+                                                     * mm.dtype_size(dtype) * ratio),
+            memory_used_decode=memory_used_decode)
     raise ValueError("comfy_vae: no comfy/sd.py VAE branch is mirrored for this file, add it to "
                      "adapter._comfy_vae_model")
 
@@ -1260,6 +1435,11 @@ class ComfyVAE:
             return
         # As VAELoader reads it (nodes.py:857): under VBAR the weights stay file slices, not RAM.
         sd = comfy.utils.load_torch_file(self.__dict__.pop("_path"))
+        # sd.py:503-505: a file in diffusers' layout, converted to ComfyUI's.
+        if ("decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" not in sd
+                and "decoder.up_blocks.0.resnets.0.norm1.weight" in sd):
+            from comfy.diffusers_convert import convert_vae_state_dict
+            sd = convert_vae_state_dict(sd)
         model, settings = _comfy_vae_model(sd)
         self.__dict__.update(settings)
         self.device = mm.vae_device()
