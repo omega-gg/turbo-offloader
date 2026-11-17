@@ -128,11 +128,11 @@ class TextEncoder(adapter.CLIP):
                          comfy.text_encoders.flux.Flux3Tokenizer, sd)
 
 
-def load(weight_file, config, load_device, dtype):
+def load(weight_file, config, load_device, dtype, **options):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
         return flux3.Flux3(**detect(sd), dtype=dtype, operations=operations)
 
     return Flux3.load(build, weight_file, config, load_device, dtype,
-                      process=flux2.process)
+                      **options, process=flux2.process)

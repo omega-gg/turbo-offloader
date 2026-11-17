@@ -464,11 +464,13 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
         cpu = torch.device("cpu")
         return 2 * sum(os.path.getsize(f) for f in big) <= mm.get_total_memory(cpu) * 0.85
 
-    load_device, dtype, cpu_stream, manual_cast, _operations, _use_vbar, build = (
+    load_device, dtype, cpu_stream, manual_cast, _operations, use_vbar, build = (
         _prepare_offload(device, dtype, _fits_full_load))
 
+    # ComfyUI's storage and compute dtypes; a dynamic patcher's model takes the file's tensors.
     tf, unexpected = _comfy_model(transformer["model"]).load(
-        transformer["file"], transformer["config"], load_device, dtype)
+        transformer["file"], transformer["config"], load_device, dtype, compute_dtype=manual_cast,
+        dynamic=use_vbar)
     if unexpected:
         print("offloader: %d transformer keys unexpected" % len(unexpected), flush=True)
     tf_patcher = build(tf)

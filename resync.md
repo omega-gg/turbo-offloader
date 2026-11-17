@@ -111,7 +111,7 @@ around the model is mirrored there (v0.45.4):
 
 | upstream | in offloader/ | what |
 |---|---|---|
-| `load_diffusion_model_state_dict`, sd.py:2484-2552; model_base.py:184-187 | `adapter.load_comfy_single_file` | the file read, its quantization, ComfyUI's ops, the build and the weight load |
+| `load_diffusion_model_state_dict`, sd.py:2460-2555; model_base.py:184-187 | `adapter.load_comfy_single_file` | the file read, its quantization, ComfyUI's ops for the storage and compute dtypes (sd.py:2529-2538), the build and the weight load, assigned only under a dynamic patcher (sd.py:2551) |
 | `BaseModel`, model_base.py:174-276 (`_apply_model`'s options, :254-257); `model_lora_keys_unet`'s generic entries, lora.py:200-207 | `adapter.BaseModel` | what every model shares: what the patcher and the pipeline read off it (a `cache_context` that keeps nothing), its LoRA keys |
 | `count_blocks`, model_detection.py:9-20 | `adapter.count_blocks` | how many blocks a prefix numbers, for each model's `detect` |
 | the grids `process_img` builds per image (e.g. ldm/flux/model.py, ldm/flux3/model.py) | `adapter.id_grids` | each grid's size off a pipeline's position ids, read once per run |

@@ -594,14 +594,17 @@ def mixed_precision_operations(compute_dtype, load_device, quant_config):
     return ops.mixed_precision_ops(quant_config, compute_dtype, disabled=disabled)
 
 
-def load_comfy_single_file(build, weight_file, load_device, compute_dtype, process=None):
+def load_comfy_single_file(build, weight_file, load_device, dtype, compute_dtype=None,
+                           dynamic=True, process=None):
     """A model of ComfyUI's own (vendored under comfy/ldm/) from its single file (or a model's
-    shards, a list of files), as sd.py's load_diffusion_model_state_dict does (sd.py:2484-2552,
+    shards, a list of files), as sd.py's load_diffusion_model_state_dict does (sd.py:2460-2555,
     v0.45.4): mmap the file, inject its quant markers (convert_old_quants), detect its
     quantization, pick ComfyUI's ops for it, build the model through `build(sd, operations)`
-    (model_base.py:184-187) and assign the file's weights (load_model_weights, as a dynamic
-    patcher has it). `process` is the model's process_unet_state_dict, run after the quant
-    markers. Returns (model, unexpected_keys)."""
+    (model_base.py:184-187) and load the file's weights (load_model_weights, sd.py:2548-2551):
+    a dynamic patcher's model takes the file's tensors as they are, any other copies them into
+    its `dtype`, the storage one (sd.py:2529-2538: fp32 on a CPU, unless streamed), computing in
+    `compute_dtype` (manual_cast) where it differs. `process` is the model's
+    process_unet_state_dict, run after the quant markers. Returns (model, unexpected_keys)."""
     files = as_files(weight_file)
 
     sd, metadata = {}, None
@@ -618,17 +621,19 @@ def load_comfy_single_file(build, weight_file, load_device, compute_dtype, proce
 
     quant_config = comfy.utils.detect_layer_quantization(sd, "")
 
+    compute_dtype = compute_dtype or dtype
+
     if quant_config is not None:
         operations = mixed_precision_operations(compute_dtype, load_device, quant_config)
     else:
-        operations = pick_operations(compute_dtype, compute_dtype, load_device)
+        operations = pick_operations(dtype, compute_dtype, load_device)
 
     model = build(sd, operations)
     model.requires_grad_(False)
     model.eval()
     model._offloader_files = files  # build_dynamic_patcher's fast_disk
 
-    _missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
+    _missing, unexpected = model.load_state_dict(sd, strict=False, assign=dynamic)
 
     return model, unexpected
 
@@ -796,13 +801,15 @@ class BaseModel(torch.nn.Module):
         self._dtype = dtype
 
     @classmethod
-    def load(cls, build, weight_file, config, load_device, dtype, process=None):
-        """The model of `build` from its file (load_comfy_single_file) behind the pipeline's call;
-        `config` is what the pipeline reads off its transformer's config, `process` the
-        model's process_unet_state_dict. Returns (model, unexpected_keys)."""
+    def load(cls, build, weight_file, config, load_device, dtype, compute_dtype=None,
+             dynamic=True, process=None):
+        """The model of `build` from its file (load_comfy_single_file, which takes the dtypes,
+        `dynamic` and `process`) behind the pipeline's call, its inputs cast to the compute dtype
+        as _apply_model casts them; `config` is what the pipeline reads off its transformer's
+        config. Returns (model, unexpected_keys)."""
         model, unexpected = load_comfy_single_file(build, weight_file, load_device, dtype,
-                                                   process=process)
-        out = cls(model, config, dtype)
+                                                   compute_dtype, dynamic, process)
+        out = cls(model, config, compute_dtype or dtype)
         out._offloader_files = model._offloader_files  # build_dynamic_patcher's fast_disk
         return out, unexpected
 

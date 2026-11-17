@@ -221,11 +221,11 @@ class TextEncoder(adapter.CLIP):
         return torch.cat(parts, dim=1), extra.get("attention_mask"), image_pad_mask
 
 
-def load(weight_file, config, load_device, dtype):
+def load(weight_file, config, load_device, dtype, **options):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
         return qwen_image21.QwenImage21Transformer2DModel(**detect(sd), dtype=dtype,
                                                           operations=operations)
 
-    return QwenImage21.load(build, weight_file, config, load_device, dtype)
+    return QwenImage21.load(build, weight_file, config, load_device, dtype, **options)

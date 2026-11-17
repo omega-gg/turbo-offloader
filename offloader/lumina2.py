@@ -113,7 +113,7 @@ class TextEncoder(adapter.CLIP):
                          comfy.text_encoders.z_image.ZImageTokenizer, sd)
 
 
-def load(weight_file, config, load_device, dtype):
+def load(weight_file, config, load_device, dtype, **options):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
@@ -122,4 +122,4 @@ def load(weight_file, config, load_device, dtype):
         model.unet_config = unet_config  # model_config.unet_config, for lora_keys
         return model
 
-    return Lumina2.load(build, weight_file, config, load_device, dtype)
+    return Lumina2.load(build, weight_file, config, load_device, dtype, **options)

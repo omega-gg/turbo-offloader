@@ -323,7 +323,7 @@ class TextEncoder(adapter.CLIP):
         return cond, mask.bool()
 
 
-def load(weight_file, config, load_device, dtype):
+def load(weight_file, config, load_device, dtype, **options):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
@@ -332,4 +332,4 @@ def load(weight_file, config, load_device, dtype):
         model.unet_config = unet_config  # model_config.unet_config, for lora_keys
         return model
 
-    return Krea2.load(build, weight_file, config, load_device, dtype)
+    return Krea2.load(build, weight_file, config, load_device, dtype, **options)

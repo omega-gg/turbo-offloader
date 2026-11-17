@@ -168,11 +168,11 @@ class TextEncoder(adapter.CLIP):
         return cond, extra.get("attention_mask")
 
 
-def load(weight_file, config, load_device, dtype):
+def load(weight_file, config, load_device, dtype, **options):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
         return qwen_image.QwenImageTransformer2DModel(**detect(sd), dtype=dtype,
                                                       operations=operations)
 
-    return QwenImage.load(build, weight_file, config, load_device, dtype)
+    return QwenImage.load(build, weight_file, config, load_device, dtype, **options)
