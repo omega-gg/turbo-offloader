@@ -395,12 +395,19 @@ Read with care:
   runs a side on a fresh host put it at −4% (14.53 s against 15.19 s; to the saved image 16.04
   against 16.60), the identity edit at −2%, the same images. A container's runs spread ±0.6 s
   (about 4%), and turbo's first run there is 5 to 7 s slower, reading the weights off the Volume
-  that ComfyUI then finds cached: compare with `--repeat 2` or more.
+  that ComfyUI then finds cached: compare with `--repeat 2` or more, which now swaps which side
+  goes first.
+- From launch to image, timed alike (ComfyUI from its server's launch, turbo to its `Saved:`
+  line), turbo is ahead: comfy-moss-image 20.3 s against 22.6 s, edit 25.0 to 25.2 s against 26.3
+  to 26.7 s. Only the first run, turbo's, reading the files cold, is behind (29.6 s against 28.4
+  s). The earlier harness timed ComfyUI from its server's readiness and turbo to its process's
+  exit, which put turbo 6 to 10 s behind.
 - The same engine on two L40S hosts at once sampled 2× apart (comfy-flux2-4b: 4.69 / 5.64 s and
   2.25 / 2.57 s), the ratio holding (−16%, −12%): on Modal, compare turbo with ComfyUI in one
   container, not a time with another host's.
-- CUDA runs ahead of the step lines on a fast GPU, so the end of sampling can land in the decode
-  that follows; sampling to the saved image would be the sturdier measure.
+- CUDA runs ahead of the step lines, so the end of sampling can land in the decode that follows
+  (on the A1000, 1.8 s of comfy-flux2-4b's sampling was still queued at its `4/4` line); sampling
+  to the saved image would be the sturdier measure.
 - Images sit further from ComfyUI's here than on the A1000 for Krea 2 (27.7 to 34.9 dB, 37.4 to
   42.1 there) and FLUX.2 9B distilled (38.3, 48.3 there); the others match. Not yet explained.
 - The stock z-image-turbo (diffusers' model on `load_pipe`) samples 3.4× slower than
