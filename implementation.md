@@ -387,8 +387,11 @@ flux3-6b 7.76 (edit 11.94), z-image-turbo 20.05.
 
 Read with care:
 
-- turbo is at parity or faster everywhere but the Krea 2 general edit, +8% (inside the 10%
-  tolerance, one container); the identity edit runs the same forward at −3%. Unconfirmed.
+- turbo is at parity or faster everywhere. The Krea 2 general edit's +8% above was noise: three
+  runs a side on a fresh host put it at −4% (14.53 s against 15.19 s; to the saved image 16.04
+  against 16.60), the identity edit at −2%, the same images. A container's runs spread ±0.6 s
+  (about 4%), and turbo's first run there is 5 to 7 s slower, reading the weights off the Volume
+  that ComfyUI then finds cached: compare with `--repeat 2` or more.
 - The same engine on two L40S hosts at once sampled 2× apart (comfy-flux2-4b: 4.69 / 5.64 s and
   2.25 / 2.57 s), the ratio holding (−16%, −12%): on Modal, compare turbo with ComfyUI in one
   container, not a time with another host's.
