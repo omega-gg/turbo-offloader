@@ -113,6 +113,7 @@ around the model is mirrored there (v0.45.4):
 |---|---|---|
 | `load_diffusion_model_state_dict`, sd.py:2484-2552; model_base.py:184-187 | `adapter.load_comfy_single_file` | the file read, its quantization, ComfyUI's ops, the build and the weight load |
 | `BaseModel`, model_base.py:174-276 (`_apply_model`'s options, :254-257); `model_lora_keys_unet`'s generic entries, lora.py:200-207 | `adapter.BaseModel` | what every model shares: what the patcher and the pipeline read off it (a `cache_context` that keeps nothing), its LoRA keys |
+| `count_blocks`, model_detection.py:9-20 | `adapter.count_blocks` | how many blocks a prefix numbers, for each model's `detect` |
 | the grids `process_img` builds per image (e.g. ldm/flux/model.py, ldm/flux3/model.py) | `adapter.id_grids` | each grid's size off a pipeline's position ids, read once per run |
 | model_detection.py:1012-1021 | `qwen_image.detect` | Qwen-Image's settings off its file (2511's `index_timestep_zero`) |
 | `model_base.QwenImage`, model_base.py:2784-2815; `BaseModel._apply_model`, model_base.py:221-263 | `qwen_image.QwenImage` | the model ComfyUI samples, its references as `edit` hands them |
@@ -189,7 +190,6 @@ images and speed against ComfyUI's on the same files and template graph.
 | aimdo's `control.init` arguments in `main.py` | `pre_torch_init` | comfy-aimdo's allocator hooks before torch |
 | the `ModelPatcher` constructor (`fast_disk`, as sd.py:2408 passes it) | `adapter.build_dynamic_patcher` | the storage policy of the streamed files |
 | `PromptModelTracker` | `prepare` / `reclaim` | a generation is ComfyUI's prompt |
-| `load_safetensors` storage tags `_comfy_tensor_file_slice` / `_comfy_tensor_mmap_refs` | `adapter._own_file_slice` | file slices read straight to the device |
 
 ## The offloader's own glue: `offloader/comfy/__init__.py`
 

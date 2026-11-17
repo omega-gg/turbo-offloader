@@ -41,13 +41,6 @@ def detect(sd):
     """model_detection.py:273-329, :359-362 (no key prefix), FLUX.2's branch: the transformer's
     settings off its file."""
 
-    def count_blocks(prefix):
-        # model_detection.py:9-20
-        count = 0
-        while any(k.startswith("{}{}.".format(prefix, count)) for k in sd):
-            count += 1
-        return count
-
     config = {"image_model": "flux2", "axes_dim": [32, 32, 32, 32], "num_heads": 48,
               "mlp_ratio": 3.0, "theta": 2000, "out_channels": 128, "global_modulation": True,
               "mlp_silu_act": True, "qkv_bias": False, "ops_bias": False,
@@ -61,8 +54,8 @@ def detect(sd):
     config["vec_in_dim"] = (sd["vector_in.in_layer.weight"].shape[1]
                             if "vector_in.in_layer.weight" in sd else None)
     config["num_heads"] = config["hidden_size"] // sum(config["axes_dim"])
-    config["depth"] = count_blocks("double_blocks.")
-    config["depth_single_blocks"] = count_blocks("single_blocks.")
+    config["depth"] = adapter.count_blocks(sd, "double_blocks.{}.")
+    config["depth_single_blocks"] = adapter.count_blocks(sd, "single_blocks.{}.")
     config["guidance_embed"] = "guidance_in.in_layer.weight" in sd
     config["yak_mlp"] = "double_blocks.0.img_mlp.gate_proj.weight" in sd
     config["txt_norm"] = "txt_norm.weight" in sd or "txt_norm.scale" in sd
@@ -163,7 +156,7 @@ class TextEncoder(adapter.CLIP):
         super().__init__(te, tokenizer, sd)
 
 
-def load(weight_file, config, load_device, dtype, convert=None):
+def load(weight_file, config, load_device, dtype):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
@@ -172,5 +165,4 @@ def load(weight_file, config, load_device, dtype, convert=None):
         model.unet_config = unet_config  # model_config.unet_config, for lora_keys
         return model
 
-    return Flux2.load(build, weight_file, config, load_device, dtype,
-                      convert=lambda sd: process(convert(sd) if convert else sd))
+    return Flux2.load(build, weight_file, config, load_device, dtype, process=process)

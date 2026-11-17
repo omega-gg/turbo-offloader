@@ -51,10 +51,7 @@ _TEMPLATE = ("<|im_start|>system\nDescribe the key features of the input image (
 
 def detect(sd):
     """model_detection.py:1012-1021 (no key prefix): the transformer's settings off its file."""
-    # count_blocks (model_detection.py:9-20)
-    num_layers = 0
-    while any(k.startswith("transformer_blocks.{}.".format(num_layers)) for k in sd):
-        num_layers += 1
+    num_layers = adapter.count_blocks(sd, "transformer_blocks.{}.")
 
     config = {"image_model": "qwen_image", "in_channels": sd["img_in.weight"].shape[1],
               "num_layers": num_layers}
@@ -171,11 +168,11 @@ class TextEncoder(adapter.CLIP):
         return cond, extra.get("attention_mask")
 
 
-def load(weight_file, config, load_device, dtype, convert=None):
+def load(weight_file, config, load_device, dtype):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
         return qwen_image.QwenImageTransformer2DModel(**detect(sd), dtype=dtype,
                                                       operations=operations)
 
-    return QwenImage.load(build, weight_file, config, load_device, dtype, convert=convert)
+    return QwenImage.load(build, weight_file, config, load_device, dtype)

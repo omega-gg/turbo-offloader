@@ -576,37 +576,6 @@ def load_streamed(model_cls, model_dir, dtype, operations=None):
     return model, missing
 
 
-def _own_file_slice(t):
-    """A view a key `convert` cut out of a file-sliced weight (diffusers chunking ComfyUI's fused
-    qkv) is not a whole slice, so comfy's cast skips its direct file->device read for it
-    (read_tensor_file_slice_into) and pages it through the mmap. Rebuild it the way comfy's
-    load_safetensors builds every tensor (utils.py:183-188): own buffer over the same mmap, own
-    TensorFileSlice. Anything else is returned as-is."""
-    import warnings
-
-    import comfy.memory_management as memm
-
-    storage = t.untyped_storage()
-    info = getattr(storage, "_comfy_tensor_file_slice", None)
-    refs = getattr(storage, "_comfy_tensor_mmap_refs", None)
-    size = t.numel() * t.element_size()
-    if info is None or refs is None or not t.is_contiguous() or size == info.size:
-        return t
-
-    skip = t.data_ptr() - storage.data_ptr()  # byte offset of the view inside its slice
-    mv = refs[1]
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="The given buffer is not writable")
-        base = torch.frombuffer(mv, dtype=torch.uint8, count=1).data_ptr()  # mmap start
-        start = t.data_ptr() - base
-        view = torch.frombuffer(mv[start:start + size], dtype=t.dtype).view(t.shape)
-    own = view.untyped_storage()
-    own._comfy_tensor_file_slice = memm.TensorFileSlice(info.file_ref, info.lock,
-                                                        info.offset + skip, size)
-    own._comfy_tensor_mmap_refs = refs
-    return view
-
-
 def as_files(weight_file):
     """A spec's "file" as a list: one single file, or a model's shards."""
     return list(weight_file) if isinstance(weight_file, (list, tuple)) else [weight_file]
@@ -625,14 +594,14 @@ def mixed_precision_operations(compute_dtype, load_device, quant_config):
     return ops.mixed_precision_ops(quant_config, compute_dtype, disabled=disabled)
 
 
-def load_comfy_single_file(build, weight_file, load_device, compute_dtype, convert=None):
+def load_comfy_single_file(build, weight_file, load_device, compute_dtype, process=None):
     """A model of ComfyUI's own (vendored under comfy/ldm/) from its single file (or a model's
     shards, a list of files), as sd.py's load_diffusion_model_state_dict does (sd.py:2484-2552,
     v0.45.4): mmap the file, inject its quant markers (convert_old_quants), detect its
     quantization, pick ComfyUI's ops for it, build the model through `build(sd, operations)`
     (model_base.py:184-187) and assign the file's weights (load_model_weights, as a dynamic
-    patcher has it). `convert`, after the quant markers, renames a file of another layout into
-    ComfyUI's and runs the model's process_unet_state_dict. Returns (model, unexpected_keys)."""
+    patcher has it). `process` is the model's process_unet_state_dict, run after the quant
+    markers. Returns (model, unexpected_keys)."""
     files = as_files(weight_file)
 
     sd, metadata = {}, None
@@ -644,8 +613,8 @@ def load_comfy_single_file(build, weight_file, load_device, compute_dtype, conve
 
     sd, metadata = comfy.utils.convert_old_quants(sd, model_prefix="", metadata=metadata)
 
-    if convert is not None:
-        sd = {k: _own_file_slice(v) for k, v in convert(sd).items()}
+    if process is not None:
+        sd = process(sd)
 
     quant_config = comfy.utils.detect_layer_quantization(sd, "")
 
@@ -662,6 +631,14 @@ def load_comfy_single_file(build, weight_file, load_device, compute_dtype, conve
     _missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
 
     return model, unexpected
+
+
+def count_blocks(state_dict_keys, prefix_string):
+    """model_detection.py:9-20: how many blocks `prefix_string` numbers ({} the block)."""
+    count = 0
+    while any(k.startswith(prefix_string.format(count)) for k in state_dict_keys):
+        count += 1
+    return count
 
 
 def llama_detect(state_dict, prefix=""):
@@ -819,12 +796,12 @@ class BaseModel(torch.nn.Module):
         self._dtype = dtype
 
     @classmethod
-    def load(cls, build, weight_file, config, load_device, dtype, convert=None):
+    def load(cls, build, weight_file, config, load_device, dtype, process=None):
         """The model of `build` from its file (load_comfy_single_file) behind the pipeline's call;
-        `config` is what the pipeline reads off its transformer's config. Returns
-        (model, unexpected_keys)."""
+        `config` is what the pipeline reads off its transformer's config, `process` the
+        model's process_unet_state_dict. Returns (model, unexpected_keys)."""
         model, unexpected = load_comfy_single_file(build, weight_file, load_device, dtype,
-                                                   convert=convert)
+                                                   process=process)
         out = cls(model, config, dtype)
         out._offloader_files = model._offloader_files  # build_dynamic_patcher's fast_disk
         return out, unexpected

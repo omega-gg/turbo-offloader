@@ -446,7 +446,6 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
     (engine/<id>.py) names them as data:
         transformer  = {"model": ComfyUI model name, "file": path,
                         "config": what the pipeline reads off its transformer's config,
-                        "convert": ...,  # optional; a file of another layout into ComfyUI's
                         "lora_names": fn(ComfyUI's LoRA key map)->dict}  # optional aliases
         text_encoder = {"model": ComfyUI model name, "file": path}  # its TextEncoder
         components   = {<pipeline __init__ arg>: prebuilt module, ...}  # vae/tokenizer/scheduler
@@ -465,11 +464,11 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
         cpu = torch.device("cpu")
         return 2 * sum(os.path.getsize(f) for f in big) <= mm.get_total_memory(cpu) * 0.85
 
-    load_device, dtype, cpu_stream, manual_cast, _operations, _use_vbar, build =         _prepare_offload(device, dtype, _fits_full_load)
+    load_device, dtype, cpu_stream, manual_cast, _operations, _use_vbar, build = (
+        _prepare_offload(device, dtype, _fits_full_load))
 
     tf, unexpected = _comfy_model(transformer["model"]).load(
-        transformer["file"], transformer["config"], load_device, dtype,
-        convert=transformer.get("convert"))
+        transformer["file"], transformer["config"], load_device, dtype)
     if unexpected:
         print("offloader: %d transformer keys unexpected" % len(unexpected), flush=True)
     tf_patcher = build(tf)

@@ -49,16 +49,12 @@ def detect(sd):
     head_dim = 128
     first_w = sd["first.weight"]  # (features, channels*patch^2)
 
-    # count_blocks (model_detection.py:9-20)
-    layers = 0
-    while any(k.startswith("blocks.{}.".format(layers)) for k in sd):
-        layers += 1
 
     return {"image_model": "krea2",
             "features": first_w.shape[0],
             "channels": first_w.shape[1] // (2 * 2),  # patch=2
             "patch": 2,
-            "layers": layers,
+            "layers": adapter.count_blocks(sd, "blocks.{}."),
             "heads": sd["blocks.0.attn.wq.weight"].shape[0] // head_dim,
             "kvheads": sd["blocks.0.attn.wk.weight"].shape[0] // head_dim,
             "txtlayers": sd["txtfusion.projector.weight"].shape[1],
@@ -327,7 +323,7 @@ class TextEncoder(adapter.CLIP):
         return cond, mask.bool()
 
 
-def load(weight_file, config, load_device, dtype, convert=None):
+def load(weight_file, config, load_device, dtype):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
@@ -336,4 +332,4 @@ def load(weight_file, config, load_device, dtype, convert=None):
         model.unet_config = unet_config  # model_config.unet_config, for lora_keys
         return model
 
-    return Krea2.load(build, weight_file, config, load_device, dtype, convert=convert)
+    return Krea2.load(build, weight_file, config, load_device, dtype)

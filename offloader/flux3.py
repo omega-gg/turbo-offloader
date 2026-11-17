@@ -38,21 +38,14 @@ import comfy.text_encoders.flux
 def detect(sd):
     """model_detection.py:263-272 (no key prefix): the transformer's settings off its file."""
 
-    def count_blocks(prefix):
-        # model_detection.py:9-20
-        count = 0
-        while any(k.startswith("{}{}.".format(prefix, count)) for k in sd):
-            count += 1
-        return count
-
     hidden_size = sd["content_mode_blocks.image.0.attn_out.weight"].shape[0]
 
     return {"hidden_size": hidden_size,
             "num_heads": hidden_size // 128,
             "fused_qkv": "single_blocks.0.qkv.weight" in sd,
             "flow_map": "ref_time_in.in_layer.weight" in sd,
-            "depth": count_blocks("txt_mode_blocks."),
-            "depth_single_blocks": count_blocks("single_blocks.")}
+            "depth": adapter.count_blocks(sd, "txt_mode_blocks.{}."),
+            "depth_single_blocks": adapter.count_blocks(sd, "single_blocks.{}.")}
 
 
 class Flux3(adapter.BaseModel):
@@ -135,12 +128,11 @@ class TextEncoder(adapter.CLIP):
                          comfy.text_encoders.flux.Flux3Tokenizer, sd)
 
 
-def load(weight_file, config, load_device, dtype, convert=None):
-    """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes. `convert`
-    renames a file of another layout into ComfyUI's."""
+def load(weight_file, config, load_device, dtype):
+    """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
         return flux3.Flux3(**detect(sd), dtype=dtype, operations=operations)
 
     return Flux3.load(build, weight_file, config, load_device, dtype,
-                      convert=lambda sd: flux2.process(convert(sd) if convert else sd))
+                      process=flux2.process)

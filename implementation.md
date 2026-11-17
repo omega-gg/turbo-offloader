@@ -38,7 +38,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `available()` | True once the vendored offloader imports (any device) |
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
-| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config, convert}` for the transformer, `{model, file}` for the text encoder) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
+| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config}` for the transformer, `{model, file}` for the text encoder) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
 | `prepare(pipe)` | `load_models_gpu` of the sampling models (the encoder loads at encode, as each ComfyUI node loads its own model): place them on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory` |
 | `reclaim(pipe)` | end a run the VAE decode did not end (`_end_sampling`: `current_patcher = None` as ComfyUI's `cleanup` does, then `node_teardown`), then `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
@@ -482,8 +482,7 @@ from ComfyUI.
 - **Single files (ComfyUI-reuse engines).** `load_pipe_comfy` loads a ComfyUI install's split
   single files rather than a diffusers component dir, each big model through its adapter
   (`adapter.load_comfy_single_file` for the transformer, `adapter.CLIP` for the text encoder),
-  the file mmapped and its weights file slices (`_own_file_slice` re-wraps what a `convert`
-  renames, see the v0.39 note). The VAE, scheduler and tokenizer come from the scaffold, or the
+  the file mmapped and its weights file slices, loaded as they are. The VAE, scheduler and tokenizer come from the scaffold, or the
   VAE is ComfyUI's own (`comfy_vae`), handed in as a prebuilt `component`. It shares both ends with
   `load_pipe`: the `_prepare_offload` setup (device / CPU comfy-vs-stream mode / dtype / VBAR /
   builder) and the `_finalize_pipe` tail (VAE placement, execution device, encode bridge/cache),
@@ -539,7 +538,8 @@ from ComfyUI.
   tensor (own buffer over the mmap + own `TensorFileSlice`), so they take comfy's own fast path:
   same bytes (image md5 unchanged), and turbo now samples faster than ComfyUI (7.0/10.1 vs
   8.8/11.3 s; end to end 33.9/38.2 vs 35.7/39.8 s). comfy-krea2-turbo's convert only renames, so
-  it was unaffected and stays at parity (57.8 vs 58.6 s). flux2-4b from the diffusers repo trails
+  it was unaffected and stays at parity (57.8 vs 58.6 s). (`_own_file_slice` went with the
+  converters, once the comfy engines ran ComfyUI's own models on their files as they are.) flux2-4b from the diffusers repo trails
   by a further ~2-4 s for the same reason: a plain sequential read of its text-encoder file is ~2 s
   slower than ComfyUI's byte-identical copy here (disk/page cache, not code). Profiling it found
   a real leak, fixed: `assign_streamed_weights` now re-ties tied weights (Qwen3's `lm_head`),
@@ -593,7 +593,9 @@ from ComfyUI.
   Qwen3-VL and its image processing put a grounded prompt 25-125% off and dropped the face from an
   identity edit. A diffusers VAE gets its input in its own dtype, as ComfyUI's VAE casts it, since
   ComfyUI's models sample in float32. `load_pipe_comfy` takes nothing else any more:
-  `stream_single_file`, `load_quant_single_file`, `wire_streamed` and `keep_declared_fp32` went.
+  `stream_single_file`, `load_quant_single_file`, `wire_streamed`, `keep_declared_fp32`, the
+  engines' `convert` and `_own_file_slice` went; FLUX's QK norm fix runs as its
+  `process_unet_state_dict` does (`process`).
   **`load_pipe` and its diffusers-side helpers stay** (`load_streamed`, `comfy_ize`,
   `install_prefetch`, `use_comfy_attention`, `use_kitchen_rope`, ...): turboCLI's stock engines
   run diffusers' own models through them: the published models at full precision for powerful

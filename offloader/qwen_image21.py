@@ -45,10 +45,7 @@ def detect(sd):
     inner_dim = sd["img_in.weight"].shape[0]
     gate_up = sd.get("transformer_blocks.0.img_mlp.gate_up.weight", None)
 
-    # count_blocks (model_detection.py:9-20)
-    num_layers = 0
-    while any(k.startswith("transformer_blocks.{}.".format(num_layers)) for k in sd):
-        num_layers += 1
+    num_layers = adapter.count_blocks(sd, "transformer_blocks.{}.")
 
     if gate_up is not None:
         mlp_ratio = gate_up.shape[0] // 2 // inner_dim
@@ -224,11 +221,11 @@ class TextEncoder(adapter.CLIP):
         return torch.cat(parts, dim=1), extra.get("attention_mask"), image_pad_mask
 
 
-def load(weight_file, config, load_device, dtype, convert=None):
+def load(weight_file, config, load_device, dtype):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
         return qwen_image21.QwenImage21Transformer2DModel(**detect(sd), dtype=dtype,
                                                           operations=operations)
 
-    return QwenImage21.load(build, weight_file, config, load_device, dtype, convert=convert)
+    return QwenImage21.load(build, weight_file, config, load_device, dtype)

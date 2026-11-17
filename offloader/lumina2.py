@@ -38,19 +38,13 @@ import comfy.utils
 def detect(sd):
     """model_detection.py:594-640 (no key prefix) for a Z-Image file: its settings."""
 
-    def count_blocks(prefix):
-        # model_detection.py:9-20
-        count = 0
-        while any(k.startswith("{}{}.".format(prefix, count)) for k in sd):
-            count += 1
-        return count
-
     w = sd["cap_embedder.1.weight"]
     if w.shape[0] != 3840:
         raise ValueError("not a Z-Image transformer (dim {})".format(w.shape[0]))
 
     config = {"image_model": "lumina2", "patch_size": 2, "in_channels": 16, "dim": w.shape[0],
-              "cap_feat_dim": w.shape[1], "n_layers": count_blocks("layers."), "qk_norm": True,
+              "cap_feat_dim": w.shape[1], "n_layers": adapter.count_blocks(sd, "layers.{}."),
+              "qk_norm": True,
               "n_heads": 30, "n_kv_heads": 30, "axes_dims": [32, 48, 48],
               "axes_lens": [1536, 512, 512], "rope_theta": 256.0,
               "ffn_dim_multiplier": 8.0 / 3.0, "z_image_modulation": True, "time_scale": 1000.0}
@@ -119,7 +113,7 @@ class TextEncoder(adapter.CLIP):
                          comfy.text_encoders.z_image.ZImageTokenizer, sd)
 
 
-def load(weight_file, config, load_device, dtype, convert=None):
+def load(weight_file, config, load_device, dtype):
     """ComfyUI's transformer for its file, behind the call diffusers' pipeline makes."""
 
     def build(sd, operations):
@@ -128,4 +122,4 @@ def load(weight_file, config, load_device, dtype, convert=None):
         model.unet_config = unet_config  # model_config.unet_config, for lora_keys
         return model
 
-    return Lumina2.load(build, weight_file, config, load_device, dtype, convert=convert)
+    return Lumina2.load(build, weight_file, config, load_device, dtype)
