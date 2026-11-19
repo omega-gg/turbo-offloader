@@ -412,6 +412,9 @@ Read with care:
   goes first. With `--repeat 1` turbo always goes first, and the cold read grows with the files:
   comfy-minimax-h3-image at 4096² (49 GB) sampled 23.27 s against 18.90 s (+23%) that way, the
   first step streaming its weights off the Volume, and 19.30 s against 19.32 s with two repeats.
+  Cold against cold, each side alone in a fresh container, turbo starts faster:
+  comfy-minimax-h3-image at 1024² reached its first step in 31.5 s against 33.9 s, its image in
+  45.8 s against 48.4 s.
 - From launch to image, timed alike (ComfyUI from its server's launch, turbo to its `Saved:`
   line), turbo is ahead: comfy-moss-image 20.3 s against 22.6 s, edit 25.0 to 25.2 s against 26.3
   to 26.7 s. Only the first run, turbo's, reading the files cold, is behind (29.6 s against 28.4
