@@ -823,20 +823,18 @@ class BaseModel(torch.nn.Module):
         self.config = SimpleNamespace(**config)
         self.device = None  # set by the patcher
         self._dtype = dtype
-        self.sampling_shape = None  # the latent shape prepare_sampling loaded for, this generation
 
     def prepare_sampling(self, shape):
         """sampler_helpers._prepare_sampling's load (v0.45.4, :188-201) for a latent of `shape`,
-        with model_base.memory_required's estimate (:430-452): once a generation, from the first
-        forward, after the text encode as KSampler runs after its CLIPTextEncode. The estimate
-        makes room for the activations, the text encoder's pages going first, so a big latent's
-        model stays resident instead of streaming a part of itself every step."""
+        with model_base.memory_required's estimate (:430-452), called right after the pipeline
+        prepares its latents (_finalize_pipe), before the first step, as KSampler loads its model
+        once the noise exists. The estimate makes room for the activations, the text encoder's
+        pages going first, so a big latent's model stays resident instead of streaming a part of
+        itself every step."""
         patcher = self.current_patcher
 
-        if self.memory_usage_factor is None or patcher is None or self.sampling_shape == shape:
+        if self.memory_usage_factor is None or patcher is None:
             return
-
-        self.sampling_shape = shape
 
         # memory_required's batch counts cond and uncond, minimum_memory_required's one of them.
         area = shape[0] * math.prod(shape[2:])

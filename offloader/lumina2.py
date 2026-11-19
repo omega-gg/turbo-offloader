@@ -75,8 +75,6 @@ class Lumina2(adapter.BaseModel):
         x = torch.stack(x).squeeze(2).to(dtype)
         sigma = (1.0 - t).float()
 
-        self.prepare_sampling(x.shape)
-
         if len({c.shape for c in cap_feats}) == 1:
             groups = [(slice(None), torch.stack(cap_feats))]
         else:

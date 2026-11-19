@@ -415,6 +415,21 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
 
         p.encode_prompt = _encode_then_teardown
 
+    # A model estimating its sampling memory loads as KSampler loads it, once the noise exists:
+    # right after the pipeline prepares its latents, before the first step and the progress bar
+    # (BaseModel.prepare_sampling).
+    model = getattr(p, "transformer", None)
+
+    if getattr(model, "memory_usage_factor", None) is not None:
+        _prepare_latents = p.prepare_latents
+
+        def _prepare_latents_then_load(*args, **kwargs):
+            latents = _prepare_latents(*args, **kwargs)
+            model.prepare_sampling(latents.shape)
+            return latents
+
+        p.prepare_latents = _prepare_latents_then_load
+
     # Drop padded text tokens (ComfyUI never pads, and drops an all-ones mask): a pipeline padding
     # to a fixed width would otherwise run those dead tokens through every block. Wrapped BEFORE
     # install_encode_cache so the cache stores the unpadded result.
@@ -543,8 +558,6 @@ def prepare(pipe):
     import comfy.model_management as mm
     from comfy.model_patcher import PromptModelTracker
 
-    from . import adapter
-
     pipe._offloader_prompt = PromptModelTracker()
     pipe._offloader_prompt.add(patchers)
 
@@ -552,14 +565,10 @@ def prepare(pipe):
     for patcher in patchers:
         patcher.pre_run()
 
-        # A new generation: the model estimates its sampling memory again (prepare_sampling).
-        if isinstance(patcher.model, adapter.BaseModel):
-            patcher.model.sampling_shape = None
-
 
 def _sampling_patchers(pipe):
     # What KSampler loads: every managed model but the text encoder, and but a model estimating
-    # its sampling memory, which loads once at its first forward with the estimate
+    # its sampling memory, which loads once with the estimate after prepare_latents
     # (BaseModel.prepare_sampling).
     encoder = getattr(pipe, "_offloader_encoder", None)
     return [patcher for patcher in pipe._offloader_patchers
