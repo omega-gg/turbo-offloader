@@ -397,7 +397,7 @@ Turbo-only on the same run (no ComfyUI graph, or a stock engine): comfy-flux2-9b
 6.53), comfy-flux2-4b edit 5.73, comfy-flux2-9b-distilled edit 3.57, comfy-flux3-6b edit 5.18,
 comfy-qwen-image-2-1 7.90 (edit 8.92), flux2-4b 4.52 (edit 4.57), flux2-9b 4.90 (edit 5.60),
 flux3-6b 7.76 (edit 11.94), z-image-turbo 20.05 (its pinned revision's fp32 transformer,
-computed in fp32; a default install saves it in bf16 since 2026-11-19: about 5.4 s). MOSS-Image, added after on another L40S:
+computed in fp32, as published; installed with `bfloat16`, about 5.4 s). MOSS-Image, added after on another L40S:
 moss-image 33.36 (50 steps, CFG 3). MiniMax-H3-Image on the 224 GiB container, its 66 GB bf16
 transformer streamed through the card every step: minimax-h3-image 28.12 (edit 34.31) at 1024²,
 rendered on a 4 MP canvas as diffusers does, 23.25 (33.56) at 2048², 86.37 (119.66) at 4096², a
