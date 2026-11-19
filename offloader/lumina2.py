@@ -63,6 +63,8 @@ class Lumina2(adapter.BaseModel):
     lengths run apart, as ComfyUI's batching can't concat them. ComfyUI's model already returns
     the velocity diffusers' pipeline negates its model's output into."""
 
+    memory_usage_factor = 2.8  # supported_models.ZImage's
+
     @property
     def in_channels(self):
         return self.diffusion_model.in_channels
@@ -72,6 +74,8 @@ class Lumina2(adapter.BaseModel):
 
         x = torch.stack(x).squeeze(2).to(dtype)
         sigma = (1.0 - t).float()
+
+        self.prepare_sampling(x.shape)
 
         if len({c.shape for c in cap_feats}) == 1:
             groups = [(slice(None), torch.stack(cap_feats))]

@@ -813,12 +813,41 @@ class BaseModel(torch.nn.Module):
 
     current_patcher = None  # set by pre_run, as BaseModel's
 
+    # The model's memory_usage_factor in supported_models.py, for prepare_sampling's estimate. None
+    # leaves the load to prepare(), with no estimate.
+    memory_usage_factor = None
+
     def __init__(self, diffusion_model, config, dtype):
         super().__init__()
         self.diffusion_model = diffusion_model
         self.config = SimpleNamespace(**config)
         self.device = None  # set by the patcher
         self._dtype = dtype
+        self.sampling_shape = None  # the latent shape prepare_sampling loaded for, this generation
+
+    def prepare_sampling(self, shape):
+        """sampler_helpers._prepare_sampling's load (v0.45.4, :188-201) for a latent of `shape`,
+        with model_base.memory_required's estimate (:430-452): once a generation, from the first
+        forward, after the text encode as KSampler runs after its CLIPTextEncode. The estimate
+        makes room for the activations, the text encoder's pages going first, so a big latent's
+        model stays resident instead of streaming a part of itself every step."""
+        patcher = self.current_patcher
+
+        if self.memory_usage_factor is None or patcher is None or self.sampling_shape == shape:
+            return
+
+        self.sampling_shape = shape
+
+        # memory_required's batch counts cond and uncond, minimum_memory_required's one of them.
+        area = shape[0] * math.prod(shape[2:])
+
+        if mm.xformers_enabled() or mm.pytorch_attention_flash_attention():
+            unit = mm.dtype_size(self._dtype) * 0.01 * self.memory_usage_factor * 1024 ** 2
+        else:
+            unit = 0.15 * self.memory_usage_factor * 1024 ** 2
+
+        mm.load_models_gpu([patcher], memory_required=2 * area * unit,
+                           minimum_memory_required=area * unit)
 
     @classmethod
     def load(cls, build, weight_file, config, load_device, dtype, compute_dtype=None,

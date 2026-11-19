@@ -543,6 +543,8 @@ def prepare(pipe):
     import comfy.model_management as mm
     from comfy.model_patcher import PromptModelTracker
 
+    from . import adapter
+
     pipe._offloader_prompt = PromptModelTracker()
     pipe._offloader_prompt.add(patchers)
 
@@ -550,11 +552,19 @@ def prepare(pipe):
     for patcher in patchers:
         patcher.pre_run()
 
+        # A new generation: the model estimates its sampling memory again (prepare_sampling).
+        if isinstance(patcher.model, adapter.BaseModel):
+            patcher.model.sampling_shape = None
+
 
 def _sampling_patchers(pipe):
-    # What KSampler loads: every managed model but the text encoder.
+    # What KSampler loads: every managed model but the text encoder, and but a model estimating
+    # its sampling memory, which loads once at its first forward with the estimate
+    # (BaseModel.prepare_sampling).
     encoder = getattr(pipe, "_offloader_encoder", None)
-    return [patcher for patcher in pipe._offloader_patchers if patcher is not encoder]
+    return [patcher for patcher in pipe._offloader_patchers
+            if patcher is not encoder
+            and getattr(patcher.model, "memory_usage_factor", None) is None]
 
 
 def node_teardown():
