@@ -523,15 +523,16 @@ def _assign_sd(model, sd):
     return [k for k in sd if k not in used]
 
 
-def cpu_fits_full_load(model):
+def cpu_fits_full_load(model, transformer="transformer"):
     """True when ComfyUI's plain CPU full-load (fp32, materialised) would fit host RAM -- so the
     caller can use that faster path instead of streaming. The fp32 model is ~2x the on-disk bf16
     size; require it under 85% of total RAM (headroom for activations + the OS). Compared against
     ComfyUI's own get_total_memory(cpu). This is ComfyUI's full-load-when-it-fits call, which
     ComfyUI applies on GPU (via free VRAM) but not on CPU; here we apply it to CPU.
-    Model-agnostic: sums the on-disk bytes of each big component (single-file or index+shards)."""
+    Model-agnostic: sums the on-disk bytes of each big component (single-file or index+shards),
+    the transformer in its folder `transformer`."""
     total = 0
-    for comp in ("transformer", "text_encoder"):
+    for comp in (transformer, "text_encoder"):
         comp_dir = os.path.join(model, comp)
         if os.path.isdir(comp_dir):
             total += sum(os.path.getsize(s) for s in _shards(comp_dir))
@@ -569,7 +570,22 @@ def load_streamed(model_cls, model_dir, dtype, operations=None):
 
     cfg = model_cls.load_config(model_dir)
     with init_empty_weights():
-        model = model_cls.from_config(cfg).to(dtype)
+        model = model_cls.from_config(cfg)
+
+    # In `dtype`, but for the modules the model keeps in float32 (_keep_in_fp32_modules), as
+    # from_pretrained loads them: their buffers made at build (MiniMax-H3-Image's rope) stay exact.
+    # The weights keep their file's dtype either way (_assign_sd).
+    keep = set(getattr(model, "_keep_in_fp32_modules", None) or ())
+    for name, module in model.named_modules():
+        if keep & set(name.split(".")):
+            continue
+        for key, tensor in module.named_parameters(recurse=False):
+            if tensor.is_floating_point():
+                module._parameters[key] = torch.nn.Parameter(tensor.to(dtype),
+                                                             requires_grad=tensor.requires_grad)
+        for key, tensor in module.named_buffers(recurse=False):
+            if tensor.is_floating_point():
+                module._buffers[key] = tensor.to(dtype)
 
     comfy_ize(model, operations)
     missing = assign_streamed_weights(model, model_dir)
@@ -631,6 +647,10 @@ def load_comfy_single_file(build, weight_file, load_device, dtype, compute_dtype
     model = build(sd, operations)
     model.requires_grad_(False)
     model.eval()
+    # model_base.py:197: each tensor's dtype as built, which the patcher casts the file's to when
+    # it loads it. A float32 file tensor in a layer built in the model's dtype (MiniMax-H3-Image's
+    # float32 biases) is loaded in that dtype, as ComfyUI does, not kept in float32.
+    mm.archive_model_dtypes(model)
     model._offloader_files = files  # build_dynamic_patcher's fast_disk
 
     _missing, unexpected = model.load_state_dict(sd, strict=False, assign=dynamic)
@@ -856,9 +876,13 @@ class FlowSampler:
         sigma offset (:168-176) and its noise (default_noise_sampler, :78-88), one step a call.
 
     The initial noise is the pipeline's, as ComfyUI's (sample.py:22-38): the seed's CPU float32
-    draw, scaled by a first sigma of 1."""
+    draw, scaled by a first sigma of 1.
 
-    def __init__(self, sampler, scheduler, shift, multiplier=1.0):
+    A model with its own model sampling passes its `sigma` (a timestep to its sigma) in place of
+    the shift, as MiniMax-H3-Image's grid does: the table, the schedulers and percent_to_sigma run
+    on it, as ComfyUI's run on any model sampling."""
+
+    def __init__(self, sampler, scheduler, shift, multiplier=1.0, sigma=None):
         if sampler not in ("euler", "er_sde") or scheduler not in ("simple", "normal"):
             raise ValueError("FlowSampler: no %s / %s" % (sampler, scheduler))
 
@@ -868,6 +892,8 @@ class FlowSampler:
         self.multiplier = multiplier
         self.seed = None
 
+        self._model_sigma = sigma
+
         self._table = self._sigma((torch.arange(1, 1001, 1) / 1000) * multiplier)
 
     def _shifted(self, t):
@@ -876,6 +902,8 @@ class FlowSampler:
         return self.shift * t / (1 + (self.shift - 1) * t)
 
     def _sigma(self, timestep):
+        if self._model_sigma is not None:
+            return self._model_sigma(timestep)
         return self._shifted(timestep / self.multiplier)
 
     def percent_to_sigma(self, percent):
@@ -883,6 +911,8 @@ class FlowSampler:
             return 1.0
         if percent >= 1.0:
             return 0.0
+        if self._model_sigma is not None:
+            return float(self._model_sigma(torch.tensor((1.0 - percent) * self.multiplier)))
         return self._shifted(1.0 - percent)
 
     def _schedule(self, steps):
@@ -1188,10 +1218,15 @@ def install_prefetch(model):
     import torch.nn as nn
     import comfy.model_prefetch as mp
 
-    # Block sequences = top-level ModuleLists of >=2 identical-typed modules (layers + refiners).
+    # Block sequences = top-level ModuleLists of >=2 blocks (layers + refiners), each running its
+    # own layers in turn. A list of bare layers is indexed, one a call, not run in order
+    # (MiniMax-H3-Image's per-step output heads): prefetched as a sequence, the head a step runs
+    # is not the one the queue streamed, and its weights race the copy.
     sequences = []
     for _name, child in model.named_children():
-        if isinstance(child, nn.ModuleList) and len(child) >= 2:
+        if (isinstance(child, nn.ModuleList)
+                and len(child) >= 2
+                and all(any(True for _ in block.children()) for block in child)):
             sequences.append(child)
     if not sequences:
         return 0
@@ -1405,6 +1440,46 @@ def _comfy_vae_model(sd):
             memory_used_encode=lambda shape, dtype: (1767 * shape[2] * shape[3]
                                                      * mm.dtype_size(dtype) * ratio),
             memory_used_decode=memory_used_decode)
+    if ("decoder.transformer_blocks.0.scale1" in sd and "decoder.proj_out.weight" in sd
+            and sd["decoder.proj_out.weight"].shape[0] == 768
+            and sd["decoder.x_embedder.weight"].shape[0] == 1024):
+        # sd.py:1050-1124, the MiniMax-H3-Image VAE: the H3 encoder with a single-frame 2D ViT
+        # decoder, its latent statistics from the release, one frame of 24 channels at 1/16. It
+        # tiles itself (handles_tiling) and decodes straight to [0, 1] (process_output is the
+        # identity).
+        import comfy.ldm.minimax.vae
+        import comfy.ops
+
+        sd.setdefault("latents_mean", torch.tensor(comfy.ldm.minimax.vae.LATENTS_MEAN))
+        sd.setdefault("latents_std", torch.tensor(comfy.ldm.minimax.vae.LATENTS_STD))
+        layers = sum(k.startswith("decoder.transformer_blocks.") and k.endswith(".scale1")
+                     for k in sd)
+        model = comfy.ldm.minimax.vae.MiniMaxH3ImageVAE(operations=comfy.ops.disable_weight_init,
+                                                        num_layers=layers)
+        upscale_ratio = (lambda a: max(1, (a - 2) // 5 * 17 + 5), 16, 16)
+        chunk_frames = (model.tokens_chunk_size + model.token_overlap) * model.vae_ratio_t
+
+        def memory_used_encode(shape, dtype):
+            frames = min(shape[2], model.clip_length)
+            fixed, per_pixel = (110_000_000, 7) if shape[2] == 1 else (1_300_000_000, 9.5)
+            return ((per_pixel * frames * shape[3] * shape[4] + fixed) * mm.dtype_size(dtype)
+                    * 1.03)
+
+        def memory_used_decode(shape, dtype):
+            # still_frame is 0: a single-frame decoder
+            frames = upscale_ratio[0](shape[2])
+            height, width = shape[3] * 16, shape[4] * 16
+            fixed = 110_000_000 if frames <= 22 else 270_000_000
+            frames = min(frames, chunk_frames + 2)
+            return (9.5 * frames * height * width + fixed) * mm.dtype_size(dtype) * 1.03
+
+        return model, dict(
+            latent_dim=3, latent_channels=24, output_channels=3,
+            working_dtypes=[torch.float16, torch.float32], handles_tiling=True,
+            upscale_ratio=upscale_ratio, upscale_index_formula=(4, 16, 16),
+            downscale_ratio=(lambda a: max(1, (a - 5) // 17 * 5 + 2) if a > 1 else 1, 16, 16),
+            downscale_index_formula=(4, 16, 16),
+            memory_used_encode=memory_used_encode, memory_used_decode=memory_used_decode)
     raise ValueError("comfy_vae: no comfy/sd.py VAE branch is mirrored for this file, add it to "
                      "adapter._comfy_vae_model")
 
@@ -1491,7 +1566,12 @@ class ComfyVAE:
                 do_tile = True
             if do_tile:
                 mm.soft_empty_cache()
-                x = self.decode_tiled_3d(z) if self.latent_dim == 3 else self.decode_tiled_(z)
+                if getattr(self, "handles_tiling", False):  # _decode_tiled_owned, sd.py:1301-1303
+                    x = self.model.decode_tiled(z)
+                elif self.latent_dim == 3:
+                    x = self.decode_tiled_3d(z)
+                else:
+                    x = self.decode_tiled_(z)
         x = x.to(self.output_device, mm.intermediate_dtype()).clamp(-1.0, 1.0)  # process_output
         x = x.unsqueeze(2) if framed else x
         return DecoderOutput(sample=x) if return_dict else (x,)
@@ -1517,7 +1597,12 @@ class ComfyVAE:
                 do_tile = True
             if do_tile:
                 mm.soft_empty_cache()
-                mu = self.encode_tiled_3d(x) if self.latent_dim == 3 else self.encode_tiled_(x)
+                if getattr(self, "handles_tiling", False):  # _encode_tiled_owned, sd.py:1341-1344
+                    mu = self.model.encode_tiled(x)
+                elif self.latent_dim == 3:
+                    mu = self.encode_tiled_3d(x)
+                else:
+                    mu = self.encode_tiled_(x)
         # Back where and as the pipeline passed it, as a diffusers VAE returns it: the pipeline
         # feeds the latent to its transformer as is (ComfyUI's model casts its input itself).
         mu = mu.to(device, dtype)

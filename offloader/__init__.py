@@ -191,12 +191,17 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
 
     import comfy.model_management as mm
 
-    load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build = _prepare_offload(
-        device, dtype, lambda: adapter.cpu_fits_full_load(model))
-
     # Pipeline + transformer classes come from the runner (turboCLI engine/<name>.py PIPELINE /
     # TRANSFORMER); the transformer meta-loads an oversized transformer for the disk-stream path.
     PipelineCls, Transformer = pipeline_cls, transformer_cls
+
+    # The transformer's folder in the repo, "transformer" unless the pipeline names another (a repo
+    # carrying its own layout beside diffusers', e.g. MiniMax-H3-Image's transformer_diffusers).
+    transformer_folder = getattr(PipelineCls, "transformer_folder", "transformer")
+    transformer_dir = os.path.join(model, transformer_folder)
+
+    load_device, dtype, cpu_stream, manual_cast, operations, use_vbar, build = _prepare_offload(
+        device, dtype, lambda: adapter.cpu_fits_full_load(model, transformer_folder))
 
     # Direct-to-device load, MPS only. On MPS (unified memory) we copy the big models into device
     # memory at load (below) instead of diffusers' CPU load + load_models_gpu's per-leaf
@@ -220,8 +225,8 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
     stream_transformer = use_vbar or cpu_stream
 
     if stream_transformer:
-        transformer, missing = adapter.load_streamed(
-            Transformer, os.path.join(model, "transformer"), dtype, operations)
+        transformer, missing = adapter.load_streamed(Transformer, transformer_dir, dtype,
+                                                     operations)
         if missing:
             print("offloader: %d transformer weights had no matching module (skipped)"
                   % len(missing), flush=True)
@@ -233,7 +238,7 @@ def load_pipe(model, dtype, pipeline_cls, transformer_cls, device="cuda:0", lora
                                         low_cpu_mem_usage=True, local_files_only=True)
         adapter.comfy_ize(p.transformer, operations)
         if direct_load:
-            _direct_load(p.transformer, os.path.join(model, "transformer"), load_device)
+            _direct_load(p.transformer, transformer_dir, load_device)
 
     adapter.keep_uncastable_resident(p.transformer, load_device, manual_cast)
     if stream_transformer and use_vbar:
@@ -425,9 +430,9 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
 
 # ComfyUI's models with an adapter here, each in the module named after it (its model_detection
 # image_model): offloader/qwen_image.py, qwen_image21.py, flux2.py, flux3.py, krea2.py,
-# lumina2.py, moss_image.py.
+# lumina2.py, moss_image.py, minimax_h3_image.py.
 _COMFY_MODELS = ("qwen_image", "qwen_image21", "flux2", "flux3", "krea2", "lumina2",
-                 "moss_image")
+                 "moss_image", "minimax_h3_image")
 
 
 def _comfy_model(name):
@@ -503,13 +508,18 @@ def comfy_vae(path, config):
     return adapter.ComfyVAE(path, config)
 
 
-def comfy_sampler(model, sampler, scheduler):
-    """KSampler's `sampler` and `scheduler` on ComfyUI's model `model` (its adapter's flow SHIFT),
-    behind the calls a pipeline makes on its scheduler; the pipeline sets its `seed`. See
-    adapter.FlowSampler."""
+def comfy_sampler(model, sampler, scheduler, file=None):
+    """KSampler's `sampler` and `scheduler` on ComfyUI's model `model` (its adapter's flow SHIFT,
+    or the model sampling its adapter reads off the transformer's `file`), behind the calls a
+    pipeline makes on its scheduler; the pipeline sets its `seed`. See adapter.FlowSampler."""
     from . import adapter
 
-    return adapter.FlowSampler(sampler, scheduler, _comfy_model(model).SHIFT)
+    module = _comfy_model(model)
+
+    if hasattr(module, "sampling"):
+        return adapter.FlowSampler(sampler, scheduler, 1.0, **module.sampling(file))
+
+    return adapter.FlowSampler(sampler, scheduler, module.SHIFT)
 
 
 def prepare(pipe):

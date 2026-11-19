@@ -41,7 +41,8 @@ Packages (whole dir): `comfy_types/`, `weight_adapter/`.
 
 Model code, for the VAEs an engine runs as ComfyUI's own (`comfy_vae`, category 3):
 `ldm/wan/vae.py` (Wan 2.1: Qwen-Image, Krea 2), `ldm/wan/vae2_2.py` (Wan 2.2 layout: Qwen-Image
-2.1), `ldm/models/autoencoder.py` (the FLUX.2 VAE: MOSS-Image), and what they import,
+2.1), `ldm/models/autoencoder.py` (the FLUX.2 VAE: MOSS-Image), `ldm/minimax/vae.py` (the
+MiniMax-H3-Image VAE), and what they import,
 `ldm/modules/diffusionmodules/model.py` (with that package's empty `__init__.py`),
 `ldm/modules/distributions/` (whole dir), `ldm/modules/ema.py`; and `diffusers_convert.py`, which
 sd.py runs on a VAE file in diffusers' layout.
@@ -49,8 +50,8 @@ sd.py runs on a VAE file in diffusers' layout.
 Model code, for the transformers an engine runs as ComfyUI's own (category 3):
 `ldm/qwen_image/model.py` (Qwen-Image, Qwen-Image-Edit), `ldm/qwen_image21/model.py` (Qwen-Image
 2.1), `ldm/flux/model.py` (FLUX.2), `ldm/flux3/model.py` (FLUX.3), `ldm/krea2/model.py` (Krea 2),
-`ldm/lumina/model.py` (Z-Image), `ldm/moss_image/model.py` (MOSS-Image), and what they import when
-they load: `ldm/flux/layers.py`, `ldm/flux/math.py`, `ldm/lightricks/model.py`,
+`ldm/lumina/model.py` (Z-Image), `ldm/moss_image/model.py` (MOSS-Image), `ldm/minimax/model.py`
+(MiniMax-H3-Image, the H3 DiT), and what they import when they load: `ldm/flux/layers.py`, `ldm/flux/math.py`, `ldm/lightricks/model.py`,
 `ldm/lightricks/symmetric_patchifier.py`, `ldm/modules/attention.py`,
 `ldm/modules/sub_quadratic_attention.py`, `ldm/modules/diffusionmodules/util.py`,
 `ldm/modules/diffusionmodules/mmdit.py`, `ldm/chroma_radiance/layers.py`, `ldm/util.py`,
@@ -61,7 +62,8 @@ Model code, for the text encoders an engine runs as ComfyUI's own (category 3):
 `text_encoders/qwen_image.py` (Qwen2.5-VL-7B), `text_encoders/qwen_image21.py` (Qwen3-VL-8B),
 `text_encoders/flux.py` (FLUX.2's Qwen3 4B and 8B, FLUX.3's Qwen3-VL-4B), `text_encoders/krea2.py`
 (Krea 2's Qwen3-VL-4B), `text_encoders/z_image.py` (Qwen3 4B), `text_encoders/moss_image.py`
-(MOSS-Image's Qwen3.5 9B), and what they import when they load: `text_encoders/qwen3vl.py`,
+(MOSS-Image's Qwen3.5 9B), `text_encoders/minimax.py` (H3's Qwen3-VL 32B), and what they import
+when they load: `text_encoders/qwen3vl.py`,
 `text_encoders/qwen35.py`, `text_encoders/qwen_vl.py`, `text_encoders/llama.py`,
 `text_encoders/sd3_clip.py`, `text_encoders/t5.py`, `text_encoders/bpe_tokenizer.py`,
 `sd1_clip.py`, `sdxl_clip.py`, `clip_model.py`, with the tokenizer files they read,
@@ -95,10 +97,11 @@ needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.p
 
 | upstream | in adapter.py | what |
 |---|---|---|
-| `VAE.__init__` branches, sd.py:846-887, :678-716 on the defaults of :509-519 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:872-887), Qwen-Image 2.1 (:849-859), the FLUX.2 VAE (:678-716, its small decoder too) |
+| `VAE.__init__` branches, sd.py:846-887, :678-716 on the defaults of :509-519 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:872-887), Qwen-Image 2.1 (:849-859), the FLUX.2 VAE (:678-716, its small decoder too), the MiniMax-H3-Image VAE (:1050-1124, its image branch: the release's latent statistics, `handles_tiling`, its memory estimates) |
 | sd.py:503-505; end of `VAE.__init__`, sd.py:1166-1188; `VAELoader.load_vae`, nodes.py:857 | `ComfyVAE._build` | the file read (a diffusers layout converted), device, dtype, the patcher, the weight load |
 | `VAE.decode`, sd.py:1360-1410; `VAE.encode`, sd.py:1513-1562 | `ComfyVAE.decode` / `encode` | `load_models_gpu` with the estimate, the out-of-memory fallback; unlike sd.py, `encode` returns the caller's dtype, as the pipeline feeds it to its transformer |
 | `decode_tiled_`, `decode_tiled_3d` (sized at sd.py:1425-1448), `encode_tiled_`, `encode_tiled_3d` | the same names on `ComfyVAE` | the tiled fallbacks |
+| `_decode_tiled_owned`, sd.py:1301-1303; `_encode_tiled_owned`, sd.py:1341-1344 | `ComfyVAE.decode` / `encode` | the fallback of a VAE that tiles itself (`handles_tiling`) |
 | main.py:318-319 | `enable_vbar` | `CoreModelPatcher` becomes `ModelPatcherDynamic` |
 
 Adding a VAE: vendor its `comfy/ldm/` model file and what it imports (category 1), add its `sd.py`
@@ -114,7 +117,7 @@ around the model is mirrored there (v0.45.4):
 
 | upstream | in offloader/ | what |
 |---|---|---|
-| `load_diffusion_model_state_dict`, sd.py:2460-2555; model_base.py:184-187 | `adapter.load_comfy_single_file` | the file read, its quantization, ComfyUI's ops for the storage and compute dtypes (sd.py:2529-2538), the build and the weight load, assigned only under a dynamic patcher (sd.py:2551) |
+| `load_diffusion_model_state_dict`, sd.py:2460-2555; model_base.py:184-197 | `adapter.load_comfy_single_file` | the file read, its quantization, ComfyUI's ops for the storage and compute dtypes (sd.py:2529-2538), the build, its dtypes archived (model_base.py:197: the patcher loads a file's tensor in its layer's dtype) and the weight load, assigned only under a dynamic patcher (sd.py:2551) |
 | `BaseModel`, model_base.py:174-276 (`_apply_model`'s options, :254-257); `model_lora_keys_unet`'s generic entries, lora.py:200-207 | `adapter.BaseModel` | what every model shares: what the patcher and the pipeline read off it (a `cache_context` that keeps nothing), its LoRA keys |
 | `count_blocks`, model_detection.py:9-20 | `adapter.count_blocks` | how many blocks a prefix numbers, for each model's `detect` |
 | the grids `process_img` builds per image (e.g. ldm/flux/model.py, ldm/flux3/model.py) | `adapter.id_grids` | each grid's size off a pipeline's position ids, read once per run |
@@ -144,6 +147,11 @@ around the model is mirrored there (v0.45.4):
 | `TextEncodeMOSSImageEdit` (Moss-Image-Edit), nodes_moss_image.py:95-149; `ImageScaleToTotalPixels`, nodes_post_processing.py:249-258 | `moss_image.MOSSImage.edit`, `_scale`, `_encode` | the source at about 1 MP on the 16 grid, encoded by ComfyUI's VAE (`comfy_vae`) |
 | `MOSSImage.extra_conds`' `ref_kv`, model_base.py:2966-2974 | `moss_image.MOSSImage.extra_conds` | the references' keys and values once, before sampling |
 | `model_lora_keys_unet`, lora.py:361-371 | `moss_image.MOSSImage.lora_keys` | bare module paths, a fused qkv by its three projections |
+| model_detection.py:401-434 (the image branch, the `config` metadata; Comfy-Org's file is the curve form, an `adaln_t_table`) | `minimax_h3_image.detect`, `_config` | MiniMax-H3-Image's settings off its file, the PDD heads' count and grid off its header |
+| `MiniMaxH3ImageModelSampling`, ldm/minimax/sampling.py:7-32 | `minimax_h3_image.sampling` | the sigma `FlowSampler` runs on: linear in the PDD grid's index |
+| `model_base.MiniMaxH3Image` and `MiniMaxH3.extra_conds`, model_base.py:2254-2307, :2429-2441; `BaseModel._apply_model`, model_base.py:221-263 | `minimax_h3_image.MiniMaxH3Image` | the model ComfyUI samples: the text refined once, the payload (token tags, references, the KSampler's seed, the packed layout), the sampler's sigmas for the PDD heads |
+| `MiniMaxH3ImageConditioning`, nodes_minimax_h3.py:673-747; `ResizeImageMaskNode`'s scale_total_pixels and scale_to_multiple_cover, nodes_post_processing.py:356-416 | `minimax_h3_image.MiniMaxH3Image.edit`, `extra_conds`, `_source`, `_short_edge` | the edit template's source, sized once (4 MP, then the 32 grid, by area) for both copies, at a 1024 to 2048 short edge for ComfyUI's VAE, encoded after the text encoder (the VAE sizes its tiles to the free VRAM) |
+| `model_lora_keys_unet`, lora.py:426-434 | `minimax_h3_image.MiniMaxH3Image.lora_keys` | bare module paths, a single-head LoRA on the PDD bank's head 0 |
 
 ### ComfyUI's sampler, behind a pipeline's scheduler
 
@@ -155,7 +163,7 @@ and checked against them bit for bit:
 
 | upstream | in adapter.py | what |
 |---|---|---|
-| `ModelSamplingDiscreteFlow`, model_sampling.py:289-336 | `FlowSampler._table`, `_sigma`, `percent_to_sigma` | the shifted sigma table |
+| `ModelSamplingDiscreteFlow`, model_sampling.py:289-336 | `FlowSampler._table`, `_sigma`, `percent_to_sigma` | the shifted sigma table, or the table of a model's own sigma (`sigma=`, a model sampling such as MiniMax-H3-Image's) |
 | `simple_scheduler`, `normal_scheduler`, samplers.py:645-693; the sigmas on the device, samplers.py:1257 | `FlowSampler._schedule`, `set_timesteps` | the schedules |
 | `calculate_denoised` (CONST), model_sampling.py:35-37 | `FlowSampler.step` | the denoised off the model's velocity |
 | `sample_euler`, k_diffusion/sampling.py:190-212 | `FlowSampler.step` | one Euler step |
@@ -180,6 +188,7 @@ does. sd.py is not vendored (see above), so what it does for a text encoder is m
 | sd.py:2088-2091 | `flux3.TextEncoder` | FLUX.3's Qwen3-VL-4B |
 | sd.py:2046-2052 | `lumina2.TextEncoder` | Z-Image's Qwen3 4B |
 | sd.py:2066-2070 | `moss_image.TextEncoder` | MOSS-Image's Qwen3.5 9B |
+| sd.py:1841-1843, :2126-2128; `MiniMaxH3ImageConditioning`, nodes_minimax_h3.py:736-739 | `minimax_h3_image.TextEncoder` | H3's Qwen3-VL 32B, the prompt after each picture labeled "Picture n: ", seen at a 1024 short edge, and its token tags |
 
 A Krea 2 edit runs the forward of the comfyui-krea2edit node pack (v2.0.0, Apache-2.0,
 `__init__.py`), what a ComfyUI user runs for it, on the path its `fit` mode takes. Re-sync it
@@ -272,5 +281,8 @@ silently disabling fp8 and the kitchen RoPE.
    the VAE, decode one latent with a comfy- engine and with ComfyUI and compare the images. For
    `FlowSampler`, run ComfyUI's `simple` / `normal` schedulers and `sample_euler` /
    `sample_er_sde` on a stand-in model next to it: on CUDA they must be bit-identical.
+   comfy-minimax-h3-image's images are identical with ComfyUI's (`test/modal.sh run --big
+   --repeat 2 --comfy /opt/ComfyUI comfy-minimax-h3-image`): its 6 steps turn any drift into
+   another picture, so a mirror off by a bf16 rounding shows there first.
    The test laptop throttles: interleave the runs (A, B, A, B) and trust a delta only once a
    second pair reproduces it.

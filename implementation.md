@@ -19,7 +19,7 @@ offloader/
   __init__.py   backend seam the runner drives (pre_torch_init/available/supports/load_pipe/...)
   adapter.py    the thin middleman -- the only real logic in the package
   <model>.py    one adapter per ComfyUI model an engine runs as ComfyUI's own (qwen_image,
-                qwen_image21, flux2, flux3, krea2, lumina2, moss_image)
+                qwen_image21, flux2, flux3, krea2, lumina2, moss_image, minimax_h3_image)
   comfy/        byte-for-byte ComfyUI offloading snapshot (see resync.md)
 ```
 
@@ -44,8 +44,8 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `prepare(pipe)` | `load_models_gpu` of the sampling models (the encoder loads at encode, as each ComfyUI node loads its own model): place them on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory` |
 | `reclaim(pipe)` | end a run the VAE decode did not end (`_end_sampling`: `current_patcher = None` as ComfyUI's `cleanup` does, then `node_teardown`), then `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
-| `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1), `comfy-moss-image` (FLUX.2, its small decoder, in fp16 as ComfyUI picks it). |
-| `comfy_sampler(model, sampler, scheduler)` | opt in to ComfyUI's own KSampler for a template that samples otherwise than diffusers' schedulers: `adapter.FlowSampler`, behind the scheduler calls a pipeline makes (`set_timesteps`, `timesteps`, `sigmas`, `step`), on ComfyUI's model `model`'s flow shift; the pipeline sets its `seed`. The `simple` and `normal` schedulers, `euler` and `er_sde` with its seeded noise, bit-identical to ComfyUI's on CUDA; `resync.md` lists the mirrored lines. Used by `comfy-moss-image`. |
+| `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1), `comfy-moss-image` (FLUX.2, its small decoder, in fp16 as ComfyUI picks it), `comfy-minimax-h3-image` (the MiniMax-H3-Image VAE, a 2D ViT decoder that tiles itself and decodes to [0, 1]). |
+| `comfy_sampler(model, sampler, scheduler, file=None)` | opt in to ComfyUI's own KSampler for a template that samples otherwise than diffusers' schedulers: `adapter.FlowSampler`, behind the scheduler calls a pipeline makes (`set_timesteps`, `timesteps`, `sigmas`, `step`), on ComfyUI's model `model`'s flow shift, or on the model sampling its adapter reads off the transformer's `file` (`sampling`: MiniMax-H3-Image's PDD grid); the pipeline sets its `seed`. The `simple` and `normal` schedulers, `euler` and `er_sde` with its seeded noise, bit-identical to ComfyUI's on CUDA; `resync.md` lists the mirrored lines. Used by `comfy-moss-image` and `comfy-minimax-h3-image`. |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
 
@@ -382,12 +382,25 @@ Sampling only (the sampler's first to last step, stamped as printed), turbo agai
 | comfy-z-image-turbo | text to image | 5.92 s | 6.26 s | −5% | 47.6 dB |
 | comfy-moss-image | text to image | 9.17 s | 9.28 s | −1% | 40.4 dB |
 | comfy-moss-image | image to image | 11.17 s | 11.13 s | 0% | 30.8 dB |
+| comfy-minimax-h3-image | text to image | 5.22 s | 5.19 s | +1% | identical |
+| comfy-minimax-h3-image | image to image | 8.81 s | 8.76 s | +1% | identical |
+
+MiniMax-H3-Image, added after on the 224 GiB container (`modal.sh run --big`), is made for 4 to
+20 MP: at 2048² sampling took 8.07 s against 8.11 s (edit 12.29 against 12.32), at 4096² (16 MP)
+19.30 s against 19.32 s (edit 25.94 against 26.53), the images identical to ComfyUI's at every
+size. From launch to image turbo is ahead: 22.3 s against 23.1 s at 1024², 26.5 against 27.2 at
+2048², 42.1 against 43.5 at 4096² (edits 28.3 / 31.9 / 52.1 against 29.3 / 32.6 / 54.6). At
+2048² both sides' text to image move by one level on a few pixels between a cold and a warm run
+(ComfyUI's VAE sizes its tiles to the free VRAM), the same on both.
 
 Turbo-only on the same run (no ComfyUI graph, or a stock engine): comfy-flux2-9b 5.99 s (edit
 6.53), comfy-flux2-4b edit 5.73, comfy-flux2-9b-distilled edit 3.57, comfy-flux3-6b edit 5.18,
 comfy-qwen-image-2-1 7.90 (edit 8.92), flux2-4b 4.52 (edit 4.57), flux2-9b 4.90 (edit 5.60),
 flux3-6b 7.76 (edit 11.94), z-image-turbo 20.05. MOSS-Image, added after on another L40S:
-moss-image 33.36 (50 steps, CFG 3).
+moss-image 33.36 (50 steps, CFG 3). MiniMax-H3-Image on the 224 GiB container, its 66 GB bf16
+transformer streamed through the card every step: minimax-h3-image 28.12 (edit 34.31) at 1024²,
+rendered on a 4 MP canvas as diffusers does, 23.25 (33.56) at 2048², 86.37 (119.66) at 4096², a
+single cold run.
 
 Read with care:
 
@@ -396,7 +409,9 @@ Read with care:
   against 16.60), the identity edit at −2%, the same images. A container's runs spread ±0.6 s
   (about 4%), and turbo's first run there is 5 to 7 s slower, reading the weights off the Volume
   that ComfyUI then finds cached: compare with `--repeat 2` or more, which now swaps which side
-  goes first.
+  goes first. With `--repeat 1` turbo always goes first, and the cold read grows with the files:
+  comfy-minimax-h3-image at 4096² (49 GB) sampled 23.27 s against 18.90 s (+23%) that way, the
+  first step streaming its weights off the Volume, and 19.30 s against 19.32 s with two repeats.
 - From launch to image, timed alike (ComfyUI from its server's launch, turbo to its `Saved:`
   line), turbo is ahead: comfy-moss-image 20.3 s against 22.6 s, edit 25.0 to 25.2 s against 26.3
   to 26.7 s. Only the first run, turbo's, reading the files cold, is behind (29.6 s against 28.4
@@ -651,7 +666,26 @@ Read with care:
   through ComfyUI's own KSampler (`comfy_sampler`): its template's er_sde draws noise every
   step, which no diffusers scheduler reproduces. Its VAE is ComfyUI's own too (`comfy_vae`):
   an edit turned a 1% difference in its reference (diffusers' VAE in bf16 against ComfyUI's
-  in fp16) into another picture. Every text encoder is ComfyUI's own too (`text_encoder["model"]`,
+  in fp16) into another picture. MiniMax-H3-Image (`minimax_h3_image.py`) has no diffusers call
+  to stand behind (diffusers' H3 transformer takes packed rows and position ids, ComfyUI's packs
+  them itself), so its engine runs a short loop on ComfyUI's call: `extra_conds` encodes an edit's
+  reference (after the text encoder: the H3 VAE sizes its tiles to the free VRAM, and only that
+  order gives ComfyUI's images exactly), refines the text and builds the payload once, as
+  model_base does, and each step passes the sampler's sigmas, from
+  which the PDD heads pick theirs. Its sampler runs on the grid in the file's metadata
+  (`sampling`, `FlowSampler(sigma=)`), and its VAE, ComfyUI's own, tiles itself
+  (`handles_tiling`). A stock repo may keep its diffusers transformer elsewhere than
+  `transformer/` (MiniMax-H3-Image's `transformer_diffusers`): the pipeline names it
+  (`transformer_folder`) and `load_pipe` streams it from there. `load_comfy_single_file`
+  archives the model's dtypes as it builds it, as model_base does (model_base.py:197): the patcher
+  loads a file's tensor in its layer's archived dtype, so a float32 bias in a bf16 layer is bf16,
+  as in ComfyUI. Without it MiniMax-H3-Image's float32 biases stayed float32, a 2e-3 difference
+  its 6 steps turned into another picture (20 dB against ComfyUI, bit-identical with it).
+  `load_streamed` keeps a diffusers model's `_keep_in_fp32_modules` in float32, as
+  `from_pretrained` does. `install_prefetch` takes a top-level `ModuleList` of blocks only (each
+  with layers of its own): MiniMax-H3-Image's six PDD heads, bare Linears of which a step runs
+  one, were prefetched as a sequence, so the head a step ran raced its copy and the image changed
+  between runs. Every text encoder is ComfyUI's own too (`text_encoder["model"]`,
   `adapter.CLIP` mirroring sd.py's): the conditioning is ComfyUI's exactly, where transformers'
   Qwen3-VL and its image processing put a grounded prompt 25-125% off and dropped the face from an
   identity edit. A diffusers VAE gets its input in its own dtype, as ComfyUI's VAE casts it, since

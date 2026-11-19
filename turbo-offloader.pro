@@ -23,6 +23,7 @@ OTHER_FILES += offloader/__init__.py \
                offloader/krea2.py \
                offloader/lumina2.py \
                offloader/moss_image.py \
+               offloader/minimax_h3_image.py \
 
 # Vendored ComfyUI offloading snapshot (byte-for-byte; see resync.md).
 OTHER_FILES += offloader/comfy/__init__.py          \
@@ -55,6 +56,7 @@ OTHER_FILES += offloader/comfy/clip_model.py                                    
                offloader/comfy/text_encoders/flux.py                                \
                offloader/comfy/text_encoders/krea2.py                               \
                offloader/comfy/text_encoders/llama.py                               \
+               offloader/comfy/text_encoders/minimax.py                             \
                offloader/comfy/text_encoders/moss_image.py                          \
                offloader/comfy/text_encoders/qwen25_tokenizer/merges.txt            \
                offloader/comfy/text_encoders/qwen25_tokenizer/tokenizer_config.json \
@@ -82,6 +84,8 @@ OTHER_FILES += offloader/comfy/ldm/chroma_radiance/layers.py            \
                offloader/comfy/ldm/lightricks/model.py                  \
                offloader/comfy/ldm/lightricks/symmetric_patchifier.py   \
                offloader/comfy/ldm/lumina/model.py                      \
+               offloader/comfy/ldm/minimax/model.py                     \
+               offloader/comfy/ldm/minimax/vae.py                       \
                offloader/comfy/ldm/models/autoencoder.py                \
                offloader/comfy/ldm/modules/attention.py                 \
                offloader/comfy/ldm/modules/distributions/__init__.py    \
