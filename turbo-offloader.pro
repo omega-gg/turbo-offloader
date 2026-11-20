@@ -24,6 +24,7 @@ OTHER_FILES += offloader/__init__.py \
                offloader/lumina2.py \
                offloader/moss_image.py \
                offloader/minimax_h3_image.py \
+               offloader/seedvr2.py \
 
 # Vendored ComfyUI offloading snapshot (byte-for-byte; see resync.md).
 OTHER_FILES += offloader/comfy/__init__.py          \
@@ -86,6 +87,10 @@ OTHER_FILES += offloader/comfy/ldm/chroma_radiance/layers.py            \
                offloader/comfy/ldm/lumina/model.py                      \
                offloader/comfy/ldm/minimax/model.py                     \
                offloader/comfy/ldm/minimax/vae.py                       \
+               offloader/comfy/ldm/seedvr/attention.py                  \
+               offloader/comfy/ldm/seedvr/constants.py                  \
+               offloader/comfy/ldm/seedvr/model.py                      \
+               offloader/comfy/ldm/seedvr/vae.py                        \
                offloader/comfy/ldm/models/autoencoder.py                \
                offloader/comfy/ldm/modules/attention.py                 \
                offloader/comfy/ldm/modules/distributions/__init__.py    \

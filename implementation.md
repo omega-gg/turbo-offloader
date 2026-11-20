@@ -19,7 +19,8 @@ offloader/
   __init__.py   backend seam the runner drives (pre_torch_init/available/supports/load_pipe/...)
   adapter.py    the thin middleman -- the only real logic in the package
   <model>.py    one adapter per ComfyUI model an engine runs as ComfyUI's own (qwen_image,
-                qwen_image21, flux2, flux3, krea2, lumina2, moss_image, minimax_h3_image)
+                qwen_image21, flux2, flux3, krea2, lumina2, moss_image, minimax_h3_image,
+                seedvr2)
   comfy/        byte-for-byte ComfyUI offloading snapshot (see resync.md)
 ```
 
@@ -40,11 +41,11 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `available()` | True once the vendored offloader imports (any device) |
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
-| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config}` for the transformer, `{model, file}` for the text encoder) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`, `moss_image.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
+| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config}` for the transformer, `{model, file}` for the text encoder, or `None` for a model whose file holds its text, SeedVR2) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`, `moss_image.py`, `minimax_h3_image.py`, `seedvr2.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
 | `prepare(pipe)` | `load_models_gpu` of the sampling models (the encoder loads at encode, as each ComfyUI node loads its own model): place them on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory`. A model declaring `memory_usage_factor` (supported_models.py's, `lumina2.py`: 2.8) is left out: it loads once right after the pipeline's `prepare_latents`, before the first step, through `BaseModel.prepare_sampling`, with sampler_helpers' estimate for that latent (model_base.memory_required), as KSampler loads it once the noise exists. Without the estimate a big latent's activations pushed part of Z-Image out every step at 4096² on an L40S, which then streamed it back (0.25 s a step, +2 to 3% against ComfyUI); with it the model stays resident |
 | `reclaim(pipe)` | end a run the VAE decode did not end (`_end_sampling`: `current_patcher = None` as ComfyUI's `cleanup` does, then `node_teardown`), then `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
-| `comfy_vae(path, config)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1), `comfy-moss-image` (FLUX.2, its small decoder, in fp16 as ComfyUI picks it), `comfy-minimax-h3-image` (the MiniMax-H3-Image VAE, a 2D ViT decoder that tiles itself and decodes to [0, 1]). |
+| `comfy_vae(path, config, tiled=None)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles, or tiled from the start at `tiled`'s pixel tile and overlap as a template's VAEEncodeTiled / VAEDecodeTiled nodes run a VAE that tiles itself; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1), `comfy-moss-image` (FLUX.2, its small decoder, in fp16 as ComfyUI picks it), `comfy-minimax-h3-image` (the MiniMax-H3-Image VAE, a 2D ViT decoder that tiles itself and decodes to [0, 1]), the comfy-seedvr2 upscalers (the SeedVR2 causal 3D VAE, tiled at 512/128, its latent scaled by `format_encoded`). |
 | `comfy_sampler(model, sampler, scheduler, file=None)` | opt in to ComfyUI's own KSampler for a template that samples otherwise than diffusers' schedulers: `adapter.FlowSampler`, behind the scheduler calls a pipeline makes (`set_timesteps`, `timesteps`, `sigmas`, `step`), on ComfyUI's model `model`'s flow shift, or on the model sampling its adapter reads off the transformer's `file` (`sampling`: MiniMax-H3-Image's PDD grid); the pipeline sets its `seed`. The `simple` and `normal` schedulers, `euler` and `er_sde` with its seeded noise, bit-identical to ComfyUI's on CUDA; `resync.md` lists the mirrored lines. Used by `comfy-moss-image` and `comfy-minimax-h3-image`. |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
@@ -384,6 +385,8 @@ Sampling only (the sampler's first to last step, stamped as printed), turbo agai
 | comfy-moss-image | image to image | 11.17 s | 11.13 s | 0% | 30.8 dB |
 | comfy-minimax-h3-image | text to image | 5.22 s | 5.19 s | +1% | identical |
 | comfy-minimax-h3-image | image to image | 8.81 s | 8.76 s | +1% | identical |
+| comfy-seedvr2-3b-upscale | image to image (2x) | 1.88 s | 1.94 s | −3% | 40.3 dB |
+| comfy-seedvr2-7b-upscale | image to image (2x) | 3.80 s | 4.01 s | −5% | 45.2 dB |
 
 MiniMax-H3-Image, added after on the 224 GiB container (`modal.sh run --big`), is made for 4 to
 20 MP: at 2048² sampling took 8.07 s against 8.11 s (edit 12.29 against 12.32), at 4096² (16 MP)
@@ -392,6 +395,9 @@ size. From launch to image turbo is ahead: 22.3 s against 23.1 s at 1024², 26.5
 2048², 42.1 against 43.5 at 4096² (edits 28.3 / 31.9 / 52.1 against 29.3 / 32.6 / 54.6). At
 2048² both sides' text to image move by one level on a few pixels between a cold and a warm run
 (ComfyUI's VAE sizes its tiles to the free VRAM), the same on both.
+
+SeedVR2's dB came before `ComfyVAE.encode` took ComfyUI's float32 cast ahead of `format_encoded`
+(it scaled the latent in fp16): with it, the 3B's image is identical to ComfyUI's on the A1000.
 
 Turbo-only on the same run (no ComfyUI graph, or a stock engine): comfy-flux2-9b 5.99 s (edit
 6.53), comfy-flux2-4b edit 5.73, comfy-flux2-9b-distilled edit 3.57, comfy-flux3-6b edit 5.18,
@@ -531,15 +537,19 @@ Read with care:
   embeddings move to the compute device — cast to the compute dtype (`manual_cast`, else the
   model dtype, never the storage one fp8 weights keep), as ComfyUI's `_apply_model` casts the
   conditioning (a streamed TE keeps its file's bf16, and flux2 takes its
-  latent dtype from `prompt_embeds`, which then mismatched the fp16 VAE) — and the pipeline's
-  `_execution_device` is pinned to the compute device (per-instance subclass) so
-  timesteps/latents are built to match the transformer.
-  Gated on `te_dev != load_device`, so the streamed paths (VBAR / CPU-stream, TE placed their own
+  latent dtype from `prompt_embeds`, which then mismatched the fp16 VAE). Gated on `te_dev != load_device`, so the streamed paths (VBAR / CPU-stream, TE placed their own
   way) and plain CPU (`text_encoder_device()` → CPU == `load_device`) are unchanged; the effect is
   MPS. ComfyUI's own text encoders (`load_pipe_comfy`) sit where their CLIPLoader puts them.
   Was materialising both transformer + TE on MPS (~15GB); now the TE is CPU-resident.
   Measured on an 8GB M1 (512×512): MPS residency ~15 → 7GB, peak swap 12.8 → 5.3GB, diffusion
   2:26 → 1:46, total 247 → 188s.
+- **The execution device is the compute device (ComfyUI's `CFGGuider.sample`).** Diffusers reads
+  `_execution_device` (read-only) from where the first module sits, and the offloader moves them:
+  a text encoder on CPU (MPS), a transformer that loads once sampling starts (`prepare_sampling`),
+  no text encoder. `_finalize_pipe` pins it to `load_device` for every pipeline (per-instance
+  subclass), as ComfyUI samples on its patcher's `load_device` whatever sits where. It was pinned
+  for an off-device text encoder only, elsewhere assigned (a no-op on the property): SeedVR2's
+  transformer built its latents on the CPU and sampled there, 1334 s against 3.
 - **Streaming is mmap file-sliced + pinned (comfy-aimdo VBAR).** Every big model has its weights
   swapped for mmap file-slices (`load_streamed` / `assign_streamed_weights`), then wrapped in
   ComfyUI's `ModelPatcherDynamic`. The transformer is meta-loaded first (`load_streamed`), so it

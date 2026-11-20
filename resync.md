@@ -42,7 +42,7 @@ Packages (whole dir): `comfy_types/`, `weight_adapter/`.
 Model code, for the VAEs an engine runs as ComfyUI's own (`comfy_vae`, category 3):
 `ldm/wan/vae.py` (Wan 2.1: Qwen-Image, Krea 2), `ldm/wan/vae2_2.py` (Wan 2.2 layout: Qwen-Image
 2.1), `ldm/models/autoencoder.py` (the FLUX.2 VAE: MOSS-Image), `ldm/minimax/vae.py` (the
-MiniMax-H3-Image VAE), and what they import,
+MiniMax-H3-Image VAE), `ldm/seedvr/vae.py` (the SeedVR2 VAE), and what they import,
 `ldm/modules/diffusionmodules/model.py` (with that package's empty `__init__.py`),
 `ldm/modules/distributions/` (whole dir), `ldm/modules/ema.py`; and `diffusers_convert.py`, which
 sd.py runs on a VAE file in diffusers' layout.
@@ -51,7 +51,8 @@ Model code, for the transformers an engine runs as ComfyUI's own (category 3):
 `ldm/qwen_image/model.py` (Qwen-Image, Qwen-Image-Edit), `ldm/qwen_image21/model.py` (Qwen-Image
 2.1), `ldm/flux/model.py` (FLUX.2), `ldm/flux3/model.py` (FLUX.3), `ldm/krea2/model.py` (Krea 2),
 `ldm/lumina/model.py` (Z-Image), `ldm/moss_image/model.py` (MOSS-Image), `ldm/minimax/model.py`
-(MiniMax-H3-Image, the H3 DiT), and what they import when they load: `ldm/flux/layers.py`, `ldm/flux/math.py`, `ldm/lightricks/model.py`,
+(MiniMax-H3-Image, the H3 DiT), `ldm/seedvr/model.py` (SeedVR2's NaDiT, with its
+`attention.py` and `constants.py`), and what they import when they load: `ldm/flux/layers.py`, `ldm/flux/math.py`, `ldm/lightricks/model.py`,
 `ldm/lightricks/symmetric_patchifier.py`, `ldm/modules/attention.py`,
 `ldm/modules/sub_quadratic_attention.py`, `ldm/modules/diffusionmodules/util.py`,
 `ldm/modules/diffusionmodules/mmdit.py`, `ldm/chroma_radiance/layers.py`, `ldm/util.py`,
@@ -97,9 +98,10 @@ needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.p
 
 | upstream | in adapter.py | what |
 |---|---|---|
-| `VAE.__init__` branches, sd.py:846-887, :678-716 on the defaults of :509-519 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:872-887), Qwen-Image 2.1 (:849-859), the FLUX.2 VAE (:678-716, its small decoder too), the MiniMax-H3-Image VAE (:1050-1124, its image branch: the release's latent statistics, `handles_tiling`, its memory estimates) |
+| `VAE.__init__` branches, sd.py:846-887, :678-716 on the defaults of :509-519 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:872-887), Qwen-Image 2.1 (:849-859), the FLUX.2 VAE (:678-716, its small decoder too), the MiniMax-H3-Image VAE (:1050-1124, its image branch: the release's latent statistics, `handles_tiling`, its memory estimates), the SeedVR2 VAE (:609-624: `disable_offload`, `handles_tiling`, `format_encoded`, its own estimates) |
+| `VAEEncodeTiled` / `VAEDecodeTiled`, nodes.py:348-415, through `VAE.encode_tiled` / `decode_tiled`, sd.py:1462-1511, :1571-1621 (the owned branch) | `ComfyVAE._encode_tiled`, `_decode_tiled` (`comfy_vae(..., tiled)`) | a template's tiled VAE nodes: the pixel tile and overlap, the decode's in latent units, its estimate one tile's |
 | sd.py:503-505; end of `VAE.__init__`, sd.py:1166-1188; `VAELoader.load_vae`, nodes.py:857 | `ComfyVAE._build` | the file read (a diffusers layout converted), device, dtype, the patcher, the weight load |
-| `VAE.decode`, sd.py:1360-1410; `VAE.encode`, sd.py:1513-1562 | `ComfyVAE.decode` / `encode` | `load_models_gpu` with the estimate, the out-of-memory fallback; unlike sd.py, `encode` returns the caller's dtype, as the pipeline feeds it to its transformer |
+| `VAE.decode`, sd.py:1360-1410; `VAE.encode`, sd.py:1513-1568 | `ComfyVAE.decode` / `encode` | `load_models_gpu` with the estimate, the out-of-memory fallback, `format_encoded` on the float32 output (`vae_output_dtype`); unlike sd.py, `encode` returns the caller's dtype, as the pipeline feeds it to its transformer |
 | `decode_tiled_`, `decode_tiled_3d` (sized at sd.py:1425-1448), `encode_tiled_`, `encode_tiled_3d` | the same names on `ComfyVAE` | the tiled fallbacks |
 | `_decode_tiled_owned`, sd.py:1301-1303; `_encode_tiled_owned`, sd.py:1341-1344 | `ComfyVAE.decode` / `encode` | the fallback of a VAE that tiles itself (`handles_tiling`) |
 | main.py:318-319 | `enable_vbar` | `CoreModelPatcher` becomes `ModelPatcherDynamic` |
@@ -152,6 +154,9 @@ around the model is mirrored there (v0.45.4):
 | `model_base.MiniMaxH3Image` and `MiniMaxH3.extra_conds`, model_base.py:2254-2307, :2429-2441; `BaseModel._apply_model`, model_base.py:221-263 | `minimax_h3_image.MiniMaxH3Image` | the model ComfyUI samples: the text refined once, the payload (token tags, references, the KSampler's seed, the packed layout), the sampler's sigmas for the PDD heads |
 | `MiniMaxH3ImageConditioning`, nodes_minimax_h3.py:673-747; `ResizeImageMaskNode`'s scale_total_pixels and scale_to_multiple_cover, nodes_post_processing.py:356-416 | `minimax_h3_image.MiniMaxH3Image.edit`, `extra_conds`, `_source`, `_short_edge` | the edit template's source, sized once (4 MP, then the 32 grid, by area) for both copies, at a 1024 to 2048 short edge for ComfyUI's VAE, encoded after the text encoder (the VAE sizes its tiles to the free VRAM) |
 | `model_lora_keys_unet`, lora.py:426-434 | `minimax_h3_image.MiniMaxH3Image.lora_keys` | bare module paths, a single-head LoRA on the PDD bank's head 0 |
+| model_detection.py:714-750 | `seedvr2.detect` | SeedVR2's settings off its file: the 7B with separate or shared MM blocks, or the 3B |
+| `SeedVR2` sampling settings, supported_models.py:1865-1897; `ModelSamplingDiscreteFlow`, model_sampling.py:294-306 | `seedvr2.sampling`, `seedvr2.SeedVR2.memory_usage_factor` | flow at shift 1 and the default ×1000 multiplier; BASE's memory_usage_factor 2.0 |
+| `model_base.SeedVR2`, model_base.py:966-975; `BaseModel._apply_model`, model_base.py:221-263; `SeedVR2Conditioning`, nodes_seedvr.py:395-414 | `seedvr2.SeedVR2` | the model ComfyUI samples: the 17-channel `condition`, the stored positive conditioning as the context at cfg 1 (one branch) |
 
 ### ComfyUI's sampler, behind a pipeline's scheduler
 
@@ -221,6 +226,7 @@ images and speed against ComfyUI's on the same files and template graph.
 | each node's `load_models_gpu` (CLIPTextEncode, KSampler's `prepare_sampling`, `comfy/sampler_helpers.py`:201) after the teardown marks pins inactive (`model_management.py`:1484) | `prepare`, the encode boundary in `_finalize_pipe` | the encoder loads at encode, the sampling models before sampling |
 | the per-node teardown in `execution.py` | `node_teardown`, `_end_sampling` | the sampler to VAE node boundary |
 | `VAE.decode` / `encode` casting their input to the VAE's dtype (e.g. sd.py:1279) | `_finalize_pipe` | a diffusers VAE gets its input in its own dtype, float32 latents from ComfyUI's models included |
+| the sampler on the patcher's `load_device` (`CFGGuider.sample`, `comfy/samplers.py`:1243) | `_finalize_pipe` | the pipeline's `_execution_device` pinned to it, wherever its modules sit |
 | aimdo's `control.init` arguments in `main.py` | `pre_torch_init` | comfy-aimdo's allocator hooks before torch |
 | the `ModelPatcher` constructor (`fast_disk`, as sd.py:2408 passes it) | `adapter.build_dynamic_patcher` | the storage policy of the streamed files |
 | `PromptModelTracker` | `prepare` / `reclaim` | a generation is ComfyUI's prompt |

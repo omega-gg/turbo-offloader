@@ -1507,6 +1507,23 @@ def _comfy_vae_model(sd):
             downscale_ratio=(lambda a: max(1, (a - 5) // 17 * 5 + 2) if a > 1 else 1, 16, 16),
             downscale_index_formula=(4, 16, 16),
             memory_used_encode=memory_used_encode, memory_used_decode=memory_used_decode)
+    if "decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" in sd:
+        # sd.py:609-624, the SeedVR2 VAE: a causal 3D VAE, 16 channels at 1/8, its latent the
+        # posterior mean scaled by format_encoded, loaded whole (disable_offload). It tiles itself
+        # (handles_tiling) and estimates its own memory.
+        import comfy.ldm.seedvr.vae
+
+        model = comfy.ldm.seedvr.vae.VideoAutoencoderKLWrapper()
+        return model, dict(
+            latent_dim=3, latent_channels=comfy.ldm.seedvr.vae.SEEDVR2_LATENT_CHANNELS,
+            output_channels=3, disable_offload=True, handles_tiling=True,
+            working_dtypes=[torch.float16, torch.bfloat16, torch.float32],
+            format_encoded=model.comfy_format_encoded,
+            upscale_ratio=(lambda a: max(0, a * 4 - 3), 8, 8), upscale_index_formula=(4, 8, 8),
+            downscale_ratio=(lambda a: max(0, math.floor((a + 3) / 4)), 8, 8),
+            downscale_index_formula=(4, 8, 8),
+            memory_used_encode=model.comfy_memory_used_encode,
+            memory_used_decode=model.comfy_memory_used_decode)
     raise ValueError("comfy_vae: no comfy/sd.py VAE branch is mirrored for this file, add it to "
                      "adapter._comfy_vae_model")
 
@@ -1518,10 +1535,12 @@ class ComfyVAE:
     out-of-memory fallback to its tiles, the output clamped (process_output). sd.py builds its
     models once ComfyUI's startup picked the patcher; here that is enable_vbar in load_pipe, so the
     file is read and the model built on first use. Any other attribute is the model's (e.g.
-    temperal_downsample)."""
+    temperal_downsample). `tiled`, a (tile_size, overlap) pair in pixels, runs every encode and
+    decode tiled at it, as the VAEEncodeTiled and VAEDecodeTiled nodes do (nodes.py:348-410)."""
 
-    def __init__(self, path, config):
+    def __init__(self, path, config, tiled=None):
         self._path = path
+        self._tiled = tiled
         self.config = SimpleNamespace(**config)  # what the pipeline reads (z_dim, ...)
 
     def __getattr__(self, name):
@@ -1578,19 +1597,23 @@ class ComfyVAE:
         z = (z[:, :, 0] if framed else z).to(self.device, self.vae_dtype)
         do_tile = False
         with mm.cuda_device_context(self.device):
-            try:
-                memory_used = self.memory_used_decode(z.shape, self.vae_dtype)
-                with comfy.model_prefetch.pause_malloc_graph():
-                    mm.load_models_gpu([self.patcher], memory_required=memory_used)
-                if getattr(self.model, "comfy_decode_estimate_is_reliable", False) \
-                        and memory_used > self.patcher.get_free_memory(self.device):
-                    raise mm.OOM_EXCEPTION("decode estimate exceeds free memory")
-                x = self.model.decode(z)
-            except Exception as e:
-                mm.raise_non_oom(e)
-                print("Warning: Ran out of memory when regular VAE decoding, retrying with tiled "
-                      "VAE decoding.", flush=True)
-                do_tile = True
+            if self._tiled is not None:
+                x = self._decode_tiled(z)
+            else:
+                try:
+                    memory_used = self.memory_used_decode(z.shape, self.vae_dtype)
+                    with comfy.model_prefetch.pause_malloc_graph():
+                        mm.load_models_gpu([self.patcher], memory_required=memory_used,
+                                           force_full_load=self._full_load())
+                    if getattr(self.model, "comfy_decode_estimate_is_reliable", False) \
+                            and memory_used > self.patcher.get_free_memory(self.device):
+                        raise mm.OOM_EXCEPTION("decode estimate exceeds free memory")
+                    x = self.model.decode(z)
+                except Exception as e:
+                    mm.raise_non_oom(e)
+                    print("Warning: Ran out of memory when regular VAE decoding, retrying with "
+                          "tiled VAE decoding.", flush=True)
+                    do_tile = True
             if do_tile:
                 mm.soft_empty_cache()
                 if getattr(self, "handles_tiling", False):  # _decode_tiled_owned, sd.py:1301-1303
@@ -1613,15 +1636,19 @@ class ComfyVAE:
         x = (x[:, :, 0] if framed else x).to(self.device, self.vae_dtype)
         do_tile = False
         with mm.cuda_device_context(self.device):
-            try:
-                memory_used = self.memory_used_encode(x.shape, self.vae_dtype)
-                mm.load_models_gpu([self.patcher], memory_required=memory_used)
-                mu = self.model.encode(x)
-            except Exception as e:
-                mm.raise_non_oom(e)
-                print("Warning: Ran out of memory when regular VAE encoding, retrying with tiled "
-                      "VAE encoding.", flush=True)
-                do_tile = True
+            if self._tiled is not None:
+                mu = self._encode_tiled(x)
+            else:
+                try:
+                    memory_used = self.memory_used_encode(x.shape, self.vae_dtype)
+                    mm.load_models_gpu([self.patcher], memory_required=memory_used,
+                                       force_full_load=self._full_load())
+                    mu = self.model.encode(x)
+                except Exception as e:
+                    mm.raise_non_oom(e)
+                    print("Warning: Ran out of memory when regular VAE encoding, retrying with "
+                          "tiled VAE encoding.", flush=True)
+                    do_tile = True
             if do_tile:
                 mm.soft_empty_cache()
                 if getattr(self, "handles_tiling", False):  # _encode_tiled_owned, sd.py:1341-1344
@@ -1630,12 +1657,52 @@ class ComfyVAE:
                     mu = self.encode_tiled_3d(x)
                 else:
                     mu = self.encode_tiled_(x)
+        if getattr(self, "format_encoded", None) is not None:  # in vae_output_dtype, sd.py:1536,
+            mu = self.format_encoded(mu.to(dtype=mm.intermediate_dtype()))  # 1567-1568, 1619-1620
         # Back where and as the pipeline passed it, as a diffusers VAE returns it: the pipeline
         # feeds the latent to its transformer as is (ComfyUI's model casts its input itself).
         mu = mu.to(device, dtype)
         mu = mu.unsqueeze(2) if framed else mu
         dist = SimpleNamespace(mode=lambda: mu, sample=lambda generator=None: mu)
         return AutoencoderKLOutput(latent_dist=dist) if return_dict else (dist,)
+
+    def _full_load(self):
+        # sd.py's force_full_load=self.disable_offload: a VAE loaded whole.
+        return getattr(self, "disable_offload", False)
+
+    def _tiles(self):
+        # The (tile_size, overlap) pair, for the VAEs whose own tiling is mirrored.
+        if not getattr(self, "handles_tiling", False):
+            raise ValueError("comfy_vae: tiled is mirrored for a VAE that tiles itself")
+        return self._tiled
+
+    def _encode_tiled(self, x):
+        # VAEEncodeTiled (nodes.py:399-415) through sd.py's encode_tiled (:1571-1621), for a model
+        # that tiles itself: the whole input's estimate, then _encode_tiled_owned at the pixel
+        # tile and overlap.
+        tile, overlap = self._tiles()
+        mm.load_models_gpu([self.patcher],
+                           memory_required=self.memory_used_encode(x.shape, self.vae_dtype),
+                           force_full_load=self._full_load())
+        return self.model.encode_tiled(x, tile_x=tile, tile_y=tile, overlap=overlap)
+
+    def _decode_tiled(self, z):
+        # VAEDecodeTiled (nodes.py:348-397) through sd.py's decode_tiled (:1481-1511): the tile
+        # and overlap in latent units, the estimate one tile's (_tile_bounded_shape, :1462-1471),
+        # then _decode_tiled_owned (:1301-1303).
+        tile, overlap = self._tiles()
+        if tile < overlap * 4:
+            overlap = tile // 4
+        ratio = self.upscale_ratio[-1] if isinstance(self.upscale_ratio, tuple) \
+            else self.upscale_ratio
+        tile, overlap = tile // ratio, overlap // ratio
+        shape = list(z.shape)
+        if len(shape) == 5:
+            shape[3], shape[4] = min(shape[3], tile), min(shape[4], tile)
+        mm.load_models_gpu([self.patcher],
+                           memory_required=self.memory_used_decode(shape, self.vae_dtype),
+                           force_full_load=self._full_load())
+        return self.model.decode_tiled(z, tile_x=tile, tile_y=tile, overlap=overlap)
 
     def decode_tiled_(self, z, tile_x=64, tile_y=64, overlap=16):
         # sd.py:1273-1295: three tilings, averaged.

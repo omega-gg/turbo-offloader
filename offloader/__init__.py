@@ -335,24 +335,14 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
     p._offloader_patchers = patchers
     p._offloader_device = load_device
 
-    # Diffusers infers _execution_device from module placement. Normally every managed module sits
-    # on the compute device, so the historical best-effort hint below suffices (and CUDA / CPU keep
-    # exactly that path). Only when the text encoder is placed OFF the compute device (te_dev !=
-    # load_device, e.g. MPS -> CPU) would the property resolve to that other device and build the
-    # timesteps/latents there, mismatching the compute-device transformer -- so in that case pin it
-    # to the compute device via a per-instance subclass (ComfyUI runs the sampler on the compute
-    # device regardless of where the text encoder lives). The encode still runs on te_dev because
-    # the bridge below overrides encode_prompt's device argument explicitly.
-    te_off_device = getattr(p, "_offloader_te_device", load_device) != load_device
-    if te_off_device:
-        _cls = type(p)
-        p.__class__ = type(_cls.__name__, (_cls,),
-                           {"_execution_device": property(lambda self: load_device)})
-    else:
-        try:
-            p._execution_device = load_device
-        except Exception:
-            pass
+    # Diffusers reads _execution_device (read-only) from where the first module sits, which the
+    # offloader moves: a text encoder off the compute device (CPU on MPS), a transformer loading
+    # once sampling starts (prepare_sampling), no text encoder. ComfyUI samples on the patcher's
+    # load_device whatever sits where (samplers.py CFGGuider.sample), so the property is pinned to
+    # it. The encode still runs on te_dev: the bridge below passes encode_prompt its own device.
+    _cls = type(p)
+    p.__class__ = type(_cls.__name__, (_cls,),
+                       {"_execution_device": property(lambda self: load_device)})
 
     # NOTE: This might improve performances.
     p.safety_checker = lambda images, **kwargs: (images, [False] * len(images))
@@ -445,9 +435,9 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
 
 # ComfyUI's models with an adapter here, each in the module named after it (its model_detection
 # image_model): offloader/qwen_image.py, qwen_image21.py, flux2.py, flux3.py, krea2.py,
-# lumina2.py, moss_image.py, minimax_h3_image.py.
+# lumina2.py, moss_image.py, minimax_h3_image.py, seedvr2.py.
 _COMFY_MODELS = ("qwen_image", "qwen_image21", "flux2", "flux3", "krea2", "lumina2",
-                 "moss_image", "minimax_h3_image")
+                 "moss_image", "minimax_h3_image", "seedvr2")
 
 
 def _comfy_model(name):
@@ -468,12 +458,14 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
         transformer  = {"model": ComfyUI model name, "file": path,
                         "config": what the pipeline reads off its transformer's config,
                         "lora_names": fn(ComfyUI's LoRA key map)->dict}  # optional aliases
-        text_encoder = {"model": ComfyUI model name, "file": path}  # its TextEncoder
+        text_encoder = {"model": ComfyUI model name, "file": path}  # its TextEncoder, or None
         components   = {<pipeline __init__ arg>: prebuilt module, ...}  # vae/tokenizer/scheduler
     A "file" may also be a list, a model's shards (a diffusers repo's folder). The transformer is
     built with ComfyUI's ops and loads as sd.py loads it, so it prefetches, attends and ropes as
-    ComfyUI's does; the text encoder loads and sits where its CLIPLoader puts it. Then
-    pipeline_cls(transformer=, text_encoder=, **components) and the shared _finalize_pipe tail."""
+    ComfyUI's does; the text encoder loads and sits where its CLIPLoader puts it. A model whose
+    file holds its text (SeedVR2) has no text encoder, and the pipeline none. Then
+    pipeline_cls(transformer=, [text_encoder=,] **components) and the shared _finalize_pipe
+    tail."""
     import os
     import torch  # noqa: F401
     from . import adapter
@@ -481,7 +473,9 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
     import comfy.model_management as mm
 
     def _fits_full_load():
-        big = adapter.as_files(transformer["file"]) + adapter.as_files(text_encoder["file"])
+        big = adapter.as_files(transformer["file"])
+        if text_encoder is not None:
+            big += adapter.as_files(text_encoder["file"])
         cpu = torch.device("cpu")
         return 2 * sum(os.path.getsize(f) for f in big) <= mm.get_total_memory(cpu) * 0.85
 
@@ -502,6 +496,11 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
         n = adapter.add_lora(tf_patcher, lora_files, key_map=key_map)
         print("offloader: applied %d LoRA patches" % n, flush=True)
 
+    if text_encoder is None:
+        p = pipeline_cls(transformer=tf, **components)
+
+        return _finalize_pipe(p, [tf_patcher], load_device, cpu_stream, manual_cast or dtype)
+
     te = _comfy_model(text_encoder["model"]).TextEncoder(text_encoder["file"])
 
     p = pipeline_cls(transformer=tf, text_encoder=te, **components)
@@ -513,14 +512,16 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
                           manual_cast or dtype)
 
 
-def comfy_vae(path, config):
+def comfy_vae(path, config, tiled=None):
     """Opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file at `path` (its
     code vendored under comfy/ldm/), read and run the way ComfyUI does, behind the calls a
     diffusers pipeline makes. `config` is what the pipeline reads off the VAE's config (z_dim,
-    latent statistics). See adapter.ComfyVAE and adapter._comfy_vae_model."""
+    latent statistics). `tiled`, a (tile_size, overlap) pair in pixels, runs it as the
+    VAEEncodeTiled and VAEDecodeTiled nodes do, for a template that names them. See
+    adapter.ComfyVAE and adapter._comfy_vae_model."""
     from . import adapter
 
-    return adapter.ComfyVAE(path, config)
+    return adapter.ComfyVAE(path, config, tiled)
 
 
 def comfy_sampler(model, sampler, scheduler, file=None):
