@@ -114,6 +114,24 @@ def sampling(weight_file):
     return {"multiplier": multiplier, "sigma": sigma}
 
 
+def lora_keys(model, key_map):
+    """model_lora_keys_unet's MiniMaxH3 entries (lora.py:425-434) over the generic `key_map`:
+    bare module paths, and with a baked PDD bank a single-head LoRA on head 0 of each output
+    head (video, and audio where there is one), the base of every interval's head."""
+    for k, _ in model.named_parameters():
+        if k.startswith("diffusion_model.") and k.endswith(".weight"):
+            key_map[k[len("diffusion_model."):-len(".weight")]] = k
+
+    final = model.diffusion_model.final_layer
+    if final.pdd_steps > 1:
+        heads = {"diffusion_model.final_layer.%s.weight" % name:
+                 getattr(final, name).weight.shape[0] // final.pdd_steps
+                 for name in ("video_out", "audio_out") if getattr(final, name) is not None}
+        key_map.update({key: (to, (0, 0, heads[to])) for key, to in key_map.items()
+                        if to in heads})
+    return key_map
+
+
 def _upscale(image, width, height, method):
     """common_upscale on an IMAGE, crop disabled."""
     samples = image.movedim(-1, 1)
@@ -230,21 +248,7 @@ class MiniMaxH3Image(adapter.BaseModel):
         return (out.float(),)
 
     def lora_keys(self):
-        """model_lora_keys_unet's entries for this model (lora.py:426-434) over the generic ones:
-        bare module paths, and a single-head LoRA on the PDD bank's head 0, the base of every
-        interval's head."""
-        key_map = super().lora_keys()
-        for k, _ in self.named_parameters():
-            if k.startswith("diffusion_model.") and k.endswith(".weight"):
-                key_map[k[len("diffusion_model."):-len(".weight")]] = k
-
-        pdd_steps = self.diffusion_model.final_layer.pdd_steps
-        head = "diffusion_model.final_layer.video_out.weight"
-        if pdd_steps > 1:
-            rows = self.diffusion_model.final_layer.video_out.weight.shape[0] // pdd_steps
-            key_map.update({key: (head, (0, 0, rows)) for key, to in key_map.items()
-                            if to == head})
-        return key_map
+        return lora_keys(self, super().lora_keys())
 
 
 class TextEncoder(adapter.CLIP):

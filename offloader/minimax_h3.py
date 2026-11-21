@@ -56,11 +56,6 @@ import comfy.utils
 SHIFT       = 12.0
 AUDIO_SHIFT = 3.0
 
-# nodes_minimax_h3.py's grid of the reference images, and the frames the audio latent counts per
-# pixel frame on the shared time axis.
-_GRID = 32
-_FRAME_RESCALE = h3.FRAME_RESCALE
-
 
 def detect(sd, config):
     """model_detection.py:401-434 (no key prefix), the audio branch: the image branch's settings
@@ -104,23 +99,16 @@ def _encode_audio(audio_vae, audio):
         samples = samples[..., :channels]
     elif samples.shape[-1] < channels:
         samples = torch.nn.functional.pad(samples, (0, channels - samples.shape[-1]),
-                                          mode="replicate")
+                                          mode=audio_vae.pad_channel_value)
     z = audio_vae.encode(samples.movedim(-1, 1)).latent_dist.mode()
     return z, z.shape[-1]
 
 
 def sampling(weight_file):
-    """ModelSamplingAV (model_sampling.py:289-357) for adapter.FlowSampler: the sigma of
-    ModelSamplingDiscreteFlow at shift 12 (time_snr_shift) and its default multiplier, so the
-    model takes sigma × 1000 as its timestep. The audio stream rides the same schedule, scaled by
-    MiniMaxH3.audio_scale."""
-    multiplier = 1000.0
-
-    def sigma(timestep):
-        t = timestep / multiplier
-        return SHIFT * t / (1 + (SHIFT - 1) * t)
-
-    return {"multiplier": multiplier, "sigma": sigma}
+    """ModelSamplingAV (model_sampling.py:289-357) for adapter.FlowSampler: flow at SHIFT
+    (comfy_sampler passes it) with the default multiplier, the model's timestep sigma × 1000. The
+    audio stream rides the same schedule, scaled by MiniMaxH3.audio_scale."""
+    return {"multiplier": 1000.0}
 
 
 class MiniMaxH3(adapter.BaseModel):
@@ -169,8 +157,9 @@ class MiniMaxH3(adapter.BaseModel):
             image = adapter.load_image(image)
             h, w = image.shape[1], image.shape[2]
             scale = min(1.0, math.sqrt((width * height) / (w * h)))
-            tw = max(_GRID, round(w * scale / _GRID) * _GRID)
-            th = max(_GRID, round(h * scale / _GRID) * _GRID)
+            grid = h3_image._GRID  # nodes_minimax_h3.py's, the reference images'
+            tw = max(grid, round(w * scale / grid) * grid)
+            th = max(grid, round(h * scale / grid) * grid)
             resized = _resize(image[:1], tw, th, "disabled")
             items.append({"type": "image", "data": resized})
             refs.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16,
@@ -202,8 +191,8 @@ class MiniMaxH3(adapter.BaseModel):
             keyframe["latent"] = _encode(vae, frames)
         if audio is not None:
             z, length = _encode_audio(audio_vae, adapter.load_audio(audio))
-            # the streams share one time axis: _FRAME_RESCALE per pixel frame
-            limit = math.floor(shapes[1][-1] - _FRAME_RESCALE * index)
+            # the streams share one time axis: FRAME_RESCALE audio frames per pixel frame
+            limit = math.floor(shapes[1][-1] - h3.FRAME_RESCALE * index)
             if limit < 1:
                 raise ValueError("frame_idx {} is past the end of the video's audio track".format(
                     frame_idx))
@@ -258,13 +247,7 @@ class MiniMaxH3(adapter.BaseModel):
         return (comfy.utils.pack_latents(out)[0].float(),)
 
     def lora_keys(self):
-        """model_lora_keys_unet's entries for this model (lora.py:421-432) over the generic ones:
-        bare module paths. The video files have one output head (pdd_steps 1), so no PDD bank."""
-        key_map = super().lora_keys()
-        for k, _ in self.named_parameters():
-            if k.startswith("diffusion_model.") and k.endswith(".weight"):
-                key_map[k[len("diffusion_model."):-len(".weight")]] = k
-        return key_map
+        return h3_image.lora_keys(self, super().lora_keys())
 
 
 class TextEncoder(h3_image.TextEncoder):

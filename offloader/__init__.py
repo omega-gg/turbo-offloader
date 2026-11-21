@@ -306,8 +306,9 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
     from . import adapter
     import comfy.model_management as mm
 
-    # Small resident modules (the VAEs, MiniMax H3's audio one too) go straight to the compute
-    # device; the offloader handles the heavy ones. VAE tiling/slicing is left to the caller.
+    # Small resident modules go straight to the compute device, the offloader handling the heavy
+    # ones: diffusers' VAEs, the stock minimax-h3's audio one too (a ComfyVAE places itself, its
+    # .to() a no-op). VAE tiling/slicing is left to the caller.
     for name in ("vae", "audio_vae"):
         vae = getattr(p, name, None)
         if vae is None:
@@ -540,7 +541,8 @@ def comfy_sampler(model, sampler, scheduler, file=None):
     module = _comfy_model(model)
 
     if hasattr(module, "sampling"):
-        return adapter.FlowSampler(sampler, scheduler, 1.0, **module.sampling(file))
+        return adapter.FlowSampler(sampler, scheduler, getattr(module, "SHIFT", 1.0),
+                                   **module.sampling(file))
 
     return adapter.FlowSampler(sampler, scheduler, module.SHIFT)
 

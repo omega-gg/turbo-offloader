@@ -48,16 +48,16 @@ import torch
 # args.cpu -> cpu_state=CPU, model_management.py:158). We parse no argv, so set args.cpu ourselves
 # when there is no GPU at all, BEFORE model_management imports -- then it initialises cpu_state=CPU
 # and never touches torch.cuda.
+from comfy.cli_args import args as _cli_args  # noqa: E402
+
 _mps = getattr(torch.backends, "mps", None)
 if not torch.cuda.is_available() and not (_mps is not None and _mps.is_available()):
-    from comfy.cli_args import args as _cli_args
     _cli_args.cpu = True
 
 # ComfyUI's --disable-pinned-memory (cli_args.py:207, model_management.py:1639-1652), read when
 # model_management imports: no pinned host copy of the weights. For a GPU that holds the whole
 # model: half the RAM, the same output. OFFLOADER_DISABLE_PINNED_MEMORY=1 sets it.
 if os.environ.get("OFFLOADER_DISABLE_PINNED_MEMORY") == "1":
-    from comfy.cli_args import args as _cli_args
     _cli_args.disable_pinned_memory = True
 
 import comfy.model_management as mm
@@ -1586,6 +1586,7 @@ def _comfy_vae_model(sd, metadata=None):
         return model, dict(
             latent_dim=3, latent_channels=24, output_channels=3,
             working_dtypes=[torch.float16, torch.float32], handles_tiling=True,
+            process_output=lambda image: image,
             upscale_ratio=upscale_ratio, upscale_index_formula=(4, 16, 16),
             downscale_ratio=(lambda a: max(1, (a - 5) // 17 * 5 + 2) if a > 1 else 1, 16, 16),
             downscale_index_formula=(4, 16, 16),
