@@ -53,6 +53,13 @@ if not torch.cuda.is_available() and not (_mps is not None and _mps.is_available
     from comfy.cli_args import args as _cli_args
     _cli_args.cpu = True
 
+# ComfyUI's --disable-pinned-memory (cli_args.py:207, model_management.py:1639-1652), read when
+# model_management imports: no pinned host copy of the weights. For a GPU that holds the whole
+# model: half the RAM, the same output. OFFLOADER_DISABLE_PINNED_MEMORY=1 sets it.
+if os.environ.get("OFFLOADER_DISABLE_PINNED_MEMORY") == "1":
+    from comfy.cli_args import args as _cli_args
+    _cli_args.disable_pinned_memory = True
+
 import comfy.model_management as mm
 import comfy.model_patcher as model_patcher
 import comfy.ops as ops
@@ -712,19 +719,48 @@ def load_image(image):
     return torch.from_numpy(numpy.array(image).astype(numpy.float32) / 255.0)[None]
 
 
+def load_audio(path):
+    """LoadAudio's AUDIO for a file (nodes_audio.py:360-396, 398-430): its first stream decoded
+    with PyAV to float32 PCM, a (1, channels, samples) waveform and its rate."""
+    import av
+
+    with av.open(path) as container:
+        if not container.streams.audio:
+            raise ValueError("No audio stream found in the file.")
+        stream = container.streams.audio[0]
+        rate, channels = stream.codec_context.sample_rate, stream.channels
+        frames = []
+        for frame in container.decode(streams=stream.index):
+            buf = torch.from_numpy(frame.to_ndarray())
+            if buf.shape[0] != channels:
+                buf = buf.view(-1, channels).t()
+            frames.append(buf)
+    if not frames:
+        raise ValueError("No audio frames decoded.")
+    wav = torch.cat(frames, dim=1)
+    if wav.dtype == torch.int16:  # f32_pcm
+        wav = wav.float() / (2 ** 15)
+    elif wav.dtype == torch.int32:
+        wav = wav.float() / (2 ** 31)
+    elif not wav.dtype.is_floating_point:
+        raise ValueError(f"Unsupported wav dtype: {wav.dtype}")
+    return {"waveform": wav[None], "sample_rate": rate}
+
+
 class CLIP:
     """sd.py's CLIP (sd.py:246-310, :332-343, :408-439, :441-455, :471-476, v0.45.4) for a text
     encoder of ComfyUI's own: its tokenizer, its model behind a patcher, and the encode its
     CLIPTextEncode runs. `clip` and `tokenizer` are the model's (its sd.py branch), `state_dict`
     the file's, as load_text_encoder_state_dicts hands them over (sd.py:1887-2232)."""
 
-    def __init__(self, clip, tokenizer, state_dict):
+    def __init__(self, clip, tokenizer, state_dict, dtype=None):
         import comfy.hooks
         import comfy.storage
 
         load_device = mm.text_encoder_device()
         offload_device = mm.text_encoder_offload_device()
-        dtype = mm.text_encoder_dtype(load_device)
+        # text_encoder_dtype, or the dtype a --*-text-enc flag would set (model_management.py:1249)
+        dtype = dtype or mm.text_encoder_dtype(load_device)
         parameters = comfy.utils.calculate_parameters(state_dict)
 
         params = {"dtype": dtype, "model_options": {},
@@ -896,11 +932,12 @@ class FlowSampler:
     citing v0.45.4:
 
       - ModelSamplingDiscreteFlow (model_sampling.py:289-336): the sigma table, percent_to_sigma;
-      - the simple and normal schedulers (samplers.py:645-693), the sigmas on the model's device
-        (samplers.py:1257);
+      - the simple, normal and beta schedulers (samplers.py:645-708), the sigmas on the model's
+        device (samplers.py:1257);
       - calculate_denoised for CONST (model_sampling.py:35-37);
-      - sample_euler (k_diffusion/sampling.py:190-212) and sample_er_sde (:1593-1656), its first
-        sigma offset (:168-176) and its noise (default_noise_sampler, :78-88), one step a call.
+      - sample_euler (k_diffusion/sampling.py:190-212), sample_res_multistep (res_multistep at
+        eta 0, :1462-1529) and sample_er_sde (:1593-1656), its first sigma offset (:168-176) and
+        its noise (default_noise_sampler, :78-88), one step a call.
 
     The initial noise is the pipeline's, as ComfyUI's (sample.py:22-38): the seed's CPU float32
     draw, scaled by a first sigma of 1.
@@ -910,7 +947,8 @@ class FlowSampler:
     on it, as ComfyUI's run on any model sampling."""
 
     def __init__(self, sampler, scheduler, shift, multiplier=1.0, sigma=None):
-        if sampler not in ("euler", "er_sde") or scheduler not in ("simple", "normal"):
+        if sampler not in ("euler", "res_multistep", "er_sde") \
+                or scheduler not in ("simple", "normal", "beta"):
             raise ValueError("FlowSampler: no %s / %s" % (sampler, scheduler))
 
         self.sampler = sampler
@@ -947,6 +985,14 @@ class FlowSampler:
         if self.scheduler == "simple":
             ss = len(s) / steps
             return torch.FloatTensor([float(s[-(1 + int(x * ss))]) for x in range(steps)] + [0.0])
+        if self.scheduler == "beta":  # alpha = beta = 0.6
+            import numpy
+            import scipy.stats
+
+            ts = 1 - numpy.linspace(0, 1, steps, endpoint=False)
+            ts = numpy.rint(scipy.stats.beta.ppf(ts, 0.6, 0.6) * (len(s) - 1))
+            sigs = [float(s[int(t)]) for i, t in enumerate(ts) if i == 0 or t != ts[i - 1]]
+            return torch.FloatTensor(sigs + [0.0])
 
         start, end = s[-1] * self.multiplier, s[0] * self.multiplier
         append_zero = True
@@ -968,7 +1014,7 @@ class FlowSampler:
         self.sigmas = sigmas
         self.timesteps = sigmas[:-1] * self.multiplier
         self._i = 0
-        self._old = self._old_d = self._generator = None
+        self._old = self._old_d = self._old_sigma_down = self._generator = None
 
     def _noise(self, x):
         if self._generator is None and self.seed is not None:
@@ -983,11 +1029,47 @@ class FlowSampler:
 
         if self.sampler == "euler":
             x = x + (x - denoised) / s[i] * (s[i + 1] - s[i])
+        elif self.sampler == "res_multistep":
+            x = self._res_multistep(i, x, denoised)
         else:
             x = self._er_sde(i, x, denoised)
 
         self._i += 1
         return (x,)
+
+    def _res_multistep(self, i, x, denoised):
+        # res_multistep at eta 0 (k_diffusion/sampling.py:1462-1529): sigma_down is the next sigma
+        # and no noise is added; Euler on the first step and onto sigma 0, then the second order
+        # multistep on the previous denoised.
+        s = self.sigmas
+        sigma_down = s[i + 1]
+
+        if sigma_down == 0 or self._old is None:
+            x = x + (x - denoised) / s[i] * (sigma_down - s[i])
+        else:
+            def t_fn(sigma):
+                return sigma.log().neg()
+
+            def phi1_fn(t):
+                return torch.expm1(t) / t
+
+            def phi2_fn(t):
+                return (phi1_fn(t) - 1.0) / t
+
+            t, t_old, t_next, t_prev = t_fn(s[i]), t_fn(self._old_sigma_down), t_fn(sigma_down), \
+                t_fn(s[i - 1])
+            h = t_next - t
+            c2 = (t_prev - t_old) / h
+
+            phi1_val, phi2_val = phi1_fn(-h), phi2_fn(-h)
+            b1 = torch.nan_to_num(phi1_val - phi2_val / c2, nan=0.0)
+            b2 = torch.nan_to_num(phi2_val / c2, nan=0.0)
+
+            x = h.neg().exp() * x + h * (b1 * denoised + b2 * self._old)
+
+        self._old = denoised
+        self._old_sigma_down = sigma_down
+        return x
 
     def _er_sde(self, i, x, denoised):
         s, lam = self.sigmas, self._lambdas
@@ -1374,9 +1456,10 @@ def _vae_memory_used(kind, shape, dtype):
 # is copied here, each piece citing its sd.py lines, so a re-sync diffs those lines between the
 # two tags and ports any change (resync.md, category 3).
 # -------------------------------------------------------------------------------------------------
-def _comfy_vae_model(sd):
-    """sd.py's VAE.__init__ for the files an engine opts in with: the model, from the file's keys,
-    and the settings sd.py gives it. Another file needs its sd.py branch added here."""
+def _comfy_vae_model(sd, metadata=None):
+    """sd.py's VAE.__init__ for the files an engine opts in with: the model, from the file's keys
+    and metadata, and the settings sd.py gives it. Another file needs its sd.py branch added
+    here."""
     if "decoder.middle.0.residual.0.gamma" in sd:  # sd.py:846-887, the Wan VAEs
         wan22_layout = "decoder.upsamples.0.upsamples.0.residual.2.weight" in sd
         head = sd.get("decoder.head.2.weight", None)
@@ -1507,6 +1590,70 @@ def _comfy_vae_model(sd):
             downscale_ratio=(lambda a: max(1, (a - 5) // 17 * 5 + 2) if a > 1 else 1, 16, 16),
             downscale_index_formula=(4, 16, 16),
             memory_used_encode=memory_used_encode, memory_used_decode=memory_used_decode)
+    if "decoder.transformer_blocks.0.scale1" in sd and not (
+            "decoder.proj_out.weight" in sd and sd["decoder.proj_out.weight"].shape[0] == 768):
+        # sd.py:1050-1125, the MiniMax H3 video VAE with its stock decoder: a causal 3D encoder and
+        # a ViT decoder, 24 channels at 1/16, 17k+5 frames to 5k+2 latents, an int8 file through
+        # ComfyUI's mixed-precision ops. It tiles itself (handles_tiling), streams its chunks into
+        # the caller's buffer (comfy_has_chunked_io) and decodes straight to [0, 1]
+        # (process_output is the identity). The Sol and LightVAE decoders are not mirrored.
+        import comfy.ldm.minimax.vae
+        import comfy.ops
+
+        ops = comfy.ops.disable_weight_init
+        quant = comfy.utils.detect_layer_quantization(sd, "")
+        if quant is not None:
+            ops = comfy.ops.mixed_precision_ops(quant, torch.float16)
+        layers = sum(k.startswith("decoder.transformer_blocks.") and k.endswith(".scale1")
+                     for k in sd)
+        still_frame = None
+        if metadata is not None and metadata.get("h3_t1_direct") == "true":
+            still_frame = int(metadata.get("h3_t1_output_slice", 3))
+        kept = {(int(k.split(".")[2]), int(k.split(".")[4])) for k in sd
+                if k.startswith("encoder.down.") and k.endswith(".conv1.weight")}
+        model = comfy.ldm.minimax.vae.MiniMaxH3VideoVAE(
+            operations=ops, num_layers=layers, still_frame=still_frame, encoder_kept_blocks=kept,
+            encoder="encoder.conv_in.weight" in sd, decoder=layers > 0, noncausal_decoder=False)
+        upscale_ratio = (lambda a: max(1, (a - 2) // 5 * 17 + 5), 16, 16)
+        chunk_frames = (model.tokens_chunk_size + model.token_overlap) * model.vae_ratio_t
+
+        def memory_used_encode(shape, dtype):
+            fixed, per_pixel = (110_000_000, 7) if shape[2] == 1 else (1_300_000_000, 9.5)
+            frames = min(shape[2], model.clip_length)
+            return ((per_pixel * frames * shape[3] * shape[4] + fixed) * mm.dtype_size(dtype)
+                    * 1.03)
+
+        def memory_used_decode(shape, dtype):
+            frames = upscale_ratio[0](shape[2])
+            height, width = shape[3] * 16, shape[4] * 16
+            fixed = (150_000_000 if frames == 1 and still_frame is None
+                     else 110_000_000 if frames <= 22 else 270_000_000)
+            frames = min(frames, chunk_frames + 2)
+            return (9.5 * frames * height * width + fixed) * mm.dtype_size(dtype) * 1.03
+
+        return model, dict(
+            latent_dim=3, latent_channels=24, output_channels=3,
+            working_dtypes=[torch.float16, torch.float32], handles_tiling=True,
+            process_output=lambda image: image,
+            upscale_ratio=upscale_ratio, upscale_index_formula=(4, 16, 16),
+            downscale_ratio=(lambda a: max(1, (a - 5) // 17 * 5 + 2) if a > 1 else 1, 16, 16),
+            downscale_index_formula=(4, 16, 16),
+            memory_used_encode=memory_used_encode, memory_used_decode=memory_used_decode)
+    if "pre_block.attn.zero_k_bias" in sd:
+        # sd.py:1127-1147, the MiniMax H3 audio VAE: a DAC encoder and a BigVGAN decoder, stereo at
+        # 32 kHz, 32 channels at 1/800, float32 only; the waveform as it comes (process_output is
+        # the identity).
+        import comfy.ldm.minimax.audio_vae
+
+        return comfy.ldm.minimax.audio_vae.MiniMaxH3AudioVAE(), dict(
+            latent_dim=2, latent_channels=32, output_channels=2, pad_channel_value="replicate",
+            audio_sample_rate=32000, upscale_ratio=800, downscale_ratio=800,
+            working_dtypes=[torch.float32], process_output=lambda audio: audio,
+            memory_used_encode=lambda shape, dtype: ((900 * shape[2] + 105_000_000)
+                                                     * mm.dtype_size(dtype) * 1.03),
+            memory_used_decode=lambda shape, dtype: (max(42_000_000,
+                                                         220 * shape[-1] * 800 + 20_000_000)
+                                                     * mm.dtype_size(dtype) * 1.03))
     if "decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" in sd:
         # sd.py:609-624, the SeedVR2 VAE: a causal 3D VAE, 16 channels at 1/8, its latent the
         # posterior mean scaled by format_encoded, loaded whole (disable_offload). It tiles itself
@@ -1543,6 +1690,12 @@ class ComfyVAE:
         self._tiled = tiled
         self.config = SimpleNamespace(**config)  # what the pipeline reads (z_dim, ...)
 
+    @staticmethod
+    def process_output(x):
+        # sd.py's process_output for the [-1, 1] a diffusers pipeline takes: clamped. A model
+        # that decodes to its own range sets the identity in its _comfy_vae_model settings.
+        return x.clamp(-1.0, 1.0)
+
     def __getattr__(self, name):
         # Only reached for what the instance lacks: build it, then read it off the model.
         if name.startswith("_"):
@@ -1554,14 +1707,16 @@ class ComfyVAE:
         # sd.py:1166-1188, the end of VAE.__init__.
         if "model" in self.__dict__:
             return
-        # As VAELoader reads it (nodes.py:857): under VBAR the weights stay file slices, not RAM.
-        sd = comfy.utils.load_torch_file(self.__dict__.pop("_path"))
+        # As VAELoader reads it (nodes.py:857), with its metadata: under VBAR the weights stay
+        # file slices, not RAM.
+        sd, metadata = comfy.utils.load_torch_file(self.__dict__.pop("_path"),
+                                                   return_metadata=True)
         # sd.py:503-505: a file in diffusers' layout, converted to ComfyUI's.
         if ("decoder.up_blocks.2.upsamplers.0.upscale_conv.weight" not in sd
                 and "decoder.up_blocks.0.resnets.0.norm1.weight" in sd):
             from comfy.diffusers_convert import convert_vae_state_dict
             sd = convert_vae_state_dict(sd)
-        model, settings = _comfy_vae_model(sd)
+        model, settings = _comfy_vae_model(sd, metadata)
         self.__dict__.update(settings)
         self.device = mm.vae_device()
         offload_device = mm.vae_offload_device()
@@ -1572,9 +1727,11 @@ class ComfyVAE:
         self.patcher = model_patcher.CoreModelPatcher(model, load_device=self.device,
                                                       offload_device=offload_device)
         model.current_patcher = self.patcher
-        model.load_state_dict(sd, strict=True, assign=self.patcher.is_dynamic())
+        missing, _ = model.load_state_dict(sd, strict=False, assign=self.patcher.is_dynamic())
         if not self.patcher.is_dynamic():
             model.to(self.vae_dtype)
+        if missing:
+            print("Missing VAE keys %s" % missing, flush=True)
         self.model = model
 
     @property
@@ -1608,7 +1765,15 @@ class ComfyVAE:
                     if getattr(self.model, "comfy_decode_estimate_is_reliable", False) \
                             and memory_used > self.patcher.get_free_memory(self.device):
                         raise mm.OOM_EXCEPTION("decode estimate exceeds free memory")
-                    x = self.model.decode(z)
+                    if getattr(self.model, "comfy_has_chunked_io", False):
+                        # sd.py:1384-1394: the model writes each chunk into the output, there
+                        with comfy.model_prefetch.pause_malloc_graph():
+                            x = torch.empty(self.model.decode_output_shape(z.shape),
+                                            device=self.output_device,
+                                            dtype=mm.intermediate_dtype())
+                        self.model.decode(z, output_buffer=x)
+                    else:
+                        x = self.model.decode(z)
                 except Exception as e:
                     mm.raise_non_oom(e)
                     print("Warning: Ran out of memory when regular VAE decoding, retrying with "
@@ -1622,7 +1787,7 @@ class ComfyVAE:
                     x = self.decode_tiled_3d(z)
                 else:
                     x = self.decode_tiled_(z)
-        x = x.to(self.output_device, mm.intermediate_dtype()).clamp(-1.0, 1.0)  # process_output
+        x = self.process_output(x.to(self.output_device, mm.intermediate_dtype()))
         x = x.unsqueeze(2) if framed else x
         return DecoderOutput(sample=x) if return_dict else (x,)
 
@@ -1960,6 +2125,8 @@ def install_encode_cache(pipe):
             return v
         if isinstance(v, (torch.device, torch.dtype)):
             return str(v)
+        if isinstance(v, dict):  # MiniMax H3's reference items
+            v = tuple(sorted(v.items()))
         if isinstance(v, (list, tuple)):
             parts = tuple(norm(x) for x in v)
             return uncacheable if any(p is uncacheable for p in parts) else parts

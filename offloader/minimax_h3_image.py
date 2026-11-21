@@ -252,11 +252,11 @@ class TextEncoder(adapter.CLIP):
     as its own state dict names it; `encode` is MiniMaxH3ImageConditioning's
     (nodes_minimax_h3.py:736-739)."""
 
-    def __init__(self, path):
+    def __init__(self, path, dtype=None):
         sd = adapter.load_clip_sd(path)
 
         super().__init__(comfy.text_encoders.minimax.te(**adapter.llama_detect(sd)),
-                         comfy.text_encoders.minimax.MiniMaxH3Tokenizer, sd)
+                         comfy.text_encoders.minimax.MiniMaxH3Tokenizer, sd, dtype)
 
     def encode(self, text, sources=()):
         """The conditioning and its token tags: each of MiniMaxH3Image.edit's sources seen at a

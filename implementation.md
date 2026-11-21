@@ -20,7 +20,7 @@ offloader/
   adapter.py    the thin middleman -- the only real logic in the package
   <model>.py    one adapter per ComfyUI model an engine runs as ComfyUI's own (qwen_image,
                 qwen_image21, flux2, flux3, krea2, lumina2, moss_image, minimax_h3_image,
-                seedvr2)
+                minimax_h3, seedvr2)
   comfy/        byte-for-byte ComfyUI offloading snapshot (see resync.md)
 ```
 
@@ -41,11 +41,11 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `available()` | True once the vendored offloader imports (any device) |
 | `supports(engine)` | `True` -- model-agnostic; offload eligibility is a turboCLI-side call |
 | `load_pipe(model, dtype, pipeline_cls, transformer_cls, device, lora_files)` | build a fully-placed diffusers pipeline (below); runner supplies the classes |
-| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config}` for the transformer, `{model, file}` for the text encoder, or `None` for a model whose file holds its text, SeedVR2) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`, `moss_image.py`, `minimax_h3_image.py`, `seedvr2.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
+| `load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, device, lora_files)` | the pipeline of a ComfyUI-reuse engine, its transformer and text encoder ComfyUI's own models. **Model-agnostic**: the engine names each by its ComfyUI model (`{model, file, config}` for the transformer, `{model, file}` for the text encoder, with an optional `dtype` as ComfyUI's `--bf16-text-enc` and kin set it, or `None` for a model whose file holds its text, SeedVR2) plus prebuilt small `components` (vae/tokenizer/scheduler). Each model's adapter in `offloader/` (`qwen_image.py`, `qwen_image21.py`, `flux2.py`, `flux3.py`, `krea2.py`, `lumina2.py`, `moss_image.py`, `minimax_h3_image.py`, `minimax_h3.py`, `seedvr2.py`) runs ComfyUI's transformer behind the pipeline's call, and its `TextEncoder` loads ComfyUI's text encoder as CLIPLoader does, the pipeline encoding through it. |
 | `prepare(pipe)` | `load_models_gpu` of the sampling models (the encoder loads at encode, as each ComfyUI node loads its own model): place them on the compute device; mark them the current prompt (`PromptModelTracker`); `pre_run` each patcher, as a sampling run does, so a model declaring `current_patcher` can ask it for `get_free_memory`. A model declaring `memory_usage_factor` (supported_models.py's, `lumina2.py`: 2.8) is left out: it loads once right after the pipeline's `prepare_latents`, before the first step, through `BaseModel.prepare_sampling`, with sampler_helpers' estimate for that latent (model_base.memory_required), as KSampler loads it once the noise exists. Without the estimate a big latent's activations pushed part of Z-Image out every step at 4096² on an L40S, which then streamed it back (0.25 s a step, +2 to 3% against ComfyUI); with it the model stays resident |
 | `reclaim(pipe)` | end a run the VAE decode did not end (`_end_sampling`: `current_patcher = None` as ComfyUI's `cleanup` does, then `node_teardown`), then `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
-| `comfy_vae(path, config, tiled=None)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles, or tiled from the start at `tiled`'s pixel tile and overlap as a template's VAEEncodeTiled / VAEDecodeTiled nodes run a VAE that tiles itself; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1), `comfy-moss-image` (FLUX.2, its small decoder, in fp16 as ComfyUI picks it), `comfy-minimax-h3-image` (the MiniMax-H3-Image VAE, a 2D ViT decoder that tiles itself and decodes to [0, 1]), the comfy-seedvr2 upscalers (the SeedVR2 causal 3D VAE, tiled at 512/128, its latent scaled by `format_encoded`). |
+| `comfy_vae(path, config, tiled=None)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles, or tiled from the start at `tiled`'s pixel tile and overlap as a template's VAEEncodeTiled / VAEDecodeTiled nodes run a VAE that tiles itself; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1), `comfy-moss-image` (FLUX.2, its small decoder, in fp16 as ComfyUI picks it), `comfy-minimax-h3-image` (the MiniMax-H3-Image VAE, a 2D ViT decoder that tiles itself and decodes to [0, 1]), the comfy-seedvr2 upscalers (the SeedVR2 causal 3D VAE, tiled at 512/128, its latent scaled by `format_encoded`), the comfy-minimax-h3 engines (MiniMax H3's video VAE, a causal 3D encoder and ViT decoder writing its chunks into the output, int8 through ComfyUI's mixed-precision ops, and its audio VAE). The file's metadata comes along, as VAELoader reads it; a model decoding to its own range declares an identity `process_output`, the others' output is clamped to the [-1, 1] a diffusers pipeline takes. |
 | `comfy_sampler(model, sampler, scheduler, file=None)` | opt in to ComfyUI's own KSampler for a template that samples otherwise than diffusers' schedulers: `adapter.FlowSampler`, behind the scheduler calls a pipeline makes (`set_timesteps`, `timesteps`, `sigmas`, `step`), on ComfyUI's model `model`'s flow shift, or on the model sampling its adapter reads off the transformer's `file` (`sampling`: MiniMax-H3-Image's PDD grid); the pipeline sets its `seed`. The `simple` and `normal` schedulers, `euler` and `er_sde` with its seeded noise, bit-identical to ComfyUI's on CUDA; `resync.md` lists the mirrored lines. Used by `comfy-moss-image` and `comfy-minimax-h3-image`. |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
@@ -399,6 +399,13 @@ size. From launch to image turbo is ahead: 22.3 s against 23.1 s at 1024², 26.5
 SeedVR2's dB came before `ComfyVAE.encode` took ComfyUI's float32 cast ahead of `format_encoded`
 (it scaled the latent in fp16): with it, the 3B's image is identical to ComfyUI's on the A1000.
 
+MiniMax H3 video (comfy-minimax-h3, ComfyUI's template files), measured after at 512², 5 s, on
+the 224 GiB container with `--warmup --repeat 2`: sampling 38.36 s against 38.86 s (−1%) for
+text to video, 41.69 s against 41.39 s (+0%) for image to video, the videos identical with
+ComfyUI's (frames and sound decoded); from launch to the saved video 60.3 s against 61.6 s and
+64.8 s against 64.8 s. comfy-minimax-h3-hq is identical with the experimental H3's graph in
+ComfyUI too.
+
 Turbo-only on the same run (no ComfyUI graph, or a stock engine): comfy-flux2-9b 5.99 s (edit
 6.53), comfy-flux2-4b edit 5.73, comfy-flux2-9b-distilled edit 3.57, comfy-flux3-6b edit 5.18,
 comfy-qwen-image-2-1 7.90 (edit 8.92), flux2-4b 4.52 (edit 4.57), flux2-9b 4.90 (edit 5.60),
@@ -440,6 +447,44 @@ Read with care:
 - The stock z-image-turbo (diffusers' model on `load_pipe`) samples 3.4× slower than
   comfy-z-image-turbo on the same weights. Not yet explained.
 - The Qwen-Image-Edit 2511 family is not part of it.
+
+## MiniMax H3 video
+
+- **MiniMax H3, video with its soundtrack (`minimax_h3.py`), as ComfyUI samples it.** The same
+  DiT as MiniMax-H3-Image with its audio stream (model_detection's audio branch), sampled on the
+  flat pack of its two latents as `CFGGuider.sample` packs a NestedTensor: the video
+  (1, 24, t, h/16, w/16) and the audio (1, 32, 2, t), one sigma schedule at shift 12
+  (`ModelSamplingAV`, the default ×1000 multiplier), the audio carried at 12 / 3 =
+  `audio_scale`, which `model_base.MiniMaxH3` scales in and out and the DiT undoes inside its
+  forward. `MiniMaxH3.forward` is `_apply_model`'s: the pack cast to the compute dtype,
+  unpacked, the DiT run on both latents, its two velocities packed back in float32. The
+  keyframes and their latents ride the payload, the noise is RandomNoise's (the seed's CPU
+  draws, video then audio), and the transformer loads with the noise, before `extra_conds`, as
+  KSampler loads it before `process_conds`. `FlowSampler` gained `res_multistep` (eta 0), the
+  template's sampler, checked bit for bit against ComfyUI's on the shift-12 schedule. The
+  text encoder is the image one's with the video node's encode (`"<Picture n>: "`, the
+  keyframes at canvas size); a spec's `dtype` runs it in bf16, as the experimental H3 ran
+  ComfyUI with `--bf16-text-enc`. The audio VAE is vendored (`ldm/minimax/audio_vae.py`).
+- **MiniMax H3 with references (Ref2VA).** `MiniMaxH3.reference_to_video` mirrors
+  MiniMaxH3ReferenceToVideo (the pictures sized to the output's area and encoded, the audio
+  loaded as LoadAudio loads it, resampled by the vendored `comfy/audio.py` and encoded as
+  `VAE.encode` takes it), `add_guide` MiniMaxH3AddGuide (a frame or an audio anchored at a
+  frame), and `extra_conds` carries the `refs`; the text encoder takes the reference items.
+  `FlowSampler` gained the beta scheduler (the experiment's Ref2VA). Loading, resampling and the
+  beta schedule are bit for bit ComfyUI's on the experiment's voice reference. The encode
+  cache keys a dict (a reference item) by its content.
+- **cuDNN attention for a generation.** `MiniMaxH3.attention("cudnn")` puts cuDNN ahead of
+  flash in `comfy.ops.SDPA_BACKEND_PRIORITY`, as the experiment's cudnn_attention.py node
+  does, and restores ComfyUI's order after (turboCLI's `attention=cudnn`). On a B200 at
+  1376x576, 2.23 s a step against 4.6.
+- **No pinned copy (`OFFLOADER_DISABLE_PINNED_MEMORY=1`).** The adapter sets ComfyUI's
+  `--disable-pinned-memory` before `model_management` imports, for a card that holds the
+  whole model. comfy-minimax-h3-hq on a B200 (Indy take, 1376x576, 5 s): the RAM peak 189 GiB
+  to 100 (the files' mapped pages without comfy-aimdo's pinned copy of them), the first video
+  138 s to 94 (the pinning skipped), the next one 52.5 s to 51, the videos identical.
+  `--highvram`, as the experiment ran ComfyUI, would leave 10 GiB once loaded but turns
+  dynamic VRAM off, a second path whose videos differ from the default's (45.1 dB): not
+  mirrored.
 
 ## The node boundary (`node_teardown`)
 

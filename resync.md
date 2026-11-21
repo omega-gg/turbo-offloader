@@ -42,7 +42,9 @@ Packages (whole dir): `comfy_types/`, `weight_adapter/`.
 Model code, for the VAEs an engine runs as ComfyUI's own (`comfy_vae`, category 3):
 `ldm/wan/vae.py` (Wan 2.1: Qwen-Image, Krea 2), `ldm/wan/vae2_2.py` (Wan 2.2 layout: Qwen-Image
 2.1), `ldm/models/autoencoder.py` (the FLUX.2 VAE: MOSS-Image), `ldm/minimax/vae.py` (the
-MiniMax-H3-Image VAE), `ldm/seedvr/vae.py` (the SeedVR2 VAE), and what they import,
+MiniMax-H3-Image and H3 video VAEs), `ldm/minimax/audio_vae.py` (the H3 audio VAE, its
+reference audio resampled by `audio.py`),
+`ldm/seedvr/vae.py` (the SeedVR2 VAE), and what they import,
 `ldm/modules/diffusionmodules/model.py` (with that package's empty `__init__.py`),
 `ldm/modules/distributions/` (whole dir), `ldm/modules/ema.py`; and `diffusers_convert.py`, which
 sd.py runs on a VAE file in diffusers' layout.
@@ -51,7 +53,8 @@ Model code, for the transformers an engine runs as ComfyUI's own (category 3):
 `ldm/qwen_image/model.py` (Qwen-Image, Qwen-Image-Edit), `ldm/qwen_image21/model.py` (Qwen-Image
 2.1), `ldm/flux/model.py` (FLUX.2), `ldm/flux3/model.py` (FLUX.3), `ldm/krea2/model.py` (Krea 2),
 `ldm/lumina/model.py` (Z-Image), `ldm/moss_image/model.py` (MOSS-Image), `ldm/minimax/model.py`
-(MiniMax-H3-Image, the H3 DiT), `ldm/seedvr/model.py` (SeedVR2's NaDiT, with its
+(the H3 DiT: MiniMax-H3-Image, and MiniMax H3's audio-video model), `ldm/seedvr/model.py`
+(SeedVR2's NaDiT, with its
 `attention.py` and `constants.py`), and what they import when they load: `ldm/flux/layers.py`, `ldm/flux/math.py`, `ldm/lightricks/model.py`,
 `ldm/lightricks/symmetric_patchifier.py`, `ldm/modules/attention.py`,
 `ldm/modules/sub_quadratic_attention.py`, `ldm/modules/diffusionmodules/util.py`,
@@ -99,9 +102,11 @@ needs from it is copied into `offloader/adapter.py`, each piece citing its `sd.p
 | upstream | in adapter.py | what |
 |---|---|---|
 | `VAE.__init__` branches, sd.py:846-887, :678-716 on the defaults of :509-519 | `_comfy_vae_model` | the model a file gets and its settings: Wan 2.1 (:872-887), Qwen-Image 2.1 (:849-859), the FLUX.2 VAE (:678-716, its small decoder too), the MiniMax-H3-Image VAE (:1050-1124, its image branch: the release's latent statistics, `handles_tiling`, its memory estimates), the SeedVR2 VAE (:609-624: `disable_offload`, `handles_tiling`, `format_encoded`, its own estimates) |
+| sd.py:1050-1125 (the stock decoder: int8 through `mixed_precision_ops`, `h3_t1_direct` off the metadata, LightVAE's kept blocks), :1127-1147 | `_comfy_vae_model` | MiniMax H3's video and audio VAEs and their settings: ratios, `handles_tiling`, identity `process_output`, the memory estimates; the Sol and noncausal decoders are not mirrored |
 | `VAEEncodeTiled` / `VAEDecodeTiled`, nodes.py:348-415, through `VAE.encode_tiled` / `decode_tiled`, sd.py:1462-1511, :1571-1621 (the owned branch) | `ComfyVAE._encode_tiled`, `_decode_tiled` (`comfy_vae(..., tiled)`) | a template's tiled VAE nodes: the pixel tile and overlap, the decode's in latent units, its estimate one tile's |
-| sd.py:503-505; end of `VAE.__init__`, sd.py:1166-1188; `VAELoader.load_vae`, nodes.py:857 | `ComfyVAE._build` | the file read (a diffusers layout converted), device, dtype, the patcher, the weight load |
+| sd.py:503-505; end of `VAE.__init__`, sd.py:1166-1188; `VAELoader.load_vae`, nodes.py:845-862 | `ComfyVAE._build` | the file read with its metadata (a diffusers layout converted), device, dtype, the patcher, the weight load (not strict, missing keys printed) |
 | `VAE.decode`, sd.py:1360-1410; `VAE.encode`, sd.py:1513-1568 | `ComfyVAE.decode` / `encode` | `load_models_gpu` with the estimate, the out-of-memory fallback, `format_encoded` on the float32 output (`vae_output_dtype`); unlike sd.py, `encode` returns the caller's dtype, as the pipeline feeds it to its transformer |
+| the output pre-allocated for `comfy_has_chunked_io`, sd.py:1384-1394; `process_output` | `ComfyVAE.decode`, `process_output` | a chunked decoder writes into the output on the intermediate device; the output clamped to [-1, 1] for a diffusers pipeline unless the model declares its identity |
 | `decode_tiled_`, `decode_tiled_3d` (sized at sd.py:1425-1448), `encode_tiled_`, `encode_tiled_3d` | the same names on `ComfyVAE` | the tiled fallbacks |
 | `_decode_tiled_owned`, sd.py:1301-1303; `_encode_tiled_owned`, sd.py:1341-1344 | `ComfyVAE.decode` / `encode` | the fallback of a VAE that tiles itself (`handles_tiling`) |
 | main.py:318-319 | `enable_vbar` | `CoreModelPatcher` becomes `ModelPatcherDynamic` |
@@ -154,6 +159,12 @@ around the model is mirrored there (v0.45.4):
 | `model_base.MiniMaxH3Image` and `MiniMaxH3.extra_conds`, model_base.py:2254-2307, :2429-2441; `BaseModel._apply_model`, model_base.py:221-263 | `minimax_h3_image.MiniMaxH3Image` | the model ComfyUI samples: the text refined once, the payload (token tags, references, the KSampler's seed, the packed layout), the sampler's sigmas for the PDD heads |
 | `MiniMaxH3ImageConditioning`, nodes_minimax_h3.py:673-747; `ResizeImageMaskNode`'s scale_total_pixels and scale_to_multiple_cover, nodes_post_processing.py:356-416 | `minimax_h3_image.MiniMaxH3Image.edit`, `extra_conds`, `_source`, `_short_edge` | the edit template's source, sized once (4 MP, then the 32 grid, by area) for both copies, at a 1024 to 2048 short edge for ComfyUI's VAE, encoded after the text encoder (the VAE sizes its tiles to the free VRAM) |
 | `model_lora_keys_unet`, lora.py:426-434 | `minimax_h3_image.MiniMaxH3Image.lora_keys` | bare module paths, a single-head LoRA on the PDD bank's head 0 |
+| model_detection.py:401-434 (the audio branch: `audio_latents_dim`) | `minimax_h3.detect` | MiniMax H3's settings off its file, over the image branch's |
+| `MiniMaxH3` sampling settings, supported_models.py:986-1012; `ModelSamplingAV`, model_sampling.py:289-357 | `minimax_h3.sampling`, `minimax_h3.MiniMaxH3.audio_scale`, `memory_usage_factor` | flow at shift 12 with the default ×1000 multiplier, the audio carried at 12 / 3 |
+| `model_base.MiniMaxH3`, model_base.py:2226-2307; `BaseModel._apply_model`, model_base.py:221-263; `pack_latents` / `unpack_latents`, utils.py:1445-1465; `CFGGuider.sample`'s pack, samplers.py:1281-1284 | `minimax_h3.MiniMaxH3` | the model ComfyUI samples on the flat pack of the video and audio latents: the payload (token tags, keyframes and their latents, seed, audio scale, packed layout), the audio scaled in and out |
+| `model_lora_keys_unet`, lora.py:421-432 | `minimax_h3.MiniMaxH3.lora_keys` | bare module paths (one output head) |
+| `MiniMaxH3ReferenceToVideo`, `MiniMaxH3AddGuide`, `_encode_ref_audio`, nodes_minimax_h3.py:87-95, :182-381; `vae_encode_crop_pixels` for the audio VAE, sd.py:1245-1267 | `minimax_h3.MiniMaxH3.reference_to_video`, `add_guide`, `_encode_audio` | the references (pictures to the output's area on the 32 grid, audio resampled to 32 kHz, cut to whole latent frames, stereo) and the guides (a frame center-cropped, an audio cut to what is left of the soundtrack) |
+| `MiniMaxH3.extra_conds`' refs, model_base.py:2254-2307 | `minimax_h3.MiniMaxH3.extra_conds` | `refs`, the references' video and audio latents after the keyframes', the layout with them |
 | model_detection.py:714-750 | `seedvr2.detect` | SeedVR2's settings off its file: the 7B with separate or shared MM blocks, or the 3B |
 | `SeedVR2` sampling settings, supported_models.py:1865-1897; `ModelSamplingDiscreteFlow`, model_sampling.py:294-306 | `seedvr2.sampling`, `seedvr2.SeedVR2.memory_usage_factor` | flow at shift 1 and the default ×1000 multiplier; BASE's memory_usage_factor 2.0 |
 | `model_base.SeedVR2`, model_base.py:966-975; `BaseModel._apply_model`, model_base.py:221-263; `SeedVR2Conditioning`, nodes_seedvr.py:395-414 | `seedvr2.SeedVR2` | the model ComfyUI samples: the 17-channel `condition`, the stored positive conditioning as the context at cfg 1 (one branch) |
@@ -172,6 +183,8 @@ and checked against them bit for bit:
 | `simple_scheduler`, `normal_scheduler`, samplers.py:645-693; the sigmas on the device, samplers.py:1257 | `FlowSampler._schedule`, `set_timesteps` | the schedules |
 | `calculate_denoised` (CONST), model_sampling.py:35-37 | `FlowSampler.step` | the denoised off the model's velocity |
 | `sample_euler`, k_diffusion/sampling.py:190-212 | `FlowSampler.step` | one Euler step |
+| `sample_res_multistep` (`res_multistep` at eta 0), k_diffusion/sampling.py:1462-1529 | `FlowSampler._res_multistep` | one res_multistep step: Euler first and onto sigma 0, then the second order step on the previous denoised |
+| `beta_scheduler`, samplers.py:696-708 | `FlowSampler._schedule` | the beta schedule (alpha = beta = 0.6, scipy's ppf) |
 | `sample_er_sde`, k_diffusion/sampling.py:1593-1656; `offset_first_sigma_for_snr`, :168-176; `default_noise_sampler`, :78-88 | `FlowSampler._er_sde`, `_noise` | one ER-SDE step, its noise drawn from the KSampler's seed |
 
 ### ComfyUI's text encoders, behind a diffusers pipeline's encode
@@ -194,6 +207,12 @@ does. sd.py is not vendored (see above), so what it does for a text encoder is m
 | sd.py:2046-2052 | `lumina2.TextEncoder` | Z-Image's Qwen3 4B |
 | sd.py:2066-2070 | `moss_image.TextEncoder` | MOSS-Image's Qwen3.5 9B |
 | sd.py:1841-1843, :2126-2128; `MiniMaxH3ImageConditioning`, nodes_minimax_h3.py:736-739 | `minimax_h3_image.TextEncoder` | H3's Qwen3-VL 32B, the prompt after each picture labeled "Picture n: ", seen at a 1024 short edge, and its token tags |
+| `MiniMaxH3ImageToVideo`'s encode, nodes_minimax_h3.py:172-173 | `minimax_h3.TextEncoder` | the keyframes as the node sizes them, labeled "<Picture n>: " (the tokenizer's default) |
+| `MiniMaxH3ReferenceToVideo`'s encode, nodes_minimax_h3.py:374 | `minimax_h3.TextEncoder` (`items`) | the references presented as `<Picture i>` / `<Audio j>` (`minimax_ref_items`) |
+| `LoadAudio`'s load, nodes_audio.py:360-396, :398-430 | `adapter.load_audio` | an audio file decoded with PyAV to float32 PCM |
+| `text_encoder_dtype`'s flags (`--bf16-text-enc` and kin), model_management.py:1249-1264 | `adapter.CLIP`'s `dtype`, a text encoder spec's `"dtype"` (`load_pipe_comfy`) | one encoder in the dtype a flag would set for all |
+| `--disable-pinned-memory`, cli_args.py:207, read at model_management.py:1639-1652 | `adapter`'s import (`OFFLOADER_DISABLE_PINNED_MEMORY=1`) | no pinned host copy of the weights, the flag set before model_management imports |
+| `SDPA_BACKEND_PRIORITY`, ops.py:70-75, as the experimental H3's cudnn_attention.py node reorders it | `minimax_h3.MiniMaxH3.attention` | cuDNN ahead of flash for one generation (turboCLI's `attention=cudnn`), restored after |
 
 A Krea 2 edit runs the forward of the comfyui-krea2edit node pack (v2.0.0, Apache-2.0,
 `__init__.py`), what a ComfyUI user runs for it, on the path its `fit` mode takes. Re-sync it

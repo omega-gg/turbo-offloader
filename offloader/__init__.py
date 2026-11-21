@@ -306,31 +306,35 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
     from . import adapter
     import comfy.model_management as mm
 
-    # Small resident modules (VAE) go straight to the compute device; the offloader handles the
-    # heavy ones. VAE tiling/slicing is left to the caller.
-    if getattr(p, "vae", None) is not None:
+    # Small resident modules (the VAEs, MiniMax H3's audio one too) go straight to the compute
+    # device; the offloader handles the heavy ones. VAE tiling/slicing is left to the caller.
+    for name in ("vae", "audio_vae"):
+        vae = getattr(p, name, None)
+        if vae is None:
+            continue
         # ComfyUI runs the VAE in fp32 on CPU (vae_dtype: bf16/fp16 conv is unsupported / emulated
         # ~10-30x slower there, so it falls through to fp32). In stream mode our storage dtype is
         # bf16, which would leave the VAE in bf16 -- a multi-minute decode; upcast it to fp32. In
         # comfy mode the pipeline is already fp32, and on GPU we keep the pipeline dtype.
         if cpu_stream:
-            p.vae.to(device=load_device, dtype=torch.float32)
+            vae.to(device=load_device, dtype=torch.float32)
         else:
-            p.vae.to(load_device)
+            vae.to(load_device)
 
-        # ComfyUI hands a VAE its input in the VAE's own dtype (VAE.decode / encode:
-        # samples.to(self.vae_dtype)), whatever the pipeline samples in: float32 latents from
-        # ComfyUI's models, bf16 ones from a diffusers transformer. A ComfyVAE does it itself.
-        if not isinstance(p.vae, adapter.ComfyVAE):
-            _vae = p.vae
+    # ComfyUI hands a VAE its input in the VAE's own dtype (VAE.decode / encode:
+    # samples.to(self.vae_dtype)), whatever the pipeline samples in: float32 latents from
+    # ComfyUI's models, bf16 ones from a diffusers transformer. A ComfyVAE does it itself, and so
+    # does diffusers' audio VAE (its weights kept in float32).
+    if getattr(p, "vae", None) is not None and not isinstance(p.vae, adapter.ComfyVAE):
+        _vae = p.vae
 
-            def _cast_in(fn):
-                def wrapped(x, *a, **k):
-                    return fn(x.to(_vae.dtype) if hasattr(x, "to") else x, *a, **k)
-                return wrapped
+        def _cast_in(fn):
+            def wrapped(x, *a, **k):
+                return fn(x.to(_vae.dtype) if hasattr(x, "to") else x, *a, **k)
+            return wrapped
 
-            _vae.decode = _cast_in(_vae.decode)
-            _vae.encode = _cast_in(_vae.encode)
+        _vae.decode = _cast_in(_vae.decode)
+        _vae.encode = _cast_in(_vae.encode)
 
     p._offloader_patchers = patchers
     p._offloader_device = load_device
@@ -435,9 +439,9 @@ def _finalize_pipe(p, patchers, load_device, cpu_stream, compute_dtype):
 
 # ComfyUI's models with an adapter here, each in the module named after it (its model_detection
 # image_model): offloader/qwen_image.py, qwen_image21.py, flux2.py, flux3.py, krea2.py,
-# lumina2.py, moss_image.py, minimax_h3_image.py, seedvr2.py.
+# lumina2.py, moss_image.py, minimax_h3_image.py, minimax_h3.py, seedvr2.py.
 _COMFY_MODELS = ("qwen_image", "qwen_image21", "flux2", "flux3", "krea2", "lumina2",
-                 "moss_image", "minimax_h3_image", "seedvr2")
+                 "moss_image", "minimax_h3_image", "minimax_h3", "seedvr2")
 
 
 def _comfy_model(name):
@@ -501,7 +505,10 @@ def load_pipe_comfy(pipeline_cls, transformer, text_encoder, components, dtype, 
 
         return _finalize_pipe(p, [tf_patcher], load_device, cpu_stream, manual_cast or dtype)
 
-    te = _comfy_model(text_encoder["model"]).TextEncoder(text_encoder["file"])
+    # NOTE: A "dtype" runs the text encoder in it, as --bf16-text-enc and kin run ComfyUI's.
+    options = {"dtype": text_encoder["dtype"]} if "dtype" in text_encoder else {}
+
+    te = _comfy_model(text_encoder["model"]).TextEncoder(text_encoder["file"], **options)
 
     p = pipeline_cls(transformer=tf, text_encoder=te, **components)
 
