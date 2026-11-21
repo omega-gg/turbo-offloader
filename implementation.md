@@ -403,7 +403,7 @@ MiniMax H3 video (comfy-minimax-h3, ComfyUI's template files), measured after at
 the 224 GiB container with `--warmup --repeat 2`: sampling 38.36 s against 38.86 s (−1%) for
 text to video, 41.69 s against 41.39 s (+0%) for image to video, the videos identical with
 ComfyUI's (frames and sound decoded); from launch to the saved video 60.3 s against 61.6 s and
-64.8 s against 64.8 s. comfy-minimax-h3-hq is identical with the experimental H3's graph in
+64.8 s against 64.8 s. comfy-minimax-h3-quality is identical with the experimental H3's graph in
 ComfyUI too.
 
 Turbo-only on the same run (no ComfyUI graph, or a stock engine): comfy-flux2-9b 5.99 s (edit
@@ -479,7 +479,7 @@ Read with care:
   1376x576, 2.23 s a step against 4.6.
 - **No pinned copy (`OFFLOADER_DISABLE_PINNED_MEMORY=1`).** The adapter sets ComfyUI's
   `--disable-pinned-memory` before `model_management` imports, for a card that holds the
-  whole model. comfy-minimax-h3-hq on a B200 (Indy take, 1376x576, 5 s): the RAM peak 189 GiB
+  whole model. comfy-minimax-h3-quality on a B200 (Indy take, 1376x576, 5 s): the RAM peak 189 GiB
   to 100 (the files' mapped pages without comfy-aimdo's pinned copy of them), the first video
   138 s to 94 (the pinning skipped), the next one 52.5 s to 51, the videos identical.
   `--highvram`, as the experiment ran ComfyUI, would leave 10 GiB once loaded but turns
