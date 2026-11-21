@@ -896,6 +896,29 @@ class BaseModel(torch.nn.Module):
         out._offloader_files = model._offloader_files  # build_dynamic_patcher's fast_disk
         return out, unexpected
 
+    @contextlib.contextmanager
+    def attention(self, kind=None):
+        """The SDPA priority around a generation: `kind` "cudnn" puts cuDNN ahead of flash
+        (`ops.SDPA_BACKEND_PRIORITY`, ops.py:68-73), as the experimental H3's cudnn_attention.py
+        node sets ComfyUI's, restored after, so another engine in the same server keeps ComfyUI's.
+        The priority is the process's: the text encoder and the VAEs too, and diffusers'
+        attention through use_comfy_attention. None keeps ComfyUI's."""
+        priority = getattr(ops, "SDPA_BACKEND_PRIORITY", None)
+
+        if kind != "cudnn" or priority is None:
+            yield
+            return
+
+        from torch.nn.attention import SDPBackend
+
+        saved = list(priority)
+        priority[:] = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                       SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+        try:
+            yield
+        finally:
+            priority[:] = saved
+
     @property
     def dtype(self):
         return self._dtype

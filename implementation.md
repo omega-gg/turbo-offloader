@@ -473,10 +473,11 @@ Read with care:
   `FlowSampler` gained the beta scheduler (the experiment's Ref2VA). Loading, resampling and the
   beta schedule are bit for bit ComfyUI's on the experiment's voice reference. The encode
   cache keys a dict (a reference item) by its content.
-- **cuDNN attention for a generation.** `MiniMaxH3.attention("cudnn")` puts cuDNN ahead of
-  flash in `comfy.ops.SDPA_BACKEND_PRIORITY`, as the experiment's cudnn_attention.py node
-  does, and restores ComfyUI's order after (turboCLI's `attention=cudnn`). On a B200 at
-  1376x576, 2.23 s a step against 4.6.
+- **cuDNN attention for a generation.** `BaseModel.attention("cudnn")`, on every model
+  adapter, puts cuDNN ahead of flash in `comfy.ops.SDPA_BACKEND_PRIORITY`, as the
+  experiment's cudnn_attention.py node does, and restores ComfyUI's order after (turboCLI's
+  `attention=cudnn`, on the H3 engines only: measured there alone). On a B200 at 1376x576,
+  2.23 s a step against 4.6.
 - **No pinned copy (`OFFLOADER_DISABLE_PINNED_MEMORY=1`).** The adapter sets ComfyUI's
   `--disable-pinned-memory` before `model_management` imports, for a card that holds the
   whole model. comfy-minimax-h3-quality on a B200 (Indy take, 1376x576, 5 s): the RAM peak 189 GiB

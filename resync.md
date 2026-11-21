@@ -211,7 +211,7 @@ does. sd.py is not vendored (see above), so what it does for a text encoder is m
 | `LoadAudio`'s load, nodes_audio.py:360-396, :398-430 | `adapter.load_audio` | an audio file decoded with PyAV to float32 PCM |
 | `text_encoder_dtype`'s flags (`--bf16-text-enc` and kin), model_management.py:1249-1264 | `adapter.CLIP`'s `dtype`, a text encoder spec's `"dtype"` (`load_pipe_comfy`) | one encoder in the dtype a flag would set for all |
 | `--disable-pinned-memory`, cli_args.py:207, read at model_management.py:1639-1652 | `adapter`'s import (`OFFLOADER_DISABLE_PINNED_MEMORY=1`) | no pinned host copy of the weights, the flag set before model_management imports |
-| `SDPA_BACKEND_PRIORITY`, ops.py:70-75, as the experimental H3's cudnn_attention.py node reorders it | `minimax_h3.MiniMaxH3.attention` | cuDNN ahead of flash for one generation (turboCLI's `attention=cudnn`), restored after |
+| `SDPA_BACKEND_PRIORITY`, ops.py:68-73, as the experimental H3's cudnn_attention.py node reorders it | `adapter.BaseModel.attention` (every model adapter) | cuDNN ahead of flash for one generation (turboCLI's `attention=cudnn`), restored after |
 
 A Krea 2 edit runs the forward of the comfyui-krea2edit node pack (v2.0.0, Apache-2.0,
 `__init__.py`), what a ComfyUI user runs for it, on the path its `fit` mode takes. Re-sync it

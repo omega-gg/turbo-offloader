@@ -31,15 +31,11 @@
 #       (nodes_minimax_h3.py:87-95, 182-381), loaded as LoadImage and LoadAudio load them
 #       (MiniMaxH3.reference_to_video, add_guide);
 #     - model_lora_keys_unet's entries for it (lora.py:421-432, lora_keys);
-#     - the experimental H3's cudnn_attention.py node, cuDNN SDPA ahead of flash in
-#       comfy.ops.SDPA_BACKEND_PRIORITY (ops.py:68-74), for a generation that asks for it
-#       (MiniMaxH3.attention);
 #     - CLIPLoader of type minimax on the Qwen3-VL 32B file, as MiniMaxH3ImageToVideo encodes
 #       with it (nodes_minimax_h3.py:172-173, TextEncoder).
 #
 #==================================================================================================
 
-import contextlib
 import math
 
 import torch
@@ -49,7 +45,6 @@ from . import minimax_h3_image as h3_image
 
 import comfy.audio
 import comfy.ldm.minimax.model as h3
-import comfy.ops
 import comfy.utils
 
 # supported_models.MiniMaxH3's sampling_settings: the video stream's flow shift and the audio's.
@@ -123,28 +118,6 @@ class MiniMaxH3(adapter.BaseModel):
 
     # The sampler carries the audio stream at this scale (MiniMaxH3.audio_scale, ModelSamplingAV).
     audio_scale = SHIFT / AUDIO_SHIFT
-
-    @contextlib.contextmanager
-    def attention(self, kind=None):
-        """The SDPA priority around a generation: `kind` "cudnn" puts cuDNN ahead of flash, as the
-        experimental H3's cudnn_attention.py node sets ComfyUI's (the text encoder and the VAEs
-        too: the priority is the process's), restored after, so another engine in the same
-        server keeps ComfyUI's. None keeps ComfyUI's."""
-        priority = getattr(comfy.ops, "SDPA_BACKEND_PRIORITY", None)
-
-        if kind != "cudnn" or priority is None:
-            yield
-            return
-
-        from torch.nn.attention import SDPBackend
-
-        saved = list(priority)
-        priority[:] = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
-                       SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
-        try:
-            yield
-        finally:
-            priority[:] = saved
 
     def reference_to_video(self, references, vae, audio_vae, width, height):
         """MiniMaxH3ReferenceToVideo (nodes_minimax_h3.py:259-381) on `references`, PIL images and
