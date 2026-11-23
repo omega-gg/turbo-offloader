@@ -483,7 +483,10 @@ Read with care:
   (`minimax_h3_upscaler.py`, the node @ 40316cf): a take's video latent enlarged in fp16 on
   H3's normalized latent, the model on the GPU for that call only. The pipe then samples from
   it with `FlowSampler.set_timesteps(denoise=0.45)`, BasicScheduler's last steps of a longer
-  schedule, as the experimental H3's `--hires` does.
+  schedule, as the experimental H3's `--hires` does. Identical with ComfyUI at 512 to 1024, with
+  and without references; at 2752x1152 on par (201.2 s each from launch, B200) and 46-48.8 dB
+  apart, a rounding-level difference whose cause is not found (turboCLI's
+  doc/minimax-h3-upscale-plan.md).
 - **No pinned copy (`OFFLOADER_DISABLE_PINNED_MEMORY=1`).** The adapter sets ComfyUI's
   `--disable-pinned-memory` before `model_management` imports, for a card that holds the
   whole model. comfy-minimax-h3-quality on a B200 (Indy take, 1376x576, 5 s): the RAM peak 189 GiB
