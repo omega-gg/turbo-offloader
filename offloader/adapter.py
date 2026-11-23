@@ -1026,7 +1026,7 @@ class FlowSampler:
         return torch.FloatTensor(sigs + ([0.0] if append_zero else []))
 
     def set_timesteps(self, num_inference_steps, device=None, denoise=1.0):
-        # BasicScheduler's denoise (nodes_custom_sampler.py:39-46): a longer schedule's last
+        # BasicScheduler's denoise (nodes_custom_sampler.py:33-42): a longer schedule's last
         # steps, for a sampling that starts from a latent.
         sigmas = self._schedule(num_inference_steps if denoise >= 1.0
                                 else int(num_inference_steps / denoise))

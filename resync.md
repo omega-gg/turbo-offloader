@@ -236,7 +236,7 @@ fp16). Re-sync it like the Krea 2 pack when its commit moves:
 | `ResBlockEmb3D`, `TemporalConv`, `LatentResizer3D` (`_forward_seg`), :160-343 | `minimax_h3_upscaler.LatentResizer3D` | the network, its module tree kept so the file loads strict; no attention blocks (forced off) |
 | `_detect_arch`, :379-415 | `minimax_h3_upscaler._arch` | its size read off the file |
 | `MinimaxH3LatentUpscaler3D.execute`, :520-602 | `minimax_h3_upscaler.LatentUpscaler` | the target dimensions on the 32 grid, the effective scale, fp16, the model back on the CPU |
-| `BasicScheduler`'s denoise, nodes_custom_sampler.py | `adapter.FlowSampler.set_timesteps(denoise=)` | a longer schedule's last steps, for the refine of a take |
+| `BasicScheduler`'s denoise, nodes_custom_sampler.py:33-42 | `adapter.FlowSampler.set_timesteps(denoise=)` | a longer schedule's last steps, for the refine of a take |
 
 Adding a text encoder: vendor its `comfy/text_encoders/` file and what it imports (category 1),
 mirror its sd.py branch as the model's `TextEncoder` after `krea2.py`, then compare its
