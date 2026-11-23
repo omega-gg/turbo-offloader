@@ -532,6 +532,15 @@ def comfy_vae(path, config, tiled=None):
     return adapter.ComfyVAE(path, config, tiled)
 
 
+def comfy_latent_upscaler(path):
+    """MiniMax H3's latent upscaler on its file at `path`: the community MiniMax H3 Latent
+    Upscaler (3D) node's network, called on a video latent and the pixel size to enlarge it to.
+    See minimax_h3_upscaler.LatentUpscaler."""
+    from .minimax_h3_upscaler import LatentUpscaler
+
+    return LatentUpscaler(path)
+
+
 def comfy_sampler(model, sampler, scheduler, file=None):
     """KSampler's `sampler` and `scheduler` on ComfyUI's model `model` (its adapter's flow SHIFT,
     or the model sampling its adapter reads off the transformer's `file`), behind the calls a

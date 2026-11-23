@@ -1025,8 +1025,12 @@ class FlowSampler:
         sigs = [float(self._sigma(t)) for t in torch.linspace(start, end, steps)]
         return torch.FloatTensor(sigs + ([0.0] if append_zero else []))
 
-    def set_timesteps(self, num_inference_steps, device=None):
-        sigmas = self._schedule(num_inference_steps).to(device)
+    def set_timesteps(self, num_inference_steps, device=None, denoise=1.0):
+        # BasicScheduler's denoise (nodes_custom_sampler.py:39-46): a longer schedule's last
+        # steps, for a sampling that starts from a latent.
+        sigmas = self._schedule(num_inference_steps if denoise >= 1.0
+                                else int(num_inference_steps / denoise))
+        sigmas = sigmas[-(num_inference_steps + 1):].to(device)
 
         if self.sampler == "er_sde":
             if sigmas[0] >= 1:

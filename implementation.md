@@ -478,6 +478,12 @@ Read with care:
   experiment's cudnn_attention.py node does, and restores ComfyUI's order after (turboCLI's
   `attention=cudnn`, on the H3 engines only: measured there alone). On a B200 at 1376x576,
   2.23 s a step against 4.6.
+- **A take refined at 2x (turboCLI's `comfy-minimax-h3-upscale` engines).**
+  `comfy_latent_upscaler` builds the community MiniMax H3 Latent Upscaler (3D) node's network
+  (`minimax_h3_upscaler.py`, the node @ 40316cf): a take's video latent enlarged in fp16 on
+  H3's normalized latent, the model on the GPU for that call only. The pipe then samples from
+  it with `FlowSampler.set_timesteps(denoise=0.45)`, BasicScheduler's last steps of a longer
+  schedule, as the experimental H3's `--hires` does.
 - **No pinned copy (`OFFLOADER_DISABLE_PINNED_MEMORY=1`).** The adapter sets ComfyUI's
   `--disable-pinned-memory` before `model_management` imports, for a card that holds the
   whole model. comfy-minimax-h3-quality on a B200 (Indy take, 1376x576, 5 s): the RAM peak 189 GiB

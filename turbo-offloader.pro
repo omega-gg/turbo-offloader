@@ -25,6 +25,7 @@ OTHER_FILES += offloader/__init__.py \
                offloader/moss_image.py \
                offloader/minimax_h3.py \
                offloader/minimax_h3_image.py \
+               offloader/minimax_h3_upscaler.py \
                offloader/seedvr2.py \
 
 # Vendored ComfyUI offloading snapshot (byte-for-byte; see resync.md).

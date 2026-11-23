@@ -225,6 +225,19 @@ like category 3 when the pack moves:
 | `_fit_encode_image`, :107-151 | `krea2._fit_encode_image` | a reference fitted to the target in pixels and VAE-encoded, before sampling |
 | `Krea2EditGroundedEncode`, :428-524 | `krea2.TextEncoder.encode` | the prompt encoded with the references in the user turn, their longest side capped |
 
+MiniMax H3's latent upscaler is the community MiniMax H3 Latent Upscaler (3D) node
+(LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler @ 40316cf, MIT,
+`nodes/minimax_h3_latent_upscaler_3d.py`), as the experimental H3's `--hires` runs it (one pass,
+fp16). Re-sync it like the Krea 2 pack when its commit moves:
+
+| upstream (`minimax_h3_latent_upscaler_3d.py`) | in offloader/ | what |
+|---|---|---|
+| `LATENTS_MEAN`, `LATENTS_STD`, :83-98 | `minimax_h3_upscaler` | H3's video latent statistics, normalized around the pass |
+| `ResBlockEmb3D`, `TemporalConv`, `LatentResizer3D` (`_forward_seg`), :160-343 | `minimax_h3_upscaler.LatentResizer3D` | the network, its module tree kept so the file loads strict; no attention blocks (forced off) |
+| `_detect_arch`, :379-415 | `minimax_h3_upscaler._arch` | its size read off the file |
+| `MinimaxH3LatentUpscaler3D.execute`, :520-602 | `minimax_h3_upscaler.LatentUpscaler` | the target dimensions on the 32 grid, the effective scale, fp16, the model back on the CPU |
+| `BasicScheduler`'s denoise, nodes_custom_sampler.py | `adapter.FlowSampler.set_timesteps(denoise=)` | a longer schedule's last steps, for the refine of a take |
+
 Adding a text encoder: vendor its `comfy/text_encoders/` file and what it imports (category 1),
 mirror its sd.py branch as the model's `TextEncoder` after `krea2.py`, then compare its
 conditioning with ComfyUI's on the same prompt (and image).
