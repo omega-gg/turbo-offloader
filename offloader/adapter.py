@@ -1030,12 +1030,7 @@ class FlowSampler:
         # steps, for a sampling that starts from a latent.
         sigmas = self._schedule(num_inference_steps if denoise >= 1.0
                                 else int(num_inference_steps / denoise))
-        self.set_sigmas(sigmas[-(num_inference_steps + 1):], device)
-
-    def set_sigmas(self, sigmas, device=None):
-        # ManualSigmas (nodes_custom_sampler.py): an explicit grid, its last point 0, as a distilled
-        # model's published steps.
-        sigmas = torch.as_tensor(sigmas, dtype=torch.float32).to(device)
+        sigmas = sigmas[-(num_inference_steps + 1):].to(device)
 
         if self.sampler == "er_sde":
             if sigmas[0] >= 1:
@@ -1997,9 +1992,6 @@ def install_tiled_vae_fallback(pipe, node_boundary=None):
                 return real(*args, **kwargs)
             return call
 
-        # A decode before sampling (a reference's frames, as an input node) is bounded as an
-        # encode: the node's teardown, not the sampler's end.
-        vae.decode_input = bounded(vae.decode, "encoding")
         vae.decode = bounded(vae.decode, "decoding")
         vae.encode = bounded(vae.encode, "encoding")
         vae._tiled_fallback_installed = True
