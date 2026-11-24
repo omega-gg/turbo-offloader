@@ -34,9 +34,16 @@
 #     - CLIPLoader of type minimax on the Qwen3-VL 32B file, as MiniMaxH3ImageToVideo encodes
 #       with it (nodes_minimax_h3.py:172-173, TextEncoder).
 #
+#   And Open-H3-Regenerate-2K IC's model side (NVlabs/Sana, sol-engine,
+#   models/Open-H3-Regenerate-2K/IC, ref2va_ic/hyperflow.py and sharp.py): HyperFlowModel, a
+#   video reference already in latents (MiniMaxH3.video_reference), audio rows held clean
+#   (extra_conds' fixed_audio) and Diffusers' LoRA names for the transformer (lora_keys).
+#
 #==================================================================================================
 
+import functools
 import math
+from types import SimpleNamespace
 
 import torch
 
@@ -145,6 +152,16 @@ class MiniMaxH3(adapter.BaseModel):
 
         return items, refs
 
+    def video_reference(self, latent, frames):
+        """MiniMaxH3ReferenceToVideo's video reference (ref_videos) on a video already in
+        latents: `latent` [1, 24, t, h, w], read by the reference rows as it is, and its `frames`
+        (an IMAGE [T, H, W, 3] at 24 fps), every 12th (2 fps) presented to Qwen3-VL as
+        <Video 1>. Returns the items and the reference blocks, as reference_to_video's."""
+        items = [{"type": "video", "data": frames[::12]}]
+        refs = [{"kind": "video", "ref_audio_t": 0, "latent_t": latent.shape[2],
+                 "latent_h": latent.shape[3], "latent_w": latent.shape[4], "latent": latent}]
+        return items, refs
+
     def add_guide(self, keyframes, shapes, frame_idx, vae=None, image=None, audio_vae=None,
                   audio=None):
         """MiniMaxH3AddGuide (nodes_minimax_h3.py:182-256) for latents of `shapes`: a PIL image
@@ -172,11 +189,14 @@ class MiniMaxH3(adapter.BaseModel):
             keyframe["audio_latent"] = z[..., :limit].clone() if length > limit else z
         keyframes.append(keyframe)
 
-    def extra_conds(self, context, tags, keyframes, shapes, seed, device, refs=None):
+    def extra_conds(self, context, tags, keyframes, shapes, seed, device, refs=None,
+                    fixed_audio=False):
         """MiniMaxH3.extra_conds (model_base.py:2254-2307) for latents of `shapes` (the video's and
         the audio's): the text through the condition projection and the token refiner once, and
         the payload (the token tags, the keyframes, the references, their latents, KSampler's seed,
-        the audio scale, the packed layout). Before sampling, as ComfyUI makes them."""
+        the audio scale, the packed layout). Before sampling, as ComfyUI makes them.
+        `fixed_audio` holds the audio rows clean (IC's silence): carried as they are, at t = 1,
+        their velocity zero (the DiT's audio_denoise_mask of zeros)."""
         context = self.diffusion_model.preprocess_text_embeds(
             context.to(device=device, dtype=self._dtype))
 
@@ -195,7 +215,7 @@ class MiniMaxH3(adapter.BaseModel):
                                          if "audio_latent" in kf] \
             + [r["audio_latent"] for r in refs if "audio_latent" in r]
         payload["seed"] = seed
-        payload["audio_scale"] = self.audio_scale
+        payload["audio_scale"] = 1.0 if fixed_audio else self.audio_scale
 
         video = shapes[0]
         payload["layout"] = h3.PackedLayout(context.shape[1], video[2], (video[3] + 1) // 2 * 2,
@@ -203,10 +223,13 @@ class MiniMaxH3(adapter.BaseModel):
                                             keyframes=payload.get("keyframes"),
                                             refs=payload.get("refs"))
 
-        return {"context": context, "minimax_payload": payload, "latent_shapes": shapes}
+        conds = {"context": context, "minimax_payload": payload, "latent_shapes": shapes}
+        if fixed_audio:
+            conds["audio_denoise_mask"] = torch.zeros(1, 1, *shapes[1][2:], device=device)
+        return conds
 
     def forward(self, hidden_states, timestep, context, minimax_payload, latent_shapes,
-                sample_sigmas, return_dict=False):
+                sample_sigmas, audio_denoise_mask=None, return_dict=False):
         options = self.transformer_options()
         options["sample_sigmas"] = sample_sigmas  # samplers.py:1228-1229
 
@@ -215,12 +238,139 @@ class MiniMaxH3(adapter.BaseModel):
         x = comfy.utils.unpack_latents(hidden_states.to(self._dtype), latent_shapes)
 
         out = self.diffusion_model(x, t, context.to(self._dtype), transformer_options=options,
-                                   minimax_payload=minimax_payload)
+                                   minimax_payload=minimax_payload,
+                                   audio_denoise_mask=audio_denoise_mask)
 
         return (comfy.utils.pack_latents(out)[0].float(),)
 
     def lora_keys(self):
-        return h3_image.lora_keys(self, super().lora_keys())
+        """ComfyUI's names (lora.py), and Diffusers' (transformer.<module>, as HyperFlow and IC
+        publish theirs) onto the fused weights: to_q / to_k / to_v as slices of qkv_proj, and
+        ff.net.0.proj onto fc1 with its halves swapped (Diffusers' SwiGLU is [value, gate],
+        ComfyUI's [gate, value]). On a HyperFlowModel, the LoRA pieces its own install consumes
+        (HyperFlow's endpoint embedder, Sharp's curve branches) are named off the weights."""
+        key_map = h3_image.lora_keys(self, super().lora_keys())
+
+        dm = self.diffusion_model
+        attn, mlp = dm.blocks[0].attn, dm.blocks[0].mlp
+        inner, half = attn.heads * attn.head_dim, mlp.fc2.in_features
+        swap = functools.partial(torch.roll, shifts=half, dims=0)
+
+        for source, target, count in (("transformer_blocks", "blocks", len(dm.blocks)),
+                                      ("token_refiner.refiner_blocks", "token_refiner.blocks",
+                                       len(dm.token_refiner.blocks))):
+            for i in range(count):
+                s = "transformer.%s.%d." % (source, i)
+                t = "diffusion_model.%s.%d." % (target, i)
+                for j, name in enumerate(("to_q", "to_k", "to_v")):
+                    key_map[s + "attn." + name] = (t + "attn.qkv_proj.weight",
+                                                   (0, j * inner, inner))
+                key_map[s + "attn.to_out.0"] = t + "attn.out_proj.weight"
+                key_map[s + "ff.net.0.proj"] = (t + "mlp.fc1.weight", None, swap)
+                key_map[s + "ff.net.2"] = t + "mlp.fc2.weight"
+
+        if hasattr(dm, "time_embedder"):
+            for name, layer in (("linear_1", "proj_in"), ("linear_2", "proj_out")):
+                key_map["transformer.time_embedder." + name] = \
+                    "diffusion_model.time_embedder.%s.weight" % layer
+
+        if isinstance(dm, HyperFlowModel):
+            for name in ("linear_1", "linear_2"):
+                key_map["transformer.endpoint_time_embedder." + name] = "hyperflow." + name
+            for i in range(len(dm.blocks)):
+                key_map["diffusion_model.blocks.%d.adaln_proj.linear" % i] = "sharp.%d" % i
+        return key_map
+
+
+class HyperFlowModel(h3.MiniMaxH3Model):
+    """ComfyUI's transformer with Open-H3-Regenerate-2K IC's model-side pieces, on a full-form file
+    (its time embedder and full-width adaln projections):
+      - HyperFlow's two-time embedder (hyperflow.py's TwoTimeEmbedder): the rows at the step's
+        timestep, the target's and the text's, are embedded on the interval to the next sigma,
+        emb(t) + gate * (endpoint(r) - emb(t)) with r = 1 - sigma_next; the others keep r = t.
+        `endpoint` is the file's time embedder with HyperFlow's endpoint LoRA merged in float32;
+        the base one takes its LoRA from the patcher, as every other linear;
+      - LMS Sharp's curve branches (sharp.py's CurveLinear): each block's adaln projection plus
+        strength * B @ A of the [1025, 8] adaln_t_table read at the row's timestep.
+    The pieces are kept off the module tree (a plain namespace), out of the loader's and the
+    patcher's way."""
+
+    def install(self, sd, hyperflow, sharp, curve, strength):
+        """HyperFlow's file (its endpoint pairs and gate), Sharp's (its curve branches, folded
+        once in float32 at `strength`; None leaves Sharp out) and `curve`'s adaln_t_table, `sd`
+        the file's tensors."""
+        from safetensors import safe_open
+
+        def lora(f, name):
+            return [f.get_tensor("%s.lora_%s.weight" % (name, m)).float() for m in "AB"]
+
+        with safe_open(hyperflow, framework="pt") as f:
+            meta = f.metadata()
+            scale = float(meta["lora_alpha"]) / float(meta["lora_rank"])
+            weights = {}
+            for layer, name in (("proj_in", "linear_1"), ("proj_out", "linear_2")):
+                a, b = lora(f, "transformer.endpoint_time_embedder." + name)
+                base = "time_embedder." + layer
+                weights[layer + ".weight"] = sd[base + ".weight"].float() + scale * (b @ a)
+                weights[layer + ".bias"] = sd[base + ".bias"].float()
+
+        endpoint = h3.TimeEmbedder(weights["proj_in.weight"].shape[1],
+                                   weights["proj_in.weight"].shape[0],
+                                   weights["proj_out.weight"].shape[0], dtype=torch.float32,
+                                   operations=torch.nn)
+        endpoint.load_state_dict(weights)
+
+        # NOTE: Sharp is optional (IC's --sharp 0): no file, no table, no branch, no hook.
+        branches, table = [], None
+        if sharp:
+            with safe_open(sharp, framework="pt") as f:
+                for i in range(len(self.blocks)):
+                    a, b = lora(f, "diffusion_model.blocks.%d.adaln_proj.linear" % i)
+                    branches.append(strength * (b @ a))
+            with safe_open(curve, framework="pt") as f:
+                table = f.get_tensor("adaln_t_table").float()
+
+            for i, block in enumerate(self.blocks):
+                block.adaln_proj.linear.register_forward_hook(functools.partial(self._sharp, i))
+
+        self._ic = SimpleNamespace(endpoint=endpoint, gate=float(meta["hyperflow_gate"]),
+                                   branches=branches, table=table, t=None, r=None, coords=None)
+
+    def place(self, device):
+        """The pieces where the model computes (the forward's device, not the pipeline's), once."""
+        ic = self._ic
+        if ic.endpoint.proj_in.weight.device != device:
+            ic.endpoint.to(device)
+            ic.branches = [b.to(device) for b in ic.branches]
+            ic.table = ic.table.to(device) if ic.table is not None else None
+
+    def _sharp(self, i, module, args, out):
+        return out + (self._ic.coords @ self._ic.branches[i].T).to(out.dtype)
+
+    def _forward(self, x, timestep, context, transformer_options={}, **kwargs):
+        # the step's interval, as FinalLayer finds it for PDD (model.py:358-359)
+        sigmas = transformer_options["sample_sigmas"]
+        sigma = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
+        i = int((sigmas.to(sigma.device) - sigma).abs().argmin())
+        self._ic.t = float(1.0 - sigma)
+        self._ic.r = float(1.0 - sigmas[min(i + 1, sigmas.shape[0] - 1)])
+        return super()._forward(x, timestep, context, transformer_options, **kwargs)
+
+    def _time_embedding(self, unique_t, device, dtype):
+        self.place(torch.device(device))
+        ic = self._ic
+        t = torch.tensor(unique_t, dtype=torch.float32, device=device)
+
+        emb = self.time_embedder(t)
+        r = torch.where((t - ic.t).abs() <= 1e-6, torch.full_like(t, ic.r), t)
+        emb = emb + ic.gate * (ic.endpoint(r) - emb)
+
+        if ic.table is not None:  # Sharp's curve coordinates, at each row's t
+            pos = t.clamp(0.0, 1.0) * (ic.table.shape[0] - 1)
+            i0 = pos.floor().long().clamp(max=ic.table.shape[0] - 2)
+            ic.coords = torch.lerp(ic.table[i0], ic.table[i0 + 1], (pos - i0).unsqueeze(1))
+
+        return emb.to(dtype)
 
 
 class TextEncoder(h3_image.TextEncoder):
@@ -241,7 +391,14 @@ def load(weight_file, config, load_device, dtype, **options):
     """ComfyUI's transformer for its file, behind the call the pipeline makes."""
     file_config = h3_image._config(weight_file)
 
+    # NOTE: IC's model side, on its files' paths: {"hyperflow", "sharp", "curve", "strength"}.
+    ic = config.get("hyperflow")
+
     def build(sd, operations):
-        return h3.MiniMaxH3Model(**detect(sd, file_config), dtype=dtype, operations=operations)
+        model = (HyperFlowModel if ic else h3.MiniMaxH3Model)(
+            **detect(sd, file_config), dtype=dtype, operations=operations)
+        if ic:
+            model.install(sd, ic, config["sharp"], config["curve"], config.get("strength", 1.0))
+        return model
 
     return MiniMaxH3.load(build, weight_file, config, load_device, dtype, **options)

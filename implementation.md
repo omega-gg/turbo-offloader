@@ -46,7 +46,7 @@ The runner discovers `backend/<mode>/` and drives it through this interface only
 | `reclaim(pipe)` | end a run the VAE decode did not end (`_end_sampling`: `current_patcher = None` as ComfyUI's `cleanup` does, then `node_teardown`), then `free_memory` + `soft_empty_cache` between generations; end the prompt |
 | `release(pipe)` | `detach` each patcher |
 | `comfy_vae(path, config, tiled=None)` | opt in to ComfyUI's own VAE: the model comfy/sd.py builds for the VAE file (its code vendored under `comfy/ldm/`), read as VAELoader reads it (`load_torch_file`, file slices under VBAR) and run as sd.py's VAE class runs it, behind the calls a diffusers pipeline makes. `adapter.ComfyVAE` mirrors sd.py: the model and settings a file gets (`_comfy_vae_model`), device, dtype and patcher (dynamic under VBAR), `decode` / `encode` through `load_models_gpu` with the out-of-memory fallback to its tiles, or tiled from the start at `tiled`'s pixel tile and overlap as a template's VAEEncodeTiled / VAEDecodeTiled nodes run a VAE that tiles itself; `resync.md` lists the mirrored lines. Used by `comfy-qwen-image-2-1` (Wan 2.2 layout), `comfy-krea2-turbo` and `comfy-qwen-image-edit-2511` (Wan 2.1), `comfy-moss-image` (FLUX.2, its small decoder, in fp16 as ComfyUI picks it), `comfy-minimax-h3-image` (the MiniMax-H3-Image VAE, a 2D ViT decoder that tiles itself and decodes to [0, 1]), the comfy-seedvr2 upscalers (the SeedVR2 causal 3D VAE, tiled at 512/128, its latent scaled by `format_encoded`), the comfy-minimax-h3 engines (MiniMax H3's video VAE, a causal 3D encoder and ViT decoder writing its chunks into the output, int8 through ComfyUI's mixed-precision ops, and its audio VAE). The file's metadata comes along, as VAELoader reads it; a model decoding to its own range declares an identity `process_output`, the others' output is clamped to the [-1, 1] a diffusers pipeline takes. |
-| `comfy_sampler(model, sampler, scheduler, file=None)` | opt in to ComfyUI's own KSampler for a template that samples otherwise than diffusers' schedulers: `adapter.FlowSampler`, behind the scheduler calls a pipeline makes (`set_timesteps`, `timesteps`, `sigmas`, `step`), on ComfyUI's model `model`'s flow shift, or on the model sampling its adapter reads off the transformer's `file` (`sampling`: MiniMax-H3-Image's PDD grid, or only a multiplier, the shift then its module's `SHIFT`, 1 without one: MiniMax H3, SeedVR2); the pipeline sets its `seed`. The `simple`, `normal` and `beta` schedulers, `euler`, `res_multistep` and `er_sde` with its seeded noise, bit-identical to ComfyUI's on CUDA; `resync.md` lists the mirrored lines. Used by `comfy-moss-image`, `comfy-minimax-h3-image`, the comfy-seedvr2 upscalers and the comfy-minimax-h3 engines. |
+| `comfy_sampler(model, sampler, scheduler, file=None)` | opt in to ComfyUI's own KSampler for a template that samples otherwise than diffusers' schedulers: `adapter.FlowSampler`, behind the scheduler calls a pipeline makes (`set_timesteps`, `timesteps`, `sigmas`, `step`; `set_sigmas` for an explicit grid), on ComfyUI's model `model`'s flow shift, or on the model sampling its adapter reads off the transformer's `file` (`sampling`: MiniMax-H3-Image's PDD grid, or only a multiplier, the shift then its module's `SHIFT`, 1 without one: MiniMax H3, SeedVR2); the pipeline sets its `seed`. The `simple`, `normal` and `beta` schedulers, `euler`, `res_multistep` and `er_sde` with its seeded noise, bit-identical to ComfyUI's on CUDA; `resync.md` lists the mirrored lines. Used by `comfy-moss-image`, `comfy-minimax-h3-image`, the comfy-seedvr2 upscalers and the comfy-minimax-h3 engines. |
 
 All GPL-derived code lives in this package; the calling runner stays GPL-free.
 
@@ -488,6 +488,26 @@ Read with care:
   latents bit-identical and the frames 46-48.8 dB apart: ComfyUI's decode there depends on the
   process's history (the same decode alone gives turbo's frames exactly), rounding-level
   (turboCLI's doc/minimax-h3-upscale-plan.md).
+- **A take re-rendered by Open-H3-Regenerate-2K IC (turboCLI's `comfy-minimax-h3-ic-upscale`
+  engines).** NVIDIA's IC (NVlabs/Sana `sol-engine/models/Open-H3-Regenerate-2K/IC`) mirrored on
+  ComfyUI's DiT, with no vendored-file change: `HyperFlowModel` (a `MiniMaxH3Model` built by
+  `load` when its config names IC's files) adds HyperFlow's two-time embedder (`_forward` reads
+  the step's interval off `sample_sigmas`, `_time_embedding` blends `emb(t) + gate * (endpoint(r)
+  - emb(t))` on the rows at the step's timestep, r = 1 - sigma_next, the endpoint embedder the
+  file's time embedder with HyperFlow's endpoint LoRA merged in fp32) and LMS Sharp's curve
+  branches (a forward hook per block adding `coords @ (B @ A)^T`, the coordinates the
+  adaln_t_table read at each row's timestep), its pieces off the module tree. It needs the
+  full-form file (time embedder, full adaln). `MiniMaxH3.lora_keys` also names Diffusers' LoRA
+  keys onto the fused weights (`to_q/k/v` as slices of `qkv_proj`, `ff.net.0.proj` onto `fc1` with
+  its halves swapped: Diffusers' SwiGLU is [value, gate], ComfyUI's [gate, value]) and routes
+  the pieces HyperFlowModel consumes off the weights. `video_reference` takes a reference video
+  already in latents (its frames every 12th for Qwen3-VL), `extra_conds(fixed_audio=True)` holds
+  the audio rows clean (an `audio_denoise_mask` of zeros: t = 1, velocity zero) and
+  `FlowSampler.set_sigmas` runs an explicit grid (ManualSigmas). Parity with IC's own modules on
+  a tiny model at fp32 rounding (turboCLI's doc/minimax-h3-ic-upscale-plan.md). A decode before
+  sampling (the take's frames for Qwen3-VL) goes through `ComfyVAE.decode_input`, bounded as an
+  encode: a "decoding" boundary ends the sampling run (`_end_sampling` drops `current_patcher`),
+  and the transformer then never loads (`prepare_sampling` needs it).
 - **No pinned copy (`OFFLOADER_DISABLE_PINNED_MEMORY=1`).** The adapter sets ComfyUI's
   `--disable-pinned-memory` before `model_management` imports, for a card that holds the
   whole model. comfy-minimax-h3-quality on a B200 (Indy take, 1376x576, 5 s): the RAM peak 189 GiB
